@@ -1119,17 +1119,31 @@ impl Agent {
                 if let Some(why) = call.parse_error.clone() {
                     self.trace.bad_calls += 1;
                     let manual = self.manual_for_bad_call(&call, &why);
-                    // 仍然要回一条 `tool_result` 挂同一个 call_id：provider 那边
+                    // **先把它那条调用原样记下来**（2026-09-20 修，整机实跑抓到的）：
+                    // provider 有一条硬要求 —— **`tool` 消息必须跟在一个带 `tool_calls`
+                    // 的 assistant 消息后面**。只回 tool_result 不记那条调用，
+                    // 下一个请求会被直接拒（HTTP 400：`Messages with role 'tool'
+                    // must be a response to a preceding message with 'tool_calls'`）。
+                    // 既然是回放，名字和参数都用**模型的原话**。
+                    let echo = Item::tool_call_echo(
+                        &call.to,
+                        &call.tool,
+                        call.raw_name.as_deref().unwrap_or(&call.tool),
+                        call.args_raw.as_deref(),
+                        &call_id,
+                    );
+                    self.note_item(out, echo);
+                    // 然后再回一条 `tool_result` 挂同一个 call_id：provider 那边
                     // 「assistant 的 tool_calls 必须有对应的 tool 回信」，少一条就是协议违规
                     self.note_item(out, Item::tool_result_with(&call.tool, &manual, &call_id));
                     eprintln!(
-                        "[agent] 模型给的参数解不出来（{why}）—— \
-                         这一条**没有发出去**，回了它一条报错即手册"
+                        "[agent] 这一条调用不成立（{why}）—— \
+                         它**没有发出去**，回了它一条报错即手册"
                     );
                     continue;
                 }
                 self.trace.tool_calls += 1;
-                let item = Item::tool_call_with(&call.tool, &call.args, &call_id);
+                let item = Item::tool_call_with(&call.to, &call.tool, &call.args, &call_id);
                 self.note_item(out, item);
                 self.pending.insert(
                     corr.clone(),

@@ -37,6 +37,12 @@ pub struct ToolCall {
     /// **发给工具** —— 那等于替模型编了它没说的话。
     #[serde(default)]
     pub parse_error: Option<String>,
+    /// **模型原话里的那个函数名**（只有"名字对不上"时才有）。
+    ///
+    /// 为什么要留着它：回放那条不成立的调用时，得**逐字**照它说的回放 ——
+    /// `fn_name(to, tool)` 重建不出一个查不到的名字（真事：它叫的是 `__edit`）。
+    #[serde(default)]
+    pub raw_name: Option<String>,
 }
 
 impl ToolCall {
@@ -53,6 +59,7 @@ impl ToolCall {
                 args: v,
                 args_raw: None,
                 parse_error: None,
+                raw_name: None,
             },
             Ok(v) => Self {
                 // 解出来了，但**不是个对象**：`{"tool":"run","args":42}` 这种也进不来
@@ -61,6 +68,7 @@ impl ToolCall {
                 tool,
                 args: serde_json::Value::Null,
                 args_raw: None,
+                raw_name: None,
                 parse_error: Some(format!(
                     "参数解得开，但它是个 {}，不是对象：{v}",
                     match v {
@@ -79,6 +87,7 @@ impl ToolCall {
                 tool,
                 args: serde_json::Value::Null,
                 args_raw: None,
+                raw_name: None,
                 parse_error: Some(format!("不是合法 JSON：{e}")),
             },
         }
@@ -281,6 +290,7 @@ mod tests {
                     args: serde_json::json!({"cmd": "ls"}),
                     args_raw: None,
                     parse_error: None,
+                    raw_name: None,
                 }],
                 usage_input_tokens: None,
             },

@@ -455,7 +455,7 @@ mod tests {
         let mut h = History::new();
         h.push(Item::new(ItemKind::System, "你是助手"));
         h.push(Item::user("干点活"));
-        h.push(Item::tool_call_with("term.run", &serde_json::json!({"cmd": "ls"}), "call_1"));
+        h.push(Item::tool_call_with("term:1", "run", &serde_json::json!({"cmd": "ls"}), "call_1"));
         // 老写法：结果**没带 id**
         h.push(Item::tool_result("term.run", "结果"));
         let err = h.assert_safe().expect_err("个数平了、配对配不上 —— 该拦");
@@ -464,7 +464,7 @@ mod tests {
         let mut ok = History::new();
         ok.push(Item::new(ItemKind::System, "你是助手"));
         ok.push(Item::user("干点活"));
-        ok.push(Item::tool_call_with("term.run", &serde_json::json!({"cmd": "ls"}), "call_1"));
+        ok.push(Item::tool_call_with("term:1", "run", &serde_json::json!({"cmd": "ls"}), "call_1"));
         ok.push(Item::tool_result_with("term.run", "结果", "call_1"));
         assert!(ok.assert_safe().is_ok());
     }

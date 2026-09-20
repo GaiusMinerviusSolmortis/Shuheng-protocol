@@ -84,12 +84,43 @@ impl Item {
     }
 
     /// 带协议细节的两条：适配器要靠 `call_id` 把结果配回调用。
-    pub fn tool_call_with(name: &str, args: &Value, call_id: &str) -> Self {
+    ///
+    /// **`instance` 必须在场**（2026-09-20 修）：适配器回放这条消息时，函数名是按
+    /// `fn_name(instance, tool)` **重建**的 —— 少了实例，重建出来就是 `__edit`
+    /// 这种丢了前缀的名字。而模型会**照着自己上一轮的调用学**，于是它下一轮
+    /// 真的会叫出一个不存在的名字（实跑里就这么发生的）。
+    pub fn tool_call_with(instance: &str, name: &str, args: &Value, call_id: &str) -> Self {
         Self::new(
             ItemKind::ToolCall { name: name.into() },
             format!("{name}({args})"),
         )
-        .with_data(serde_json::json!({"call_id": call_id, "args": args}))
+        .with_data(serde_json::json!({
+            "call_id": call_id, "instance": instance, "args": args
+        }))
+    }
+
+    /// **原样回放模型那一条调用**（名字/参数可能根本解不开）。
+    ///
+    /// 用在"这条调用不成立、我们回了一条报错即手册"那条路上：provider 要求
+    /// **`tool` 消息必须跟在一条带 `tool_calls` 的 assistant 消息后面** ——
+    /// 少了那一条，整个请求会被直接拒（HTTP 400）。
+    /// 既然是回放，就**照它说的原样**回放：名字用 `raw_name`，参数用 `args_raw`。
+    pub fn tool_call_echo(
+        instance: &str,
+        name: &str,
+        raw_name: &str,
+        raw_args: Option<&str>,
+        call_id: &str,
+    ) -> Self {
+        let mut d = serde_json::json!({
+            "call_id": call_id, "instance": instance, "args": serde_json::Value::Null
+        });
+        d["raw_name"] = serde_json::json!(raw_name);
+        if let Some(raw) = raw_args {
+            d["args_raw"] = serde_json::json!(raw);
+        }
+        Self::new(ItemKind::ToolCall { name: name.into() }, format!("{name}(…)"))
+            .with_data(d)
     }
 
     pub fn tool_result_with(name: &str, text: impl Into<String>, call_id: &str) -> Self {
