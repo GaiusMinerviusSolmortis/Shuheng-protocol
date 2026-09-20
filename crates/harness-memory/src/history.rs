@@ -5,8 +5,13 @@
 //! > **一次工具调用和它的结果，绝不能被切开。**
 //!
 //! 切开之后模型会看到"调用了但没结果"（或反过来），那比不压缩糟得多。
-//! 我们的做法很省事也够稳：**只在轮次边界切**。一轮 = 一个 `User` 到下一个
-//! `User` 之前，所以调用与结果天然在同一轮里。
+//! 切在哪：**任何"开着的调用数为 0"的位置都行**（2026-09-20 放宽）。
+//!
+//! 原来只在**轮次边界**切（一轮 = 一个 `User` 到下一个 `User` 之前）——
+//! 那样调用与结果天然在同一轮里，但**一个超长回合内部就压不了了**
+//! （待定 #105：一个回合里连着几十次工具调用，窗口先爆在回合中间）。
+//! 现在切点细化到**调用对粒度**：只要那个位置上没有"调了还没回"的调用，
+//! 就能切 —— 这就是"调用与结果同进同出"那句话的精确形态。
 //!
 //! 另外，**开头连续的 `System` 永远不参与压缩** —— 它是那段稳定的前缀，
 //! 压掉它等于每轮都重建一次提示词（而且是白碎一次缓存）。
@@ -26,6 +31,13 @@ pub struct CutPlan {
     pub cut: usize,
     /// 压掉了几轮
     pub turns: usize,
+    /// **这一刀切在回合内部**（不是轮边界）。
+    ///
+    /// 为什么要单独记：它改变了"模型接下来看到什么"的形状 ——
+    /// 轮边界那刀切完，历史是"摘要 + 若干个完整轮次"；
+    /// 回合内部那刀切完，历史是"摘要 + **同一个回合的后半截**"。
+    /// 排查"它为什么忘了刚说过的话"时，这两者要分得开。
+    pub mid_turn: bool,
     /// 这之前的估算 token
     pub before_tokens: u64,
 }
@@ -106,33 +118,97 @@ impl History {
         counter: &dyn TokenCounter,
     ) -> Option<CutPlan> {
         let ranges = self.turn_ranges();
-        // 至少要留下 keep_turns 轮，所以最多能压掉 len - keep_turns 轮
-        if ranges.len() <= keep_turns {
-            return None;
-        }
-        let max_cut_turns = ranges.len() - keep_turns;
         let start = self.system_prefix_len();
-
-        // 从"只压一轮"起步，往后加，直到**剩下的部分**已经装得下 target
-        let mut chosen = 1usize;
-        for n in 1..=max_cut_turns {
-            let cut = ranges[n - 1].1;
-            let kept = &self.items[cut..];
-            let kept_tokens = counter.count(kept);
-            // 摘要本身也要占地方：粗估成被压部分的 1/5（写摘要总会短很多）
-            let removed_tokens = counter.count(&self.items[start..cut]);
-            let summary_est = removed_tokens / 5;
-            chosen = n;
-            if kept_tokens + summary_est <= target_tokens {
-                break;
+        let all = self.balanced_positions(start, self.items.len());
+        // **保底要留下的那一段**从哪开始：正常是"最近 keep_turns 轮的起点"；
+        // 轮数本来就不够时，保底的就是**全部历史**。
+        let floor_from = if ranges.len() > keep_turns {
+            ranges[ranges.len() - keep_turns].0
+        } else {
+            start
+        };
+        // 两条路，**分界线就是"保底那几轮够不够切"**：
+        let chosen = if ranges.len() > keep_turns {
+            // **正常那条**：有得切。在保底之上"能切多少切多少"——
+            // 先找"切得最少又装得下"的，找不到就取那个范围内**最深**的一个。
+            let normal = self.balanced_positions(start, floor_from);
+            normal
+                .iter()
+                .find(|cut| self.kept_fits(**cut, start, target_tokens, counter))
+                .copied()
+                .or_else(|| normal.last().copied())?
+        } else {
+            // **保底覆盖了全部历史**（轮数本来就不够，比如"只有一个回合"）。
+            // 老行为是直接不压 —— 而那条正是 #105 说的病：
+            // 一个回合里连着几十次工具调用时，窗口会爆在回合中间，而压缩帮不上忙。
+            //
+            // 现在只在**真的装不下**时才动手：全部历史 ≤ 目标 ⇒ 什么都不做（老行为）；
+            // 装不下 ⇒ **往这一轮内部切**，只保底留**最后一个完整段落**
+            // （最后一次调用对 + 它之后的话）。
+            //
+            // ⚠️ 它把 `keep_recent_turns` 从**硬下限**变成了**软下限**：
+            // 保底保不住时，宁可多压一点，也不要让窗口爆在回合中间。
+            // 这条取舍记在 README 那四条硬要求里。
+            if counter.count(&self.items[start..]) <= target_tokens {
+                return None;
             }
-        }
-        let cut = ranges[chosen - 1].1;
+            let soft_max = all.get(all.len().checked_sub(2)?).copied()?;
+            self.balanced_positions(start, soft_max).last().copied()?
+        };
+        // 压掉了几轮：数一数 `[start, cut)` 里跨过了几个 `User`
+        let turns = self.items[start..chosen]
+            .iter()
+            .filter(|i| i.kind == ItemKind::User)
+            .count();
+        let mid_turn = !ranges.iter().any(|(_, end)| *end == chosen);
         Some(CutPlan {
-            cut,
-            turns: chosen,
+            cut: chosen,
+            turns,
+            mid_turn,
             before_tokens: self.tokens(counter),
         })
+    }
+
+    /// **合法的切点**：`[start, cut)` 里"调了还没回"的调用数为 0。
+    ///
+    /// 这就是"调用与结果同进同出"的**全部**内容 —— 只要这个位置上没有悬着的调用，
+    /// 切在回合中间也是安全的。系统前缀本身永远不切（`cut > start`）。
+    fn balanced_positions(&self, start: usize, max_cut: usize) -> Vec<usize> {
+        let mut open = 0i64;
+        let mut out = Vec::new();
+        for (i, item) in self.items.iter().enumerate().skip(start) {
+            // ⚠️ **切点不许越过 `max_cut`** —— 那是"必须留下的那几轮"的第一项。
+            // 第一版写成 `i > max_cut`，于是它会在 `max_cut` 那一项上也推一个
+            // `i + 1`：**把该留下的那一轮的第一项一起吃掉了**。
+            // 抓到它的是"至少要留 2 轮"那条测试（它算出留了 1 轮）。
+            if i + 1 > max_cut {
+                break;
+            }
+            match item.kind {
+                ItemKind::ToolCall { .. } => open += 1,
+                ItemKind::ToolResult { .. } => open -= 1,
+                _ => {}
+            }
+            // `i + 1` = "切在它之后"；`open == 0` = 那一刻没有悬着的调用
+            if open == 0 && i + 1 > start {
+                out.push(i + 1);
+            }
+        }
+        out
+    }
+
+    /// 切在 `cut` 之后，剩下的（加上摘要的估算体积）装得下目标吗？
+    fn kept_fits(
+        &self,
+        cut: usize,
+        start: usize,
+        target_tokens: u64,
+        counter: &dyn TokenCounter,
+    ) -> bool {
+        let kept_tokens = counter.count(&self.items[cut..]);
+        // 摘要本身也要占地方：粗估成被压部分的 1/5（写摘要总会短很多）
+        let summary_est = counter.count(&self.items[start..cut]) / 5;
+        kept_tokens + summary_est <= target_tokens
     }
 
     /// 把 `[0, cut)`（不含系统前缀）换成一条摘要，按 `placement` 放回去。
@@ -170,9 +246,25 @@ impl History {
     /// 这条不写成文档里的一句希望 —— 它是压缩之后必须过的一关。
     pub fn assert_safe(&self) -> Result<(), String> {
         let mut open_calls = 0i32;
+        // **按 id 配对的第二道**（2026-09-20 加）：原来只数个数 —— 而"个数对得上"
+        // 不等于"配得上"：一个**没有 call_id**的结果能把计数凑平，
+        // 而真 provider 那边会因此拒绝整条请求（`tool_calls` 必须逐个有回信）。
+        // 它抓到的第一个真 bug 就是超时那条路：结果当时没带 id。
+        let mut open_ids: Vec<String> = Vec::new();
         for item in &self.items {
+            let id = item
+                .data
+                .as_ref()
+                .and_then(|d| d.get("call_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             match item.kind {
-                ItemKind::ToolCall { .. } => open_calls += 1,
+                ItemKind::ToolCall { .. } => {
+                    open_calls += 1;
+                    if let Some(id) = id {
+                        open_ids.push(id);
+                    }
+                }
                 ItemKind::ToolResult { .. } => {
                     open_calls -= 1;
                     if open_calls < 0 {
@@ -181,6 +273,19 @@ impl History {
                             item.text
                         ));
                     }
+                    if let Some(id) = id {
+                        match open_ids.iter().position(|x| x == &id) {
+                            Some(pos) => {
+                                open_ids.remove(pos);
+                            }
+                            None => {
+                                return Err(format!(
+                                    "结果带的是 `call_id={id}`，可没有哪个还开着口的调用用它 —— \
+                                     这一对配不上（切点切了，或者上游漏了 call_id）"
+                                ))
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -188,6 +293,12 @@ impl History {
         if open_calls != 0 {
             return Err(format!(
                 "有 {open_calls} 次工具调用没有结果就断了 —— 切点把一对切开了"
+            ));
+        }
+        if let Some(left) = open_ids.first() {
+            return Err(format!(
+                "还有调用 `call_id={left}` 没等到结果 —— 个数虽然是平的，\
+                 但**配对配不上**（结果那边多半没带 id）"
             ));
         }
         Ok(())
@@ -274,10 +385,88 @@ mod tests {
         assert!(eager.turns > lazy.turns, "目标越小该压得越狠：{} vs {}", eager.turns, lazy.turns);
     }
 
+    /// **轮数不够时**：装得下就不压；**装不下就往轮里切**（#105 那条新规则）。
+    ///
+    /// 这条测试是从它的反面改过来的：原来断言"轮数不够 ⇒ 一定不压"。
+    /// 那句话在"只有一个超大回合"时会变成"窗口爆在回合中间而压缩帮不上忙"。
+    /// 现在它两半都断言 —— **旧的那半没丢**（装得下时照样不动手）。
     #[test]
-    fn nothing_to_cut_when_turns_are_few() {
+    fn too_few_turns_means_no_cut_unless_it_does_not_fit() {
+        let c = HeuristicCounter::new();
         let h = history_of(2);
-        assert!(h.plan_cut(2, 0, &HeuristicCounter::new()).is_none());
+        // 目标给得宽（保底就是全部历史，装得下）⇒ 什么都不做
+        assert!(h.plan_cut(2, u64::MAX, &c).is_none());
+        // 目标够不着 ⇒ **往这一轮里切**，而不是放弃
+        let plan = h.plan_cut(2, 1, &c).expect("装不下就该往轮里切");
+        assert!(plan.mid_turn, "这一刀在回合内部");
+    }
+
+    /// **一个超长回合内部也能压**（待定 #105）。
+    ///
+    /// 在这之前切点只在轮边界，而"只有一轮"时那条规则直接返回 `None` ——
+    /// 于是一个回合里连着几十次工具调用时，窗口**必然爆在回合中间**，
+    /// 而压缩一点忙都帮不上。
+    #[test]
+    fn a_single_huge_turn_can_be_cut_inside() {
+        let mut h = History::new();
+        h.push(Item::new(ItemKind::System, "你是助手"));
+        h.push(Item::user("把这件事办完"));
+        // 一轮里连着 8 次工具调用
+        for n in 1..=8 {
+            h.push(Item::assistant(format!("第 {n} 步")));
+            h.push(Item::tool_call("term.run", &format!("{{\"cmd\":\"echo {n}\"}}")));
+            h.push(Item::tool_result("term.run", format!("结果 {n}")));
+        }
+        h.push(Item::assistant("办完了"));
+        let plan = h
+            .plan_cut(1, 0, &HeuristicCounter::new())
+            .expect("一个长回合内部该能切");
+        assert!(plan.mid_turn, "这一刀就在回合内部");
+        assert!(plan.cut < h.items().len(), "切点得落在历史内部");
+        // 切开之后不变量还得成立（调用对没被切开）
+        let mut h2 = h.clone();
+        h2.replace_prefix_with_summary(plan.cut, Item::new(ItemKind::Summary, "摘要"), true);
+        assert!(h2.assert_safe().is_ok(), "{:?}", h2.assert_safe());
+        // 而且**保底留下最后一个完整段落**：最后一条助手话还在
+        assert_eq!(h2.items().last().unwrap().text, "办完了");
+    }
+
+    /// **切点不许切开一对调用**：随便挑一个位置试，只有"开着的调用为 0"的地方能切。
+    #[test]
+    fn balanced_positions_never_land_between_a_call_and_its_result() {
+        let h = history_of(3);
+        let positions = h.balanced_positions(h.system_prefix_len(), h.items().len());
+        for p in positions {
+            let mut probe = h.clone();
+            probe.push(Item::new(ItemKind::Assistant, "哨兵"));
+            // 在 p 处切一刀（把 [start,p) 换成摘要），不变量该照常成立
+            probe.replace_prefix_with_summary(p, Item::new(ItemKind::Summary, "摘要"), false);
+            assert!(probe.assert_safe().is_ok(), "切在 {p} 之后不该破配对");
+        }
+    }
+
+    /// **按 `call_id` 配对的第二道闸**（2026-09-20 加）：个数平了、可配对配不上。
+    ///
+    /// 这条抓到的第一个真 bug 是**超时那条路**：调用带着 id，而那条
+    /// "它一直没回"的结果**没带 id** —— 计数是平的，可真 provider 那边
+    /// 「assistant 的 tool_calls 必须有对应回信」会因此拒绝整条请求。
+    #[test]
+    fn a_result_without_its_call_id_is_caught() {
+        let mut h = History::new();
+        h.push(Item::new(ItemKind::System, "你是助手"));
+        h.push(Item::user("干点活"));
+        h.push(Item::tool_call_with("term.run", &serde_json::json!({"cmd": "ls"}), "call_1"));
+        // 老写法：结果**没带 id**
+        h.push(Item::tool_result("term.run", "结果"));
+        let err = h.assert_safe().expect_err("个数平了、配对配不上 —— 该拦");
+        assert!(err.contains("call_1"), "{err}");
+        // 补上 id 就合法了
+        let mut ok = History::new();
+        ok.push(Item::new(ItemKind::System, "你是助手"));
+        ok.push(Item::user("干点活"));
+        ok.push(Item::tool_call_with("term.run", &serde_json::json!({"cmd": "ls"}), "call_1"));
+        ok.push(Item::tool_result_with("term.run", "结果", "call_1"));
+        assert!(ok.assert_safe().is_ok());
     }
 
     #[test]

@@ -1381,6 +1381,13 @@ impl Agent {
                     .previous_summary()
                     .map(|s| s.chars().count())
                     .unwrap_or(0),
+                // **这一刀切在回合内部吗**（#105）：它决定"模型接下来看到什么"的形状 ——
+                // 轮边界那刀是"摘要 + 若干完整轮次"，回合内部那刀是
+                // "摘要 + 同一个回合的后半截"。排查"它为什么忘了刚说过的话"时要分得开。
+                "mid_turn": r.mid_turn,
+                // 配对没成立的话原因在这儿（成立就是 null）—— 护栏不该变成杀手，
+                // 但**必须留下痕迹**
+                "pairing_note": r.pairing_note,
                 "reason": r.reason,
                 "window_before": r.window_before,
                 "window_after": r.window_after,
@@ -1413,9 +1420,15 @@ impl Agent {
         for corr in expired {
             if let Some(p) = self.pending.remove(&corr) {
                 eprintln!("[agent] 调用 {} 超时（{}）", p.call.tool, corr);
-                let item = Item::tool_result(
+                // ⚠️ **必须带上 `call_id`**（2026-09-20 修）：原来这条结果没带 id，
+                // 于是历史里是「带 id 的调用 + 没 id 的结果」—— 个数是平的，
+                // 可真 provider 那边「assistant 的 tool_calls 必须有对应回信」
+                // 会因此**拒绝整条请求**（下一次模型调用直接 400）。
+                // 抓到它的是把 `assert_safe` 升级成"按 `call_id` 配对"之后。
+                let item = Item::tool_result_with(
                     &p.call.tool,
                     format!("（超时：{} 一直没回，我不知道它做没做）", p.call.to),
+                    &p.call_id,
                 );
                 self.note_item(out, item);
             }

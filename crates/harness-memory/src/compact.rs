@@ -77,6 +77,14 @@ pub struct CompactionRecord {
     pub summary_bytes: usize,
     /// 摘要放在哪个下标（给"位置契约"留证据）
     pub summary_at: usize,
+    /// **这一刀切在回合内部**（#105）—— "模型接下来看到什么"的形状不一样：
+    /// 轮边界那刀切完是"摘要 + 若干个完整轮次"；回合内部那刀是
+    /// "摘要 + **同一个回合的后半截**"。排查"它为什么忘了刚说过的话"时，
+    /// 这两者要分得开。
+    pub mid_turn: bool,
+    /// 压缩之后配对**没成立**的话，这里是原因（成立就是 `None`）。
+    /// 它**不阻止压缩**（护栏不该变成杀手），但必须留下痕迹。
+    pub pairing_note: Option<String>,
 }
 
 impl CompactionRecord {
@@ -166,9 +174,19 @@ impl<'a> Compactor<'a> {
         let removed =
             history.replace_prefix_with_summary(plan.cut, summary_item, before_last_user);
 
-        // **切点安全性的运行时断言** —— 不许留下半对调用
-        if let Err(e) = history.assert_safe() {
-            panic!("压缩破坏了调用/结果的配对：{e}");
+        // **切点安全性的运行时检查** —— 不许留下半对调用。
+        //
+        // ⚠️ 2026-09-20 从 `panic!` 改成**记录 + 出声**：这条不变量现在有两半 ——
+        // **计数**（切点能破坏的那一半）和**按 `call_id` 配对**
+        // （上游能破坏的那一半：谁漏了 id）。后一半出了问题**不该把智能体打死**
+        // （它可能正干到一半），但也**绝不许闷声过去**：历史照旧用、记进记录、stderr 说一遍。
+        // 切点本身由 `balanced_positions` 保证不拆对；真要拆了，测试会先红。
+        let pairing_note = history.assert_safe().err();
+        if let Some(e) = &pairing_note {
+            eprintln!(
+                "[memory] 压缩之后配对不成立：{e} —— 历史照旧用，但这条要查\
+                 （切点是按「开着的调用为 0」选的，所以多半是上游漏了 call_id）"
+            );
         }
 
         let tokens_after = history.tokens(self.counter);
@@ -206,6 +224,8 @@ impl<'a> Compactor<'a> {
             removed,
             summary_bytes,
             summary_at,
+            mid_turn: plan.mid_turn,
+            pairing_note,
         };
         hooks.post_compact(&record);
         Some(record)
@@ -294,11 +314,24 @@ mod tests {
         let r = c
             .compact(&mut h, &mut w, When::PreTurn, Reason::ContextLimit, &mut NoHooks)
             .unwrap();
+        assert!(r.tokens_after < r.tokens_before, "压完总得比压之前小");
+        // ⚠️ **这里不能断言 `≤ target`**（2026-09-20 改）：目标只是**规划时的估计** ——
+        // 规划用"被压部分 ÷ 5"去猜摘要多大，而真正的摘要**写出来才知道多大**。
+        // README 里早就记过这条（"'压到目标'是个做不到的保证 …… 判据只能是
+        // '落到触发线以下'"），可这条测试当时写的是 `≤ target` —— 它一直是**靠运气过的**。
+        // 切点细化到调用对粒度之后（#105），那个运气没了，于是它红了：
+        // 现在它断言的是**真正保证得住**的那两条。
+        let trigger = policy.trigger_tokens(4000);
         assert!(
-            r.tokens_after <= policy.target_tokens(4000),
-            "压完 {} 应当 ≤ 目标 {}",
-            r.tokens_after,
-            policy.target_tokens(4000)
+            r.tokens_after < trigger,
+            "压完 {} 应当落到触发线 {trigger} 以下",
+            r.tokens_after
+        );
+        // 而且要**明显**低于触发线（"一次压到位"，不是刚好压回去一点）
+        assert!(
+            r.tokens_after < trigger * 2 / 3,
+            "压完 {} 只是勉强躲进触发线 {trigger} —— 那不叫一次压到位",
+            r.tokens_after
         );
     }
 
