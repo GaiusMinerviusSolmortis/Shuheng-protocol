@@ -107,6 +107,13 @@ $r11 = Ask 'term:1' 'c-11' @{ tool = 'read'; args = @{ instance_id = 't-1' } }
 $r12 = Ask 'term:1' 'c-12' @{ tool = 'read'; args = @{ instance_id = 't-1' } }
 $r13 = Ask 'term:1' 'c-13' @{ tool = 'send'; args = @{ instance_id = 't-1'; text = 'x' } }
 $r14 = Ask 'term:1' 'c-14' @{ tool = 'status' }
+# **带引号的命令行要原样到达 shell**（2026-09-20 抓到的老 bug）：
+# Rust 的 `Command::arg` 会替我们把 `"` 转义成 `\"`，而 **cmd.exe 不认那套** ——
+# `start /B cmd /C \"ping …\"` 会报"不认识这条命令"；
+# 更阴的是引号配对被打乱之后 PowerShell 会把 `$t` 当成它自己的变量展开成空，
+# 命令被掏空了还在"正常"退出。**之前一条验收命令都没用过引号**，所以它活到今天。
+$r20 = Ask 'term:1' 'c-20' @{ tool = 'run'; args = @{ instance_id = 't-1'; cmd = 'echo "两个 词"' } }
+$r21 = Ask 'term:1' 'c-21' @{ tool = 'run'; args = @{ instance_id = 't-1'; cmd = 'powershell -NoProfile -Command "$w=1+1; Write-Output word-is-$w"' } }
 $r15 = Ask 'term:1' 'c-15' @{ tool = 'open'; args = @{ path = 'sub'; purpose = '第二条终端' } }
 Send 'term:1' 'c-16' @{ tool = 'run'; args = @{ instance_id = 't-2'; cmd = 'ping -n 30 127.0.0.1' } }
 Start-Sleep -Milliseconds 400
@@ -183,7 +190,9 @@ Check '18. 中控照常记账：每一次 run 都有结果收尾' {
     $chunks = @($records | Where-Object { $_.type -eq 'chunk' })
     $runCorrs = @($runs | ForEach-Object { $_.corr })
     $settled = @($records | Where-Object { $_.type -eq 'result' -and $runCorrs -contains $_.corr })
-    ($runs.Count -eq 11) -and ($settled.Count -eq $runCorrs.Count) -and ($chunks.Count -ge 2)
+    # 条数是**数出来的**（2026-09-20 加了两条"带引号"的，从 11 变 13）——
+    # 关键那一半是"每一次 run 都有结果收尾"，条数只是防止这条判据空转
+    ($runs.Count -eq 13) -and ($settled.Count -eq $runCorrs.Count) -and ($chunks.Count -ge 2)
 }
 <#
   第 19 条是 **2026-09-20 审计**补的，盯的是"服务自己的结果没合它自己声明的形"。
@@ -200,6 +209,14 @@ Check '19. **没有一条 run 的结果违反终端自己声明的形状**（闸
     $tripped = @($records | Where-Object { $_.payload.schema_violation -or $_.payload.code -eq 'schema_violation' })
     $nullWhy = @($records | Where-Object { $_.type -eq 'result' -and $_.payload.PSObject.Properties.Name -contains 'why' -and $null -eq $_.payload.why })
     ($tripped.Count -eq 0) -and ($nullWhy.Count -eq 0)
+}
+Check '20. **带引号的命令行原样到达 shell**（双引号里的词没被拆开）' {
+    $r20.payload.effect -eq 'confirmed' -and $r20.payload.output -like '*"两个 词"*'
+}
+Check '21. 而 shell 里那层 `$变量` **归它自己展开**（不是被我们吃掉）' {
+    # 这条是同一个 bug 更阴的那半：引号配对被打乱之后，PowerShell 会把 `$w`
+    # 当成它自己的变量、展开成空 —— 命令被掏空了还在"正常"退出
+    $r21.payload.effect -eq 'confirmed' -and $r21.payload.output -like '*word-is-2*'
 }
 Write-Host '== stdout（截断显示）==' -ForegroundColor Cyan
 $script:all | ForEach-Object {

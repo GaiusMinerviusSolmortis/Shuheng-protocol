@@ -129,8 +129,11 @@ pub const SANDBOX_FACES: &[(&str, &[&str])] = &[
     ("identity", &["same-user"]),
     // 拉起的进程看得见哪些可执行文件
     ("executables", &["none", "inherit"]),
-    // CPU / 内存 / 时间上限
-    ("resources", &["none", "timeout"]),
+    // CPU / 内存 / 时间上限。
+    // * `timeout`：只有**墙钟**超时（到点掐掉）；
+    // * `limits`：**墙钟 + 内核执行的硬限额**（内存 / 进程数 / CPU 时间）——
+    //   2026-09-20 终端做了这一档，值跟着事实走（开了才报）。
+    ("resources", &["none", "timeout", "limits"]),
 ];
 
 /// **存活状态**的词表 —— 这一轴归**中控**，不归服务。

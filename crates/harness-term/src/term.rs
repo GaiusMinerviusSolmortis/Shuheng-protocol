@@ -17,7 +17,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use crate::Inbound;
-use crate::job::Job;
+use crate::job::{Job, Limits};
 
 /// 一次 `run` 的结局。
 #[derive(Debug, Clone)]
@@ -42,6 +42,9 @@ pub struct Running {
     child: Child,
     /// 把这棵进程树一起管的 Job Object（Windows）。`None` = 只能杀一层。
     job: Option<Job>,
+    /// 这次跑完时 job 账本上的痕迹（峰值内存 / 起过几个进程）。
+    /// **它不是结论，是证据**：用来把"很可能撞了限额"说成推断。
+    pub account: crate::job::JobAccount,
     /// 还有几个读线程没读完（stdout / stderr 各一个）
     readers_left: u8,
     /// 进程自己已经退出了吗（退了但读线程没读完时**还不能回结果**，
@@ -71,6 +74,11 @@ pub struct Terminal {
     spill: Option<Spill>,
     /// 内存里最多留多少字节（超了就把前面的挪到磁盘）
     memory_cap: usize,
+    /// **这棵树的硬限额**（Job Object 上、由内核执行）。
+    ///
+    /// 默认全空 = 不限额：多严算"合理"是 profile 的事（待定 #3），
+    /// 而"默认开一个我拍的数"会在正常需求上碰壁。开了才报 `resources: "limits"`。
+    limits: Limits,
     pub read_cursor: usize,
 }
 
@@ -91,6 +99,7 @@ impl Terminal {
         holder: String,
         spill_path: PathBuf,
         memory_cap: usize,
+        limits: Limits,
     ) -> Self {
         // **新实例 = 空缓冲。**
         //
@@ -114,6 +123,7 @@ impl Terminal {
                 len: 0,
             }),
             memory_cap,
+            limits,
             read_cursor: 0,
         }
     }
@@ -269,7 +279,7 @@ impl Terminal {
         let mut child = command.spawn()?;
         // 先把它收进 job，再去读它的输出 —— **顺序不能反**：
         // 反过来的话，一个起得极快的命令可能在 assign 之前就已经生了孙子进程。
-        let job = Job::assign(&child);
+        let job = Job::assign(&child, self.limits);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -284,6 +294,7 @@ impl Terminal {
             deadline: timeout.map(|d| Instant::now() + d),
             child,
             job,
+            account: crate::job::JobAccount::default(),
             readers_left: 2,
             exit: None,
             timed_out: false,
@@ -390,7 +401,16 @@ impl Terminal {
 
     /// 收掉这一次运行，返回它（给调用方回结果用）。
     pub fn finish(&mut self, _outcome: &RunOutcome) -> Option<Running> {
-        self.running.take()
+        let mut running = self.running.take()?;
+        // **趁 job 还在，把它的账读出来**（读完就随 Running 一起 drop 掉了）。
+        //
+        // 为什么要读：限额是**内核执行的**，可内核没告诉我们"它是因为撞了限额被杀的"
+        // （那要完成端口通知，没做）。所以事后查两个计数器 ——
+        // 峰值内存 / 一共起过几个进程 —— 然后**按推断说话**。
+        if let Some(job) = running.job.as_ref() {
+            running.account = job.account();
+        }
+        Some(running)
     }
 
     /// 把正在跑的那条**结掉**，并把已经攒到的输出一起返回。
@@ -450,9 +470,31 @@ impl Pipe {
 }
 
 #[cfg(windows)]
+/// 把一条命令行交给系统 shell。
+///
+/// ⚠️ **Windows 上必须用 `raw_arg`，不能用 `arg`**（2026-09-20 抓到的老 bug）：
+///
+/// Rust 的 `Command::arg` 会按 **MSVCRT 那套规则**替我们转义参数 ——
+/// 参数里的 `"` 会变成 `\"`。可 **`cmd.exe` 不认那套转义**：
+/// 它看到的是字面反斜杠 + 一个引号切换，于是
+///
+/// * `\"` 留在命令行里（`start /B cmd /C \"ping …\"` ⇒ cmd 报"不认识这条命令"）；
+/// * 引号配对被打乱之后，PowerShell 那一层把 `$t` 当成**它自己的变量**展开成空 ——
+///   命令被掏空了还在"正常"退出，看起来像"跑完了"。
+///
+/// 这个坑从第一天就在，**而之前的验收命令一条引号都没用过**（`echo x` / `cd sub` /
+/// `ping -n 4`）—— 是"给终端加限额"那条测试随手写了个
+/// `powershell -Command "…"` 才把它撞出来的。
+///
+/// 修法：`raw_arg` 把命令行**原样**交出去，让 cmd 按**它自己的**规则解析；
+/// 引号怎么配、变量归谁展开，那是命令作者和 shell 之间的事，**不该由我们的
+/// 参数传递层替他决定**。
+#[cfg(windows)]
 fn shell(cmd: &str) -> Command {
+    use std::os::windows::process::CommandExt;
     let mut c = Command::new("cmd");
-    c.arg("/C").arg(cmd);
+    // 两个都 raw：`/C` 只是个开关，后面那一串才是**一整条命令行**
+    c.raw_arg("/C").raw_arg(cmd);
     c
 }
 
@@ -561,7 +603,15 @@ mod tests {
             crate_now(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        Terminal::new("t-1".into(), PathBuf::from("."), "p".into(), "h".into(), path, cap)
+        Terminal::new(
+            "t-1".into(),
+            PathBuf::from("."),
+            "p".into(),
+            "h".into(),
+            path,
+            cap,
+            Limits::default(),
+        )
     }
 
     /// **背压的落地形态是"溢出"，不是"让生产者阻塞"**（§5.17）：
@@ -615,6 +665,7 @@ mod tests {
             deadline: None,
             child: shell("exit").spawn().unwrap(),
             job: None,
+            account: crate::job::JobAccount::default(),
             readers_left: 2,
             exit: None,
             timed_out: false,
@@ -640,6 +691,7 @@ mod tests {
             deadline: None,
             child: Command::new("cmd").arg("/C").arg("exit").spawn().unwrap(),
             job: None,
+            account: crate::job::JobAccount::default(),
             readers_left: 2,
             exit: None,
             timed_out: false,

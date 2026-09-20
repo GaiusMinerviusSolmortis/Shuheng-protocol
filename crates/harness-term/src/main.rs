@@ -57,6 +57,12 @@ struct Args {
     memory_cap: usize,
     /// 溢出文件放哪（`data/spill/<sid>/<实例>.log`）
     spill_dir: PathBuf,
+    /// **这棵树的硬限额**（Job Object，内核执行 —— §5.8 决定二那张表里的"资源"面）。
+    ///
+    /// 默认全空 = 不限额。为什么默认不设：多严算"合理"是 **profile** 的事（待定 #3），
+    /// 而"默认开一个我拍的数"会在正常需求上碰壁（一次大编译就可能撞上）。
+    /// 打开之后 manifest 里那一面就从 `timeout` 变成 `limits` —— **声明跟着事实走**。
+    limits: job::Limits,
 }
 
 fn parse_args() -> Args {
@@ -70,6 +76,7 @@ fn parse_args() -> Args {
         inline_limit: 50_000,
         memory_cap: 1_048_576,
         spill_dir: PathBuf::from("data/spill"),
+        limits: job::Limits::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -95,6 +102,22 @@ fn parse_args() -> Args {
             "--spill-dir" => {
                 if let Some(v) = it.next() {
                     a.spill_dir = PathBuf::from(v);
+                }
+            }
+            // **三个限额**：单位都取人最容易说对的那个（MB / 个数 / 毫秒）
+            "--mem-limit-mb" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+                    a.limits.mem_bytes = Some(v.saturating_mul(1024 * 1024));
+                }
+            }
+            "--max-procs" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u32>().ok()) {
+                    a.limits.max_procs = Some(v);
+                }
+            }
+            "--cpu-time-ms" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+                    a.limits.cpu_time_ms = Some(v);
                 }
             }
             _ => {}
@@ -326,13 +349,23 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
             "network": "unrestricted",
             "identity": "same-user",
             "executables": "inherit",
-            "resources": "timeout"
+            // **2026-09-20 起它跟着事实走**：开了限额就报 `limits`，
+            // 没开就还是只有超时那一条。声明不许比事实大，也不许比事实小。
+            "resources": if args.limits.any() { "limits" } else { "timeout" }
         },
-        "sandbox_note": "**五个面里只有「时间」是真的**：`timeout_ms` 到点就整棵树掐掉。\
+        "sandbox_note": if args.limits.any() {
+            "**「时间」和「资源」这两面是真的**：`timeout_ms` 到点整棵树掐掉；\
+             另外三个限额（内存 / 进程数 / CPU 时间）关在同一个 Job 上、**由内核执行**。\
+             ⚠️ 文件系统 / 网络 / 身份 / 可执行文件**仍然没有限制** ——\
+             它跑的命令和你自己在命令行里跑的是同一个世界。\
+             我报的那个 `fence` 是**绑定范围**，**不是沙箱**。"
+        } else {
+            "**五个面里只有「时间」是真的**：`timeout_ms` 到点就整棵树掐掉。\
                           文件系统 / 网络 / 身份 / 可执行文件**都没有限制** ——\
                           它跑的命令和你自己在命令行里跑的是同一个世界。\
                           我报的那个 `fence` 是**绑定范围**（哪些路径归这个实例管），\
-                          **不是沙箱**；把这两件事混着叫「围栏」是这里最容易骗人的地方。",
+                          **不是沙箱**；把这两件事混着叫「围栏」是这里最容易骗人的地方。"
+        },
         // **参数表与结果形状都是服务自己的义务**（规范 §11.1 的 C 组）：
         // 只报工具名不报参数，等于让人猜怎么调；不报结果形状，就没人能验它。
         "tools": tools(),
@@ -414,6 +447,9 @@ fn tools() -> Vec<Value> {
             },
             // 输出太长溢出到文件时，全文在哪（§5.17）；没溢出就是 null
             "spilled_to": {"type": ["string", "null"]},
+            // **撞限额的推断**（2026-09-20）：只在真有迹象时给，而且是**推断**不是结论。
+            // 它必须在这儿声明 —— 契约是闭合的，"结果里多一个字段"会被投递闸门拦下。
+            "limits": {"type": ["string", "null"]},
         }))
         // 成功和"做了一半"都得给输出 —— 那正是模型要看的东西；
         // 而"不是没做"这句话，只有带着 output 才说得清（§11.2 五态）。
@@ -799,6 +835,7 @@ impl Term {
             holder.clone(),
             spill,
             self.args.memory_cap,
+            self.args.limits,
         );
         self.terms.insert(id.clone(), t);
 
@@ -969,6 +1006,11 @@ impl Term {
         // **命令失败 ≠ 调用失败。**
         // `effect` 说的是"这个动作生效了没有"，不是"命令成功了没有"（§11.2）。
         // 退出码 1 的命令**确实执行了** —— 那是数据，不是传输错误。
+        // **它是不是撞了限额？** —— 内核执行的限额**不会**直接告诉我们"是我杀的"
+        // （那要完成端口通知，没做）。所以这里事后查两个计数器，
+        // 然后**按推断说话**：措辞是"很可能"，证据（峰值 / 个数）一起给出来。
+        // 推断就是推断 —— 写成结论的话，模型会拿它当事实去排查。
+        let limit_note = limits_note(&self.args.limits, &running.account);
         let mut payload = match &outcome {
             RunOutcome::Exited(code) => json!({
                 "route": null, "effect": "confirmed",
@@ -1022,6 +1064,10 @@ impl Term {
             if let Some(obj) = payload.as_object_mut() {
                 obj.entry("why".to_string()).or_insert_with(|| json!(how_to_read));
             }
+        }
+        // 限额那条判词：**只在真有迹象时加**，而且明说它是推断
+        if let (Some(note), Some(obj)) = (limit_note, payload.as_object_mut()) {
+            obj.insert("limits".into(), json!(note));
         }
         let reply = self.mint(
             MessageType::Result,
@@ -1249,6 +1295,75 @@ impl Term {
 }
 
 /// 这条命令是不是 `cd`？是的话给出目标（裸 `cd` 给 `None`）。
+/// **它是不是撞了限额？** —— 返回一句**推断**（不是结论）。
+///
+/// ⚠️ **2026-09-20 第一版写错了，这里记下来**：当时写的是"峰值 ≥ 上限的 95%
+/// ⇒ 很可能撞了内存上限"。那是**把三个限额当成一种发作方式**了 ——
+/// 它们其实不一样（见 `job.rs` 文件头那张表）：
+///
+/// * **CPU 时间**超了 ⇒ **内核终止整个 job**（这一条**是杀**，证据也硬：
+///   用掉的 CPU 时间会顶到上限）⇒ 可以说"撞了"，并说清是内核干的；
+/// * **进程数**超了 ⇒ 再创建就**失败**（命令自己报错），累计数会顶到上限
+///   ⇒ 只给一句弱提示；
+/// * **内存**超了 ⇒ **命令自己分配失败**，**内核根本没杀它** ⇒
+///   只报测量值（离上限多远），**不说"它被杀了"** —— 那句话是假的。
+///
+/// 两半分开：**测量的数每次都报**（那是事实），**推断只在有证据时说**。
+fn limits_note(limits: &job::Limits, account: &job::JobAccount) -> Option<String> {
+    if !limits.any() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(cap) = limits.mem_bytes {
+        lines.push(format!(
+            "峰值内存 {:.1} MB（上限 {:.1} MB）",
+            account.peak_mem_bytes as f64 / 1_048_576.0,
+            cap as f64 / 1_048_576.0
+        ));
+    }
+    if let Some(n) = limits.max_procs {
+        lines.push(format!(
+            "一共起过 {} 个进程（上限 {n}）",
+            account.total_processes
+        ));
+    }
+    if let Some(ms) = limits.cpu_time_ms {
+        lines.push(format!(
+            "用掉 {} ms CPU 时间（上限 {ms} ms）",
+            account.cpu_time_ms
+        ));
+    }
+    let mut out = format!("这次运行的账：{}。", lines.join("；"));
+    // **只有 CPU 那条是"杀"**，所以只有它敢说"撞了"
+    if let Some(ms) = limits.cpu_time_ms {
+        if ms > 0 && account.cpu_time_ms >= ms / 100 * 95 {
+            out.push_str(
+                "**撞了 CPU 时间上限** —— 这一条是**内核到点终止整棵树**（不是它自己退的），\
+                 所以那条命令没有跑完。",
+            );
+            return Some(out);
+        }
+    }
+    if let Some(n) = limits.max_procs {
+        if n > 0 && account.total_processes >= n {
+            out.push_str(
+                "进程数顶到上限了：**再想创建进程会失败**（命令自己会报错），\
+                 而这一条**不是**被杀的 —— 是它创建不出来。",
+            );
+        }
+    }
+    if let Some(cap) = limits.mem_bytes {
+        if cap > 0 && account.peak_mem_bytes >= cap / 100 * 95 {
+            out.push_str(
+                "内存峰值贴着上限：**命令多半分配失败了**（`malloc`/`new` 返回不了）——\
+                 ⚠️ 这一条**不是内核杀它**，内存限额只挡分配。",
+            );
+        }
+    }
+    Some(out)
+}
+
+/// 这条命令是不是 `cd`？是的话给出目标（裸 `cd` 给 `None`）。
 fn cd_target(cmd: &str) -> Option<Option<String>> {
     let t = cmd.trim();
     if t == "cd" {
@@ -1298,6 +1413,7 @@ mod tests {
             holder.into(),
             std::env::temp_dir().join("harness-term-test-spill.log"),
             1_048_576,
+            job::Limits::default(),
         )
     }
 
@@ -1345,6 +1461,8 @@ mod tests {
             inline_limit: 50_000,
             memory_cap: 1_048_576,
             spill_dir: PathBuf::from("data/spill"),
+            // 这一条测的是"**没开限额**时 manifest 也合规"（`resources: timeout`）
+            limits: job::Limits::default(),
         };
         let report = harness_service::contract::check_manifest(&manifest(&args, &fence));
         assert!(report.is_ok(), "{:?}", report.errors);
