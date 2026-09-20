@@ -278,6 +278,11 @@ struct Queued {
 
 /// 一次还没落地的调用。**中控记得"我替谁在等谁"** ——
 /// 服务崩的时候要靠它给每个调用者一个诚实的交代（§4.6）。
+///
+/// `Clone` 是为**投递前的闸门**用的：那条路要读着 `pending` 里的记录
+/// 去校验结果形状，**但不能把记录摘走**（摘了，方向规则四就看不见它了 ——
+/// 详见 `on_service_line` 里那段）。
+#[derive(Clone)]
 struct PendingCall {
     target: String,
     caller: String,
@@ -731,10 +736,11 @@ fn run() -> i32 {
                 // 排空是为了**不变量二的反面**：已经发出去的调用，结果还没落盘就走人，
                 // 日志里就会留下一个"有请求、无结果"的洞。
                 //
-                // TODO -- 未决 #8：这里用的是"回合结束"这个边界。另外两个边界
-                // （模型请求前 / **有副作用工具分派前**）还没拍板。阶段 2 的编辑器
-                // 是第一个有副作用的工具 —— 到那时，投递一次写操作之前必须先 barrier，
-                // 否则"日志说没做、文件其实改了"会变成一个查不出来的洞。
+                // 这里用的是"**回合结束**"这个边界 —— 三个边界里的第三个（规范-消息协议 §5.6）。
+                // 另外两个**已经都在了**（2026-09-20）：
+                //   * **有副作用工具分派前** —— 见 `dispatch()`（判据是 `destructiveHint`）；
+                //   * **模型请求前** —— 智能体发 `{"op":"barrier"}` 请中控落（见 `local_op`）。
+                // 边界怎么选仍然是**暂定值**（待定 #100 / 规范 §8 #8），但机制不是空话了。
                 let _ = app.log.barrier();
                 if app.pending.is_empty() {
                     break;
@@ -1104,14 +1110,33 @@ impl App {
             }
         }
         // **投递前的闸门**：结果得合它自己声明过的形（规范-工具服务 §11.1 C 组）。
-        if env.kind == MessageType::Result {
-            if let Some(corr) = &env.corr {
-                if let Some(call) = self.pending.remove(corr) {
-                    self.gate_result(&mut env, &call);
-                }
+        //
+        // ⚠️ **这里只"看"`pending`，不许"摘"。**（2026-09-20 修掉一个真 bug）
+        //
+        // 原来这里是 `self.pending.remove(corr)` —— 先摘、再 `route`。
+        // 而 `route` 的方向规则四判的是"回给中控的结果得是中控要过的"，
+        // **它查的正是 `pending`**。于是顺序一颠倒，**每一条回给中控的结果
+        // 都被判成孤儿结果**：中控自己的健康探针，回包 100% 被丢掉，
+        // 还每轮往日志和通道里灌一条假故障（smoke-lifecycle 里 18 发 18 中）。
+        //
+        // 教训和"落盘判断必须在投递那一刻算"是同一条：
+        // **一张表要是被两处读，就得说清谁在什么时候动它** —— 摘账要等这条
+        // 结果把整个 `route` 走完（判方向、投递、留痕），不能抢在它前面。
+        let settling = if env.kind == MessageType::Result {
+            env.corr.clone()
+        } else {
+            None
+        };
+        if let Some(corr) = &settling {
+            if let Some(call) = self.pending.get(corr).cloned() {
+                self.gate_result(&mut env, &call);
             }
         }
         self.route(env);
+        // 走完才算这笔调用结束（没 `corr` 的结果本来就不在表里）
+        if let Some(corr) = settling {
+            self.pending.remove(&corr);
+        }
     }
 
     /// **结果合形吗？**（第二道闸门）
@@ -1518,12 +1543,11 @@ impl App {
             })
             .collect();
         for (corr, call) in orphans {
-            self.pending.remove(&corr);
             let env = self.mint(
                 MessageType::Result,
                 CTRL,
                 &call.caller,
-                Some(corr),
+                Some(corr.clone()),
                 Authority::System,
                 json!({
                     "effect": "unverifiable",
@@ -1539,6 +1563,13 @@ impl App {
             );
             // 同上：这一条是**给调用方**的，不是给控制台看的
             self.route(env);
+            // ⚠️ **摘账要等它走完 `route`**（2026-09-20）。
+            //
+            // 这一条和 `on_service_line` 里那处是**同一个病**：方向规则四靠
+            // `pending` 认"这条结果是不是中控要过的"。而探针的调用方**就是中控自己** ——
+            // 于是这条 `ctrl → ctrl` 的交代，在"先摘后发"的写法下会被判成孤儿结果，
+            // 反过来又生一条假故障（就是它把 smoke-lifecycle 从 0 条孤儿顶到 1 条）。
+            self.pending.remove(&corr);
         }
     }
 
@@ -1577,9 +1608,10 @@ impl App {
         for (svc, list) in expired {
             self.waiting_ready.remove(&svc);
             for e in list {
-                if let Some(corr) = &e.corr {
-                    self.pending.remove(corr);
-                }
+                // 顺序同 `on_service_line` / `on_service_exited`：**先交代，后摘账**。
+                // 今天到不了这里（探针只在服务自报家门之后才发，不会进这条队列），
+                // 但这是同一个坑 —— 三处写法必须一样，否则以后谁加一条
+                // "中控自己排队的调用"，就又生一条假孤儿。
                 self.refuse_call(
                     &e,
                     "service_down",
@@ -1587,6 +1619,9 @@ impl App {
                     "这不是你的用法问题：要么它启动失败了（看它的 stderr），\
                      要么它的 manifest 过不了注册关。发 `list` 看它的 state",
                 );
+                if let Some(corr) = &e.corr {
+                    self.pending.remove(corr);
+                }
             }
         }
 
@@ -2101,7 +2136,26 @@ impl App {
         // ⚠️ **这个判断必须在投递这一刻做，不能在排队那一刻做** ——
         // 排队时它多半还没自报家门，那时算出来必然是"读不到声明"，
         // 于是每一次调用都会保守落盘（连 `read` 都落）。这条是 smoke-editor 抓出来的。
-        let (barrier, why) = if q.env.kind == MessageType::Request {
+        // ⚠️ **只对"发给工具服务"的请求判**（2026-09-20）。
+        //
+        // 原来这里只看"是不是 request"，于是**给智能体派一个活**也会走进同一段：
+        // `tool_hints("agent:dada", "")` 当然读不到声明 ⇒ 走"保守落一次"那条分支，
+        // 白 fsync 一次，还在 stderr 上印一句会误导人的
+        // "读不到它的声明（tool=）"——**智能体本来就不是工具，没有声明可读**。
+        //
+        // 这条守的是"文件会不会被动"：一次派活本身不动任何文件。
+        // 判据改得跟 `route` 里盖章那处**同一个**（`to_tool_service`），
+        // 免得同一件事在第二个地方算出第二个答案。
+        // ⚠️ **智能体也是"被拉起来的服务进程"**（`service.is_some()` 对它同样为真）——
+        // 所以判据必须跟 `route` 那道注册关一样带上 `!is_agent`，
+        // 否则"派活给智能体"照样会走进来。这是这条判据**第一次写就写错**的地方，
+        // 是 smoke-barrier 第 9 条当场抓到的。
+        let to_tool_service = self
+            .reg
+            .get_ref(&q.env.to)
+            .map(|i| !i.is_agent && i.service.is_some())
+            .unwrap_or(false);
+        let (barrier, why) = if q.env.kind == MessageType::Request && to_tool_service {
             let tool = q
                 .env
                 .payload
@@ -2121,13 +2175,15 @@ impl App {
         };
         if barrier {
             match self.log.barrier() {
-                Ok(()) => {
+                // `synced` 为假 = 本来就干净、这次短路了 —— **不是失败**
+                Ok(synced) => {
                     if self.debug_barriers || why.contains("读不到") {
                         eprintln!(
-                            "[ctrl] 屏障：分派前先落盘（{}，因为{}{}）",
+                            "[ctrl] 屏障：分派前先落盘（{}，因为{}{}）{}",
                             q.env.to,
                             why,
-                            if deferred { "；这条攒到它报到之后才投" } else { "" }
+                            if deferred { "；这条攒到它报到之后才投" } else { "" },
+                            if synced { "" } else { " —— 日志本来就干净，这次没 fsync" }
                         );
                     }
                 }
@@ -2164,6 +2220,58 @@ impl App {
                     "data": {"pong": true, "last_seq": self.log.last_seq(), "sid": self.sid}
                 });
                 self.reply(req, payload);
+            }
+            // **落盘屏障**：让**别的进程**也能说"先把这个回合记下来"（规范-消息协议 §5.5 #8）。
+            //
+            // 为什么要有这个 op：会话日志是**中控独占**的（只有它写、只有它 fsync），
+            // 而"模型请求前"这个边界发生在**智能体**进程里 —— 它手里没有那支笔，
+            // 但它比谁都清楚"我要去问模型了"。所以边界归它判，动作归中控做。
+            //
+            // 它防的是什么：模型是在**中控日志之外**跑的一次远程调用，而模型看到的
+            // 那段上下文是**从日志里重建的**（不变量二）。日志要是还压在缓冲里，
+            // "模型见过什么"这件事就没有落盘的凭证 —— 崩在这中间，
+            // 重放出来的历史会和模型当时看到的**不是同一份**。
+            //
+            // `reason` 是调用方自己写的，中控**原话打出来**（跟遗嘱同一条纪律：
+            // 谁干的谁说明，中控不替它编）。
+            "barrier" => {
+                let reason = req
+                    .payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("（调用方没写原因）")
+                    .to_string();
+                match self.log.barrier() {
+                    Ok(synced) => {
+                        // 正常路径不出声（跟"分派前"那一处同一条纪律）：
+                        // 模型一回合要走好几步，默认每步一行就成了噪音。
+                        // 机制是不是真的发生了，看**日志里那条请求和它的答复**，
+                        // 要看实时痕迹就开 `--debug-barriers`。
+                        if self.debug_barriers {
+                            eprintln!(
+                                "[ctrl] 屏障：{reason}（{}，synced={}，seq={}）",
+                                req.from,
+                                synced,
+                                self.log.last_seq()
+                            );
+                        }
+                        self.reply(
+                            req,
+                            json!({"effect": "confirmed", "code": null,
+                                   "data": {"synced": synced, "last_seq": self.log.last_seq(),
+                                            "reason": reason}}),
+                        );
+                    }
+                    // **落不下去要明说。** 这条不是"小事"：它意味着"已记录"这个前提
+                    // 不成立了 —— 调用方该按 `unverifiable` 处理，而不是当成功继续跑。
+                    Err(e) => self.reply(
+                        req,
+                        json!({"effect": "unverifiable", "code": "refused",
+                               "why": format!("日志落盘失败：{e}"),
+                               "remedy": "这一下**没落成** —— 你接下来干的事将没有落盘凭证。\
+                                          先把结果告诉用户，或者查磁盘；别当成功继续"}),
+                    ),
+                }
             }
             "list" => {
                 let data = self.reg.snapshot();

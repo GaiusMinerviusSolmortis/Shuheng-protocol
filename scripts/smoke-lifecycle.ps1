@@ -170,6 +170,37 @@ Check '13. **敕令里带的是服务自己写的遗嘱**（不是中控编的�
         $_.payload.instance -eq 'echo:zombie' } | Select-Object -First 1
     $inj -and $inj.payload.text -like '*只是个 mock*' -and $inj.payload.text -notlike '*套话*'
 }
+<#
+  第 14/15 条是 **2026-09-20 审计**补的 —— 它们盯的是一个"看着接好了其实没接上"的地方：
+
+  中控的探针回包，**曾经 100% 被判成孤儿结果**。原因是两张纸的顺序：
+  `on_service_line` 先 `pending.remove(corr)`、再 `route`；而 `route` 的方向规则四
+  判"这条结果是不是中控要过的"，**查的正是 `pending`** —— 摘完了才问，当然说没有。
+  代价：探针的答复被丢掉（`route` 遇违规直接 return），还每轮生一条假故障。
+
+  这一条试过：修之前 18 条探针回包 → 18 条孤儿故障；修之后 0 条。
+  判据写在这里，是为了让"先摘后发"这个写法再也回不来。
+#>
+$toCtrl = @($records | Where-Object { $_.to -eq 'ctrl' -and $_.type -eq 'result' })
+$orphan = @($records | Where-Object { $_.payload.why -like '*孤儿结果*' })
+Check '14. **探针的回包没有被误判成孤儿结果**' {
+    $toCtrl.Count -ge 3 -and $orphan.Count -eq 0
+}
+Check '15. 服务掉线时它名下未决的调用**逐个被交代过**（含中控自己那笔探针），且没生孤儿' {
+    $sent = @($records | Where-Object { $_.from -eq 'ctrl' -and $_.type -eq 'request' } | ForEach-Object { $_.corr })
+    $settled = @($records | Where-Object { $_.payload.code -eq 'service_down' })
+    $toSelf = @($settled | Where-Object { $_.to -eq 'ctrl' })
+    # `ctrl → ctrl` 那条（把"探针的答复"交代给自己）正是**第二个踩坑点**：
+    # 服务掉线时"逐个交代"也曾经先摘账再 route，于是同样被判成孤儿。
+    # 所以这一条要指名道姓地查：**这些 crr 里，没有一个被 fault 成孤儿。**
+    # （第 14 条查的是总数，这条查的是"第二处写法有没有再犯"。）
+    $selfCorrs = @($toSelf | ForEach-Object { $_.corr })
+    $blamed = @($records | Where-Object { $_.payload.why -like '*孤儿结果*' } |
+        Where-Object { $selfCorrs -contains $_.corr })
+    $toCtrl.Count -gt 0 -and
+        (@($toCtrl | Where-Object { $sent -notcontains $_.corr }).Count -eq 0) -and
+        ($settled.Count -ge 1) -and ($toSelf.Count -ge 1) -and ($blamed.Count -eq 0)
+}
 
 Write-Host ''
 Write-Host '== 图上三个服务的状态（含给人看的那两样）==' -ForegroundColor Cyan

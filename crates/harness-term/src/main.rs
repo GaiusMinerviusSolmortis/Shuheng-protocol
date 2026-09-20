@@ -954,7 +954,7 @@ impl Term {
         // **命令失败 ≠ 调用失败。**
         // `effect` 说的是"这个动作生效了没有"，不是"命令成功了没有"（§11.2）。
         // 退出码 1 的命令**确实执行了** —— 那是数据，不是传输错误。
-        let payload = match &outcome {
+        let mut payload = match &outcome {
             RunOutcome::Exited(code) => json!({
                 "route": null, "effect": "confirmed",
                 "code": null,
@@ -962,9 +962,8 @@ impl Term {
                 "output": output,
                 "cursor": running.to,
                 "bytes": bytes,
-                "spilled_to": if trimmed { spilled_to } else { None },
-                // `why` 在成功时也能带（信封允许）—— 这里正好用来指路
-                "why": if trimmed { Some(how_to_read) } else { None }
+                "spilled_to": if trimmed { spilled_to } else { None }
+                // **`why` 不在这里写** —— 见下面那段（不能塞 `null`）
             }),
             RunOutcome::TimedOut => json!({
                 "route": null, "effect": "partial",
@@ -993,6 +992,22 @@ impl Term {
                 "remedy": "先看 output 判断它停在哪一步；要接着干就重新 run 一条"
             }),
         };
+        // **成功时可以带 `why`（信封允许）—— 但"没什么可说"时必须把键省掉，不能塞 `null`。**
+        //
+        // 2026-09-20 审计抓到的真 bug：这里原来写的是
+        // `"why": if trimmed { Some(how_to_read) } else { None }`，
+        // 而契约构造器（`harness_service::contract`）把 `why` 声明成 `{"type": "string"}`，
+        // schema 又是**闭合**的。于是**每一条输出没被裁剪的普通命令**（也就是绝大多数），
+        // 回来都带着 `"why": null` ⇒ 违反它**自己声明的形状** ⇒ 投递闸门每次都要
+        // 给它贴一张 `schema_violation`，并在日志里生一条系统事件。
+        //
+        // 它不是"闸门太严"，也不是"声明该放宽"：`why` 本来就不在 `required` 里 ——
+        // **什么都不想说时，正确形状是"没有这个键"**。声明是诚实的，错的只是这一行赋值。
+        if trimmed {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.entry("why".to_string()).or_insert_with(|| json!(how_to_read));
+            }
+        }
         let reply = self.mint(
             MessageType::Result,
             &running.by.clone(),

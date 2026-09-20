@@ -93,7 +93,7 @@
 | [07-界面](07-界面.md) | **§9、§12** GUI 作为消息流的投影、表示层、点击策略、桌宠不在框架内。 |
 | [08-记忆](08-记忆.md) | **§16** 锚点、分层、沉淀，以及**大眼记忆实现的评估**。 |
 | [09-模型](09-模型.md) | **§8、§15** 提示词编译与模型拼装。 |
-| [10-决策](10-决策.md) | 已定 **256** + 待定 **79** + 已解决待清账 3。**按主题分组，不再按时间追加。** 计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验 |
+| [10-决策](10-决策.md) | 已定 **261** + 待定 **79** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验 —— ⚠️ **这一行汇总它管不到**，2026-09-20 审计发现这里原来写 256、真值是 257（小节的数是对的，汇总的数没人查） |
 | [**规范-消息协议**](规范-消息协议.md) | **规范性文件**：信封、消息种类、配对、会话日志、stdio 传输。 |
 | [规范-工具服务](规范-工具服务.md) | **规范性文件**，与其余探索性文档性质不同。 |
 | [附录-参考](附录-参考.md) | **§10、§17** 与已有工作的对照，以及和 MCP 的定位比较。 |
@@ -205,7 +205,7 @@ crates/harness-service/src/domain_lock.rs  域锁（一个域一个进程）
 crates/harness-editor/                     编辑器：写锁 + 回滚
 crates/harness-term/                       终端：命令模式 + 游标读 + 杀进程树
 scripts/smoke-editor.ps1                   验收：18 条判据
-scripts/smoke-term.ps1                     验收：18 条判据
+scripts/smoke-term.ps1                     验收：19 条判据
 ```
 
 **编辑器**那份建一个临时项目、拉起**两个**编辑器进程托管它，然后从 console 喂 NDJSON：
@@ -863,7 +863,7 @@ scripts/smoke-stale.ps1              验收：9 条判据
 crates/harness-ctrl/src/main.rs      周期 tick（探 health + 记账）+ `stop` op
 crates/harness-ctrl/src/registry.rs   last_seen_ms / unresponsive / last_active_ms
 crates/harness-echo/src/main.rs       `--freeze`：装死（进程还在、就是不应答）
-scripts/smoke-lifecycle.ps1           验收：12 条判据
+scripts/smoke-lifecycle.ps1           验收：15 条判据（后两条是 2026-09-20 审计补的）
 ```
 
 跑法：`pwsh -File scripts/smoke-lifecycle.ps1`。
@@ -1050,10 +1050,11 @@ scripts/smoke-spill.ps1            验收：9 条判据（关键一条是"分页
 | ~~6~~ | ~~§2.3 `cancel`~~ | ✅ **2026-09-19 走通了**：智能体等超时 → 发 cancel → 服务**确实停它** → 回 `partial` + `canceled` | 超时不再只是"我不等了" |
 | ~~7~~ | ~~不变量一是个空壳~~ | ✅ **2026-09-19 改成构建期断言**：一条测试查 `harness-core` 的依赖表里没有传输 | 空壳断言比不写更糟，见下 |
 | 8 | §11.1 E 组面板字段 | **一半有消费者了**（2026-09-20 审计）：`health` 被探针用（§2.5）、`state_vocabulary` 被"没声明过的状态"检查用；**`node_kind` / `node_actions` / `content` 仍然没有任何消费者** | 等 GUI；那几个在那之前是纯数据 |
-| 9 | **`lifecycle`**（C 组最后一个）| ⚠️ **纯声明**：三个服务都写了 `per_session`/`per_call`，**运行时没有任何一处读它** —— 装配是"开会话时一次性全拉起来"，没有"按需拉起 / 按会话回收" | 它是最后一个"声明了没人执行"的字段；要做就得先做装配策略 |
-| 10 | **编辑器没复用溢出方案** | 终端的 `read`/`run` 已经有内联上限 + 溢出 + `spilled_to`（§5.17）；**编辑器的 `read` 还是 `spilled_to: null` 且不截断** | 同一个待定挂在编辑器上；阈值和切法可以直接复用 |
+| ~~9~~ | ~~**`lifecycle`**（C 组最后一个）~~ | ✅ **2026-09-20 补上**：`per_call` 现在**真的按需拉起**（服务表里有它、但还没起来 ⇒ 第一次用到它时才拉；`should_start_now()` 是唯一入口）。`resident` 仍**未实现且被闸门拦**（不实现的不许声明）| 验收：`smoke-lifecycle-field.ps1`（7 条判据）|
+| 10 | **编辑器没复用溢出方案** | ⚠️ **一半**：`read` 已经是**分页器**（一次一页 + `next_offset`，`spilled_to` 为 `null` 且说清"全文就是那个文件"）—— 死循环解开了；但**编辑器侧仍然没有"溢写到磁盘副本"**那半 | 剩下那半要不要做，取决于"单个文件大到内存放不下"真不真；`smoke-pager.ps1` 盯着已做的那半 |
 | 11 | **会话日志侧的大 payload 溢出**（§5.1）| ❌ 没做：终端输出溢到磁盘了，但**日志本身**还没有"大 payload 溢出成文件、日志里放引用"那条；`chunk` 的溢出阈值也还没定（规范-消息协议 §8 #2）| 日志现在会随 `chunk` 一直长；哪天要压体积就得做它 |
-| ~~12~~ | ~~**落盘屏障的第二个边界**~~ | ✅ **2026-09-20 做掉**：**有副作用的工具，分派之前先落一次盘**（判据 = 服务声明的 `destructiveHint`；读不到就保守落一次并出声）。`--debug-barriers` 让它可验。**三个边界还剩"模型请求前"那一次**（归智能体那条线）| 验收：`smoke-editor` 第 17/18 条 |
+| ~~12~~ | ~~**落盘屏障的第二个边界**~~ | ✅ **2026-09-20 做掉**：**有副作用的工具，分派之前先落一次盘**（判据 = 服务声明的 `destructiveHint`；读不到就保守落一次并出声）。`--debug-barriers` 让它可验 | 验收：`smoke-editor` 第 17/18 条 |
+| ~~14~~ | ~~**落盘屏障的第三个边界：模型请求前**~~ | ✅ **2026-09-20 做掉**：中控**新开一个 `barrier` op**，智能体每次 `model.reply()` 前发 `{"op":"barrier","reason":"模型请求前"}`；答复是事实（`synced` / `last_seq`），落不成**只出声不停手**。规范 §5.6 | 验收：`smoke-barrier.ps1`（9 条判据）。**三个边界现在都在了** |
 | 13 | **请求能不能抢在服务自报家门之前投出去**（审计新抓）| ✅ **2026-09-20 做掉**：没报到就**先攒着**，报到后照序放行；超宽限（2s）逐个拒。**原来那道注册关有个洞**：manifest 还没看过，请求已经递到服务手上了 | 规范 §2.6；两条实现纪律都是踩出来的（队列放"要投的那一行"、落盘判断放投递那一刻）|
 
 #### 二、路线图的欠账
@@ -1175,6 +1176,34 @@ pub fn assert_transport_agnostic() -> Result<(), String> {
 > 这类"有 output 也有 why"的结果**只在失败一半时出现**（`partial`）——
 > 也就是说：**恰好是最需要解释的那种情况，解释被丢了。**
 
+#### 七、2026-09-20 审计：两个真 bug、一个同族第四次、一处工程风险
+
+这一轮不是"再写点功能"，是**对着代码逐条问"你说你做到了，证据呢"**。
+方法：`cargo test` 看 **exit code**（不是看空输出）、26 个验收脚本全跑、
+然后**把日志逐条摊开对**（不是只看脚本打的绿字）。
+
+| 抓到什么 | 本质 | 怎么处理 |
+|---|---|---|
+| **探针回包 100% 被判成孤儿结果**（`smoke-lifecycle` 实测 18 发 18 中）| **一张表被两处读，顺序没说清**：`on_service_line` 先 `pending.remove(corr)`、再 `route`；而方向规则四判"这结果是不是中控要过的"**查的正是 `pending`** —— 摘完了才问，当然说没有。后果是探针答复被丢（`route` 遇违规直接 `return`）+ 每轮一条假故障 | **三处写法统一成"先看、走完 `route` 再摘"**（`on_service_line` / `on_service_exited` / 报到超时）。判据：`smoke-lifecycle` 第 14/15 条，**对老代码会红** |
+| **终端 `run` 每次都违反自己声明的形状** | 成功分支写 `"why": null`，而 `why` 声明的是 `string`、schema 闭合 —— 于是**每一条没被裁剪的普通命令**都挂着 `schema_violation`。它不是"闸门太严"：`why` 本来就不在 `required` 里，**什么都不想说时正确形状是"没有这个键"** | 改成"没话说就省键"。判据：`smoke-term` 第 19 条，**对老代码会红** |
+| **"有副作用工具分派前先落盘"这条判据写错了对象** | 它只看"是不是 request"，于是**给智能体派活**也撞进来（智能体也是被拉起来的服务进程，`service.is_some()` 对它同样为真）⇒ 白 fsync + 印一句误导人的"读不到它的声明" | 判据加上 `!is_agent`，**跟注册关用同一个谓词**。这条**第一次就写错了**，是 `smoke-barrier` 第 9 条当场抓住的 |
+| **三个屏障边界缺一个**，而且**连路都没有** | "我下一步要去问模型了"只有智能体知道，可日志**中控独占** —— 缺的不是一行调用，是一个 **op** | 中控开 `barrier` op，智能体每次 `model.reply()` 前喊一声。规范 §5.6；`smoke-barrier.ps1`（9 条判据） |
+| **14.5k 行代码没有版本控制** | `git rev-parse --show-toplevel` 从项目里往上返回的是 **`D:/`** —— `.git` 在**盘根**、`master` 上一个 commit 都没有 | 给项目建**自己的**仓库 + `.gitignore`（`target/`、`data/`）+ 一条基线提交，之后的修改才有回退点 |
+
+**同一轮里还有两处"数"错了，都是没人查的那一类**：
+
+* README 模块地图那行写"已定 **256**"，真值是 **257** —— 小节的数有
+  `check-decisions.ps1` 盯着，**汇总的数没人盯**。这轮改成 261（又是四条新的），
+  并在那一行明写"这一行脚本管不到"。
+* 两条代码注释（`session_log.rs` 说"分派前那一次还没补"、`harness-ctrl` 的
+  `ConsoleEof` 分支说"另外两个边界还没拍板"）**在代码改完之后就过期了**。
+  这类注释是最脏的债 —— **没人跑得出来**。
+
+> **这一轮真正的方法论只有一条**：绿字不能当证据。
+> 两个 bug 都藏在"全绿"的验收脚本后面 —— 判据查的是"该发生的事发生了没有"，
+> 而它们坏在"不该发生的事发生了没有"。
+> 所以新判据一律**先拿老代码验一遍"它会不会红"**，红不了就说明这条判据在空转。
+
 
 
 ## 怎么用这份文档
@@ -1205,7 +1234,7 @@ pub fn assert_transport_agnostic() -> Result<(), String> {
 | 09-模型 | 拼装约束已定，复合模型归类待定 |
 | 10-决策 | **唯一入口，按主题组织** |
 | 规范-工具服务 | **五组字段已定，且有闸门保证实现不长歪**（§11.8）；剩下三个洞（`content` 取值 / `node_actions` 枚举 / 闲置回收语义）|
-| **代码** | **内核四层齐 + 可恢复 + 绑定（可运行期改签）+ 重新托管 + 手册/能力/取消/压缩/验证 + 契约闸门 + 实例独属 + id 铸造规则 + 身份索引 + 磁盘指纹 + 重试语义 + 中控生命周期管控 + 遗嘱 + 状态两轴 + 背压 + 屏障与报到 + lifecycle 执行**（八个 crate + 二十五个验收脚本）；语言 = **Rust** |
+| **代码** | **内核四层齐 + 可恢复 + 绑定（可运行期改签）+ 重新托管 + 手册/能力/取消/压缩/验证 + 契约闸门 + 实例独属 + id 铸造规则 + 身份索引 + 磁盘指纹 + 重试语义 + 中控生命周期管控 + 遗嘱 + 状态两轴 + 背压 + 报到 + lifecycle 执行 + **三个落盘屏障边界**（含跨进程那个 `barrier` op）**（八个 crate + **二十六个**验收脚本，160 个测试，14.5k 行）；语言 = **Rust** |
 
 ### 怎么跑
 
@@ -1213,7 +1242,7 @@ pub fn assert_transport_agnostic() -> Result<(), String> {
 cargo test                                       # 160 个测试（159 单元 + 1 doc-test）
 pwsh -File scripts/smoke-stdio.ps1               # 阶段 1 验收（11 条判据）
 pwsh -File scripts/smoke-editor.ps1              # 阶段 2 验收（18 条判据）
-pwsh -File scripts/smoke-term.ps1                # 阶段 2 验收（18 条判据）
+pwsh -File scripts/smoke-term.ps1                # 阶段 2 验收（19 条判据）
 pwsh -File scripts/smoke-memory.ps1              # 阶段 3 验收（14 条判据）
 pwsh -File scripts/smoke-agent.ps1               # 智能体层验收（13 条判据）
 pwsh -File scripts/smoke-deepseek.ps1            # 真实模型验收（7 条判据；没 key 就跳过）
@@ -1233,9 +1262,10 @@ pwsh -File scripts/smoke-ids.ps1                 # id 铸造：撞 id 被拒、s
 pwsh -File scripts/smoke-index.ps1               # 身份索引：跨会话追溯 + 那条链（8 条判据）
 pwsh -File scripts/smoke-stale.ps1               # 磁盘指纹：用户改了怎么办（9 条判据）
 pwsh -File scripts/smoke-pager.ps1               # 分页读：编辑器那半（6 条判据）
-pwsh -File scripts/smoke-lifecycle.ps1           # 中控生命周期：探针 + 最后活动时间 + stop（13 条判据）
+pwsh -File scripts/smoke-lifecycle.ps1           # 中控生命周期：探针 + 最后活动时间 + stop（15 条判据）
 pwsh -File scripts/smoke-lifecycle-field.ps1     # lifecycle 字段真执行：按需拉起（7 条判据）
 pwsh -File scripts/smoke-spill.ps1               # 背压：溢出 + 头尾 + 游标读全文（9 条判据）
+pwsh -File scripts/smoke-barrier.ps1             # 落盘屏障的三个边界，含跨进程那个（9 条判据）
 pwsh -File scripts/check-decisions.ps1           # 决策册的计数校验（不是验收，是查账）
 pwsh -File scripts/dump-manifest.ps1 -Service term   # 把活服务自报的 manifest 打出来
 ```

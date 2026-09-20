@@ -185,6 +185,22 @@ Check '18. 中控照常记账：每一次 run 都有结果收尾' {
     $settled = @($records | Where-Object { $_.type -eq 'result' -and $runCorrs -contains $_.corr })
     ($runs.Count -eq 11) -and ($settled.Count -eq $runCorrs.Count) -and ($chunks.Count -ge 2)
 }
+<#
+  第 19 条是 **2026-09-20 审计**补的，盯的是"服务自己的结果没合它自己声明的形"。
+
+  当时终端 `run` 的成功分支写着 `"why": if trimmed { Some(..) } else { None }`，
+  而它声明的 `why` 是 `string`（闭合 schema）—— 于是**每一条输出没被裁剪的普通命令**
+  回来都带 `"why": null`，投递闸门每次都得贴一张 `schema_violation`。
+
+  这一条同时钉住两件事：结果**形状合法**，而且闸门**一次都没响**。
+#>
+Check '19. **没有一条 run 的结果违反终端自己声明的形状**（闸门一次都没响）' {
+    $logPath = Join-Path (Join-Path (Join-Path $dataDir 'sessions') $sid) 'log.jsonl'
+    $records = Get-Content -LiteralPath $logPath | ForEach-Object { $_ | ConvertFrom-Json }
+    $tripped = @($records | Where-Object { $_.payload.schema_violation -or $_.payload.code -eq 'schema_violation' })
+    $nullWhy = @($records | Where-Object { $_.type -eq 'result' -and $_.payload.PSObject.Properties.Name -contains 'why' -and $null -eq $_.payload.why })
+    ($tripped.Count -eq 0) -and ($nullWhy.Count -eq 0)
+}
 Write-Host '== stdout（截断显示）==' -ForegroundColor Cyan
 $script:all | ForEach-Object {
     $m = $_ | ConvertFrom-Json
