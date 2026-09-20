@@ -43,6 +43,14 @@ struct Args {
     /// echo 的用途本来就是"演那些真服务不该演的"，`full` 那一档也一样
     /// （它**没有执行者**，注册关会拦下它 —— 那正是要演的东西）。
     inject: String,
+    /// **报一个自己没声明过的实例状态**（`zombie`）。
+    ///
+    /// 中控有一条规则（§11.8 的"两个轴"）：实例事件里的 `state` 必须出自
+    /// manifest 的 `state_vocabulary`，报了个没声明过的词就发一条
+    /// `instance_state_undeclared` —— 因为图上那个点的颜色就靠这张表。
+    /// **那条规则是真抓到过东西的**（终端声明 `exited` 却报 `closed`），
+    /// 而"中控发现了会说"这半截一直没有判据 —— 这个开关就是给它的靶子。
+    bad_state: bool,
 }
 
 fn parse_args() -> Args {
@@ -55,6 +63,7 @@ fn parse_args() -> Args {
     let mut freeze = false;
     let mut sandbox_lie = false;
     let mut inject = String::from("card");
+    let mut bad_state = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -66,6 +75,7 @@ fn parse_args() -> Args {
             "--freeze" => freeze = true,
             "--sandbox-lie" => sandbox_lie = true,
             "--inject" => inject = it.next().unwrap_or(inject),
+            "--bad-state" => bad_state = true,
             _ => {}
         }
     }
@@ -78,6 +88,7 @@ fn parse_args() -> Args {
         freeze,
         sandbox_lie,
         inject,
+        bad_state,
     }
 }
 
@@ -317,7 +328,33 @@ fn handle_request(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, req: &
     }
 
     let payload = match tool {
-        "ping" => json!({"route": null, "effect": "confirmed", "code": null, "data": {"pong": true}}),
+        "ping" => {
+            if args.bad_state {
+                // **报一个自己没声明过的实例状态**（它的词表是 idle/busy/closed）。
+                // 中控该发一条 `instance_state_undeclared` —— 图上那个点的颜色就靠那张表，
+                // 所以"服务报了个词表外的状态"这件事**不许静悄悄过去**。
+                let ev = Envelope {
+                    id: ids.next_message(),
+                    ts: now_ms(),
+                    kind: MessageType::Event,
+                    from: args.instance.clone(),
+                    to: "ctrl".into(),
+                    corr: None,
+                    sid: args.sid.clone(),
+                    authority: Authority::Observe,
+                    payload: json!({
+                        "kind": "instance",
+                        "action": "state",
+                        "instance": "e-1",
+                        "state": "zombie",
+                        "path": null,
+                        "purpose": "演一个没声明过的状态词"
+                    }),
+                };
+                emit(out, &ev);
+            }
+            json!({"route": null, "effect": "confirmed", "code": null, "data": {"pong": true}})
+        }
         "help" => json!({
             "route": null, "effect": "confirmed", "code": null,
             "data": {
@@ -433,6 +470,7 @@ mod tests {
             freeze: false,
             sandbox_lie: false,
             inject: "card".into(),
+            bad_state: false,
         }
     }
 

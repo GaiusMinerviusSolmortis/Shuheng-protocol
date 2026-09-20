@@ -190,6 +190,15 @@ Check '20. 同一个实例**只换凭证**时：不换名册（缓存不动）�
     (@($changes).Count -eq $changesBeforeCapsOnly) -and ($capsChanged.Count -ge 1) -and `
         $g10.payload.effect -eq 'confirmed'
 }
+Check '21. **中控那条审计事件也在**：`binding_changed`（一次控制面变更要留痕）' {
+    # 这条钉的是**审计面**，不是行为面：`grant` / `revoke` 各有一次。
+    # 为什么值得单列：GUI 和"事后追责"读的都是这一类事件 ——
+    # 而**它以前一条判据都没有**（代码里有、脚本里没人提过）。
+    $audit = @($records | Where-Object { $_.payload.code -eq 'binding_changed' })
+    $acts = @($audit | ForEach-Object { $_.payload.action })
+    ($audit.Count -ge 2) -and ($acts -contains 'grant') -and ($acts -contains 'revoke') -and `
+        (@($audit | Where-Object { $_.payload.agent -eq 'agent:dada' -and $_.payload.instance -eq 'echo:1' }).Count -ge 1)
+}
 
 # ---------------------------------------------------------------- 场景 B
 Write-Host '== 场景 B：智能体那条通道想给自己加权限 ==' -ForegroundColor Cyan

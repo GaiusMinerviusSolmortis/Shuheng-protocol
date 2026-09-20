@@ -78,6 +78,28 @@ Check "$($claimed.Count) 个脚本的条数逐个对得上（合计 $totalActual
 foreach ($s in $stale) { Say $s }
 
 Write-Host ''
+Write-Host '== 散文里的「N 条判据」也要对账 ==' -ForegroundColor Cyan
+# 上面那条只管「怎么跑」那个代码块（`# …… 条判据` 的形式）。
+# 而 README 的**正文**里还散着一堆同样的数字（`验收：18 条判据` 那种）——
+# **同一类手写数字，不能只查一半**。规则很简单：一行里同时出现脚本名和
+# `N 条判据`，就拿那一行数（不跨行匹配，跨行的宁可漏也别猜）。
+$proseStale = @()
+$proseChecked = 0
+foreach ($l in $readme) {
+    if ($l -match '([a-z0-9\-]+\.ps1).*?(\d+)\s*条判据') {
+        $file = $matches[1]
+        $said = [int]$matches[2]
+        $path = Join-Path $root "scripts/$file"
+        if (-not (Test-Path $path)) { continue }
+        $proseChecked++
+        $actual = ([regex]::Matches((Get-Content $path -Raw), '(?m)^\s*Check\s')).Count
+        if ($said -ne $actual) { $proseStale += "$file：正文写 $said，实际 $actual" }
+    }
+}
+Check "正文里那 $proseChecked 处的条数都对得上" { $proseStale.Count -eq 0 }
+foreach ($s in $proseStale) { Say $s }
+
+Write-Host ''
 Write-Host '== 测试总数（跑出来的）==' -ForegroundColor Cyan
 Write-Host '  正在跑 cargo test ...' -ForegroundColor DarkGray
 $out = & cargo test --manifest-path (Join-Path $root 'Cargo.toml') --no-fail-fast 2>&1

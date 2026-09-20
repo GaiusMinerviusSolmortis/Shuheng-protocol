@@ -31,6 +31,7 @@ $servicesPath = Join-Path $work 'services.json'
   { "kind": "echo",   "id": "echo:holes", "role": "tool", "cmd": ["$(J $echo)"], "args": ["--manifest-holes"] },
   { "kind": "echo",   "id": "echo:liar",  "role": "tool", "cmd": ["$(J $echo)"], "args": ["--bad-result"] },
   { "kind": "echo",   "id": "echo:sandbox-liar", "role": "tool", "cmd": ["$(J $echo)"], "args": ["--sandbox-lie"] },
+  { "kind": "echo",   "id": "echo:state-liar",   "role": "tool", "cmd": ["$(J $echo)"], "args": ["--bad-state"] },
   { "kind": "editor", "id": "editor:1",   "role": "tool",
     "cmd": ["$(J $editor)"], "args": ["--fence", "$(J $project)"] }
 ]
@@ -91,10 +92,12 @@ if (-not $ready) { Write-Host '服务没能全部上线，后面的判据会失�
 Send @{ to = 'echo:1';     body = @{ tool = 'echo'; args = @{ text = '正常的那个' } } } 'c-good'
 Send @{ to = 'echo:holes'; body = @{ tool = 'ping'; args = @{} } }                   'c-holes'
 Send @{ to = 'echo:liar';  body = @{ tool = 'echo'; args = @{ text = '说谎的那个' } } } 'c-liar'
+Send @{ to = 'echo:state-liar'; body = @{ tool = 'ping'; args = @{} } }            'c-state'
 Send @{ to = 'ctrl';       body = @{ op = 'list' } }                                 'c-list'
 Pump 25000 {
     $replies.ContainsKey('c-good') -and $replies.ContainsKey('c-holes') -and
-    $replies.ContainsKey('c-liar') -and $replies.ContainsKey('c-list')
+    $replies.ContainsKey('c-liar') -and $replies.ContainsKey('c-list') -and
+    $replies.ContainsKey('c-state')
 } | Out-Null
 $proc.StandardInput.Close()
 $proc.WaitForExit(8000) | Out-Null
@@ -195,6 +198,23 @@ if ($holes) {
     Write-Host "  why:    $($holes.payload.why)"
     Write-Host "  remedy: $($holes.payload.remedy)"
 }
+Write-Host ''
+Check '15. **报了一个没声明过的实例状态 ⇒ 中控要说**（`instance_state_undeclared`）' {
+    # 这条规则本身是老规矩（§11.8 的"两个轴"：实例事件的 `state` 必须出自
+    # manifest 的 `state_vocabulary`）—— 但**"中控发现了会说"这半截一直没有判据**。
+    # 它抓过一次真的：终端声明 `exited`、却每次 `close` 都报 `closed`。
+    # 图上那个点的颜色就靠这张表，所以"报了个词表外的词"不许静悄悄过去。
+    $st = @($records | Where-Object { $_.payload.code -eq 'instance_state_undeclared' })
+    $st.Count -ge 1 -and $st[0].payload.state -eq 'zombie'
+}
+Check '16. 判词里要**给出它声明过的那几个词**（照着就能改，而不是只说"你报错了"）' {
+    $st = @($records | Where-Object { $_.payload.code -eq 'instance_state_undeclared' } | Select-Object -First 1)
+    $st -and (@($st.payload.declared) -contains 'idle') -and ($st.payload.why -like '*zombie*')
+}
+Check '17. 同一个词**只吵一次**（不然每报一次状态就刷一条审计）' {
+    @($records | Where-Object { $_.payload.code -eq 'instance_state_undeclared' }).Count -eq 1
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host "失败 $($failures.Count) 条：" -ForegroundColor Red

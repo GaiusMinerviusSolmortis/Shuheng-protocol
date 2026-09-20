@@ -206,7 +206,7 @@ crates/harness-service/src/domain_lock.rs  域锁（一个域一个进程）
 crates/harness-editor/                     编辑器：写锁 + 回滚
 crates/harness-term/                       终端：命令模式 + 游标读 + 杀进程树
 scripts/smoke-editor.ps1                   验收：18 条判据
-scripts/smoke-term.ps1                     验收：19 条判据
+scripts/smoke-term.ps1                     验收：21 条判据
 ```
 
 **编辑器**那份建一个临时项目、拉起**两个**编辑器进程托管它，然后从 console 喂 NDJSON：
@@ -533,7 +533,7 @@ crates/harness-agent/src/prompt.rs   提示词编译 + 组合清单
 crates/harness-agent/src/model.rs    模型适配层 + 脚本化 mock
 crates/harness-agent/src/script.rs   mock 脚本（NDJSON，一行一步）
 crates/harness-agent/src/main.rs     回合循环：调模型 → 调工具 → 收结果 → 再调
-scripts/smoke-agent.ps1              验收：两个场景、13 条判据
+scripts/smoke-agent.ps1              验收：两个场景、18 条判据
 ```
 
 跑法：`pwsh -File scripts/smoke-agent.ps1`。
@@ -683,7 +683,7 @@ B 先调错工具 → 收到带出口的报错 → 改对继续。
 
 ```text
 crates/harness-agent/src/deepseek.rs   真 provider 适配器（OpenAI 兼容）
-scripts/smoke-deepseek.ps1             验收：7 条判据（**没 key 就跳过**）
+scripts/smoke-deepseek.ps1             验收：11 条判据（**没 key 就跳过**）
 ```
 
 跑法：`pwsh -File scripts/smoke-deepseek.ps1`（key 取自环境变量或 `D:\WXBot\.env`）。
@@ -748,7 +748,7 @@ scripts/smoke-graph.ps1                     验收：9 条判据
 #### ✅ 2026-09-19：内核最后两层 —— **通道**与**会话**
 
 ```text
-scripts/smoke-session.ps1   验收：13 条判据
+scripts/smoke-session.ps1   验收：12 条判据
 ```
 
 跑法：`pwsh -File scripts/smoke-session.ps1`。
@@ -957,7 +957,7 @@ ctrl 分不清"哪一代"，于是新实例被旧消息打死。
 crates/harness-ctrl/src/registry.rs   grant / revoke（改签一条绑定）
 crates/harness-ctrl/src/main.rs       两个 op + 敕令 + 审计事件
 crates/harness-agent/src/main.rs      refresh_tools：回合边界扫一遍授权，变了就换名册
-scripts/smoke-regrant.ps1             验收：18 条判据（改签 + 敕令 + 换名册 + **盖章**）
+scripts/smoke-regrant.ps1             验收：21 条判据（改签 + 敕令 + 换名册 + 盖章 + 审计事件）
 ```
 
 跑法：`pwsh -File scripts/smoke-regrant.ps1`。
@@ -1387,7 +1387,7 @@ scripts/smoke-spill.ps1            验收：9 条判据（关键一条是"分页
 | **`capabilities` 校验** | **服务** | §7 那句话就是责任分配：「**工具只校验手里的凭证够不够干这件事**」。中控只管**签发** —— 于是"改一条能力要求"不用动中控 |
 | **`route` 字段** | **服务** | 这条通道是怎么投递的，**只有投递方知道**。中控猜不出来，也不该猜 |
 
-验收：`pwsh -File scripts/smoke-help-grant.ps1`（9 条判据）。实测的拒绝长这样：
+验收：`pwsh -File scripts/smoke-help-grant.ps1`（10 条判据）。实测的拒绝长这样：
 
 ```text
 why:     调 `run` 需要的能力你没有：proc.exec
@@ -1539,8 +1539,8 @@ pwsh -File scripts/smoke-help-grant.ps1          # 手册与能力校验（10 �
 pwsh -File scripts/smoke-cancel.ps1              # 取消（7 条判据）
 pwsh -File scripts/smoke-compact-turn.ps1        # 循环里真的触发压缩（9 条判据）
 pwsh -File scripts/smoke-verify.ps1              # 独立验证（6 条判据）
-pwsh -File scripts/smoke-contract.ps1            # 契约闸门：注册 + 投递（14 条判据）
-pwsh -File scripts/smoke-regrant.ps1             # 运行期改签：grant/revoke + 敕令 + 换名册 + 盖章（20 条判据）
+pwsh -File scripts/smoke-contract.ps1            # 契约闸门：注册 + 投递 + 状态词表外的报法（17 条判据）
+pwsh -File scripts/smoke-regrant.ps1             # 运行期改签：grant/revoke + 敕令 + 换名册 + 盖章 + 审计事件（21 条判据）
 pwsh -File scripts/smoke-ownership.ps1           # 实例独属：谁的实例谁动（11 条判据）
 pwsh -File scripts/smoke-ids.ps1                 # id 铸造：撞 id 被拒、spawn 只增不减（8 条判据）
 pwsh -File scripts/smoke-index.ps1               # 身份索引：跨会话追溯 + 那条链（8 条判据）
