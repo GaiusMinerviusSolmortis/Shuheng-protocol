@@ -238,10 +238,28 @@ fn emit(out: &mut impl io::Write, env: &Envelope) {
     }
 }
 
-fn required_caps(_tool: &str) -> &'static [&'static str] {
-    // MCP 那边的权限模型我们看不见，所以这边只能**整台 server 一个令牌**。
-    // 要更细，得先有"每个 MCP 工具一条能力"的声明 —— 那得由部署方写（还没做）。
-    &["mcp.call"]
+/// **一个工具要什么能力** —— 声明和执行**共用这一个函数**。
+///
+/// 别的服务是"名片里手写一份、执行时另手写一份"，靠一条测试把两张表钉住。
+/// 这里那张表是**算出来的**（`OUR_TOOLS` 之外的一律是 MCP 工具），
+/// 所以干脆让两边走同一个函数：**没有第二张表，也就没有漂的余地**。
+///
+/// * 外来的 MCP 工具：MCP 那边的权限模型我们看不见，只能**整台 server 一个令牌**
+///   `mcp.call`。要更细，得先有"每个 MCP 工具一条能力"的声明 —— 那得由部署方写（还没做）。
+/// * 我们自己的三个诊断入口（`help` / `ping` / `status`）：**零能力**。
+///   它们在那道闸门**之前**就被处理掉了（`match tool` 里直接 `return true`），
+///   所以这条返回在运行时够不着 —— 但"够不着"不该靠"没人记得去看"来保证，
+///   这里如实写下来：诊断通道不跟着鉴权一起坏。
+fn caps_for(tool: &str) -> &'static [&'static str] {
+    if OUR_TOOLS.contains(&tool) {
+        &[]
+    } else {
+        &["mcp.call"]
+    }
+}
+
+fn required_caps(tool: &str) -> &'static [&'static str] {
+    caps_for(tool)
 }
 
 fn manifest(args: &Args, client: &McpClient, tools: &[Value]) -> Value {
@@ -294,7 +312,7 @@ fn manifest(args: &Args, client: &McpClient, tools: &[Value]) -> Value {
             .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
         decls.push(
             ToolDecl::new(name, desc, schema)
-                .caps(&["mcp.call"])
+                .caps(caps_for(name))
                 // **它可能碰到我们看不见的东西**（网络、别人的服务）—— 如实声明
                 .open_world()
                 .lifecycle("per_session")
@@ -676,5 +694,44 @@ fn help_text(section: &str, args: &Args, tools: &[Value]) -> String {
         _ => "章节清单在 `data.sections` 里；传 `section` 取某一章。\
               一次全倒给你会把上下文吃掉（渐进披露）。"
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **#87 能力声明与能力强制必须对得上**（2026-09-20，第十二个 crate 的版本）。
+    ///
+    /// 这个桥没法照抄别处那条测试（遍历 `tools()` 逐条比对）：它的能力表是**算出来的**，
+    /// 而且 `manifest()` 要一个活着的 MCP 客户端才能跑。
+    /// 所以这里改用**更轻、但同样硬**的判据钉住那条性质：
+    ///
+    /// 1. 我们自己的三个诊断入口**零能力**（它们在那道闸门之前就 `return` 了，
+    ///    但把它写成零能力，"诊断通道不跟着鉴权一起坏"就成了一条可查的声明）；
+    /// 2. 除此之外**一律 `mcp.call`** —— 包括那个名字我们还不认识的时候
+    ///    （报错路径也不许绕过令牌：不认识的名字走的是"对端没这个工具"，
+    ///    而那道判断在那道闸门**之后**）。
+    ///
+    /// 真正防漂的那一手在 `caps_for()`：`manifest()` 里 `.caps(caps_for(name))`
+    /// 和执行侧 `required_caps(tool)` 是**同一个函数**，没有第二张表可漂。
+    /// 这条测的就是"那个函数没被改歪"。
+    #[test]
+    fn only_foreign_tools_need_the_mcp_call_token() {
+        for own in OUR_TOOLS {
+            assert!(
+                caps_for(own).is_empty(),
+                "诊断入口 `{own}` 报出了能力 {:?} —— 它必须零能力",
+                caps_for(own)
+            );
+            assert_eq!(required_caps(own), caps_for(own), "`{own}` 的声明与执行对不上");
+        }
+        for foreign in ["read_file", "search", "某个我们还不认识的名字", ""] {
+            assert_eq!(
+                required_caps(foreign),
+                &["mcp.call"],
+                "外来工具 `{foreign}` 必须整台 server 一个令牌"
+            );
+        }
     }
 }

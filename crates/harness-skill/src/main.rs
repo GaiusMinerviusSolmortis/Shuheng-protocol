@@ -520,3 +520,30 @@ fn help_text(section: &str, args: &Args) -> String {
             .to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **声明的能力和强制的必须逐条对得上**（2026-09-20）。
+    ///
+    /// 两张表漂了，后果是"**声明了 `skill.read`、实际什么都没执行**" ——
+    /// 而门只查声明那一侧，这个洞没有别的东西看得见。
+    #[test]
+    fn the_enforcement_table_matches_what_we_declare() {
+        for t in tools() {
+            let name = t["name"].as_str().expect("每个工具都有名字");
+            let declared: Vec<&str> = t["capabilities"]
+                .as_array()
+                .expect("每个工具都报到 capabilities")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let enforced: Vec<&str> = required_caps(name).to_vec();
+            assert_eq!(
+                declared, enforced,
+                "`{name}` 的声明和执行对不上：{declared:?} vs {enforced:?}"
+            );
+        }
+    }
+}

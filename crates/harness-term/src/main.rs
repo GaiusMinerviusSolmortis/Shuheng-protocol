@@ -1393,6 +1393,26 @@ fn emit(out: &mut impl io::Write, env: &Envelope) {
 mod tests {
     use super::*;
 
+    /// **声明的能力和强制的必须逐条对得上**（2026-09-20）—— 同编辑器那条，
+    /// 理由写在那边：两张表漂了就是"声明了 `proc.exec`、实际什么都没执行"的静默洞。
+    #[test]
+    fn the_enforcement_table_matches_what_we_declare() {
+        for t in tools() {
+            let name = t["name"].as_str().expect("每个工具都有名字");
+            let declared: Vec<&str> = t["capabilities"]
+                .as_array()
+                .expect("每个工具都报到 capabilities")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let enforced: Vec<&str> = required_caps(name).to_vec();
+            assert_eq!(
+                declared, enforced,
+                "`{name}` 的声明和执行对不上：{declared:?} vs {enforced:?}"
+            );
+        }
+    }
+
     fn req_from(who: &str, caller_kind: &str) -> Envelope {
         Envelope {
             id: "m-t".into(),

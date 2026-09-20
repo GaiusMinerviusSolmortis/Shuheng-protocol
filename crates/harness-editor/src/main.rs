@@ -1146,6 +1146,32 @@ fn emit(out: &mut impl io::Write, env: &Envelope) {
 mod tests {
     use super::*;
 
+    /// **声明的能力和强制的必须逐条对得上**（2026-09-20）。
+    ///
+    /// 为什么这条值得占一个测试位：manifest 里每个工具写了 `.caps([...])`，
+    /// 而执行侧另有一张手写的 `required_caps()`。**两张表一旦漂**，
+    /// 后果是"**声明了 `fs.write`、实际什么都没执行**"——
+    /// 而门只查声明那一侧，**这个洞没有任何别的东西看得见**。
+    /// 反过来漂（强制了一条没声明的）也不对：模型看不到那条能力要求。
+    #[test]
+    fn the_enforcement_table_matches_what_we_declare() {
+        for t in tools() {
+            let name = t["name"].as_str().expect("每个工具都有名字");
+            let declared: Vec<&str> = t["capabilities"]
+                .as_array()
+                .expect("每个工具都报到 capabilities（闸门也会查）")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let enforced: Vec<&str> = required_caps(name).to_vec();
+            assert_eq!(
+                declared, enforced,
+                "`{name}`：manifest 声明的是 {declared:?}，而执行时查的是 {enforced:?} —— \
+                 这两张表不许漂"
+            );
+        }
+    }
+
     /// **自己的 manifest 自己先过一遍闸门。** 这条是构建期断言，
     /// 和"不变量一"那条同一个形状：靠自觉不如靠一条会红的测试。
     #[test]

@@ -417,7 +417,12 @@ fn emit(out: &mut impl io::Write, env: &Envelope) {
 fn required_caps(tool: &str) -> &'static [&'static str] {
     match tool {
         "deposit" => &["mem.write"],
-        "pin" | "unpin" | "forget" => &["mem.curate"],
+        // ⚠️ **这里原来还有 `"unpin"`** —— 而**没有那个工具**（`pin` 用 `pinned: false` 表达拔钉）。
+        // 一条对着不存在工具的分支不会出错，但它说明**这张表和工具表是分开维护的** ——
+        // 而那种分开维护迟早会漂成"声明了 `fs.write`、实际什么都没执行"的静默洞
+        // （门只查声明那一侧，看不见强制那一侧）。
+        // 现在每个服务都有一条测试把两张表逐条钉住。
+        "pin" | "forget" => &["mem.curate"],
         "recall" | "list" => &["mem.read"],
         // 零能力：出问题的时候得有人能问它一句 —— 诊断通道不能跟着鉴权一起坏
         // 零能力：诊断那几句永远放行（"出问题的时候得有人能问它一句"）。
@@ -942,5 +947,45 @@ fn help_text(section: &str, args: &Args) -> String {
         _ => "章节清单在 `data.sections` 里；传 `section` 取某一章。\
               一次全倒给你会把上下文吃掉（渐进披露）。"
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_args() -> Args {
+        Args {
+            instance: "mem:test".into(),
+            sid: "s-test".into(),
+            kind: "mem".into(),
+            store: PathBuf::from("data/memory-test"),
+            default_ttl_ms: 0,
+            resident: None,
+        }
+    }
+
+    /// **声明的能力和强制的必须逐条对得上**（2026-09-20）。
+    ///
+    /// 这条测试**当场抓到过一个真的**：执行那张表里有一条 `"unpin"` 分支，
+    /// 而**根本没有 `unpin` 这个工具**（`pin` 用 `pinned: false` 表达拔钉）。
+    /// 一条对着不存在工具的分支不会出错 —— 但它说明这两张表是分开维护的，
+    /// 而分开维护迟早会漂成"声明了 `mem.write`、实际什么都没执行"的静默洞。
+    #[test]
+    fn the_enforcement_table_matches_what_we_declare() {
+        for t in tools(&a_args()) {
+            let name = t["name"].as_str().expect("每个工具都有名字");
+            let declared: Vec<&str> = t["capabilities"]
+                .as_array()
+                .expect("每个工具都报到 capabilities")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let enforced: Vec<&str> = required_caps(name).to_vec();
+            assert_eq!(
+                declared, enforced,
+                "`{name}` 的声明和执行对不上：{declared:?} vs {enforced:?}"
+            );
+        }
     }
 }
