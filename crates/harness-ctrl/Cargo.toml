@@ -11,5 +11,6 @@ path = "src/main.rs"
 [dependencies]
 harness-core = { path = "../harness-core" }
 harness-service = { path = "../harness-service" }
+harness-ipc = { path = "../harness-ipc" }
 serde.workspace = true
 serde_json.workspace = true

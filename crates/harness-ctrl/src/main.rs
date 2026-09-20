@@ -16,6 +16,7 @@ mod registry;
 mod service;
 mod index;
 
+use crate::service::StopReport;
 use harness_core::codec::{self, CodecError, NdjsonReader, NextLine};
 use harness_core::direction::{self, DirectionContext};
 use harness_core::envelope::{Authority, Envelope, MessageType};
@@ -220,6 +221,22 @@ struct ServiceSpec {
     /// ⚠️ **它不负责"用完就收"**：§5.20 定过不做自动回收（收只走四条确定路径）。
     #[serde(default)]
     lifecycle: Option<String>,
+    /// **常驻**：会话结束不收它，**别的会话来接同一个进程**（2026-09-20）。
+    ///
+    /// 和 `lifecycle` 的关系要说清，否则就是同一件事写两遍：
+    /// * `lifecycle` 是**服务自述**（manifest 里那句，闸门校验形状）；
+    /// * `resident` 是**部署配置**（这一条）—— 因为"接上老进程"还需要一个
+    ///   **会合目录**，那是这台机器上的部署事实，服务自己不知道。
+    ///
+    /// 两个都对上才算数：服务声明 `resident`、表里也写 `resident: true` + `rendezvous`。
+    /// 只写一个的话中控会**明说缺什么**（见 `spawn_spec`）。
+    #[serde(default)]
+    resident: bool,
+    /// **会合目录**：常驻服务把"我在哪个端口、口令是什么、我是几号进程"写在这儿，
+    /// 让后来的会话找得到它。**必须是一个跨会话稳定的地方**（不能跟着 `--data-dir` 走，
+    /// 否则新会话换个 data 目录就找不到了）。
+    #[serde(default)]
+    rendezvous: Option<String>,
 }
 
 /// 一条绑定的两种写法（§2.3 里那个 `{resource, capability, ...}` 的雏形）。
@@ -274,6 +291,18 @@ struct Queued {
     /// 已经编码好的那一行（投递时直接用）
     line: String,
     since_ms: i64,
+}
+
+/// 一次还没落地的调用。**中控记得"我替谁在等谁"** ——
+/// **怎么把它弄起来** —— 两种通道的决定就在这儿（2026-09-20）。
+enum Launcher {
+    /// 父子私有那条：stdin/stdout（第一版就有的）
+    Stdio,
+    /// 常驻那条：**先看有没有活着的，有就接上，没有才拉**
+    Resident {
+        dir: std::path::PathBuf,
+        grace_ms: u64,
+    },
 }
 
 /// 一次还没落地的调用。**中控记得"我替谁在等谁"** ——
@@ -1720,6 +1749,38 @@ impl App {
             .unwrap_or_else(|| "ping".into())
     }
 
+    /// **这个服务自己声明了"怎么让它停下来"吗？**（manifest 里的 `stop` 字段）
+    ///
+    /// 形状和 `probe_tool` 一样：**服务声明入口，中控照着调**。
+    /// 中控不认识"shutdown"这个词，它只认识"这个服务说收它要调哪个工具"。
+    fn stop_entry_of(&self, id: &str) -> Option<String> {
+        self.reg.manifest_of(id).and_then(|m| {
+            m.get("tools")?
+                .as_array()?
+                .iter()
+                .find_map(|t| t.get("stop").and_then(Value::as_str).map(str::to_string))
+        })
+    }
+
+    /// **请一个服务自己停**：发一条请求就返回，**不等回信**。
+    ///
+    /// 为什么不在这儿等：中控是单线程的，回信要由主循环处理 ——
+    /// 在这儿等它，就是**死锁**（自己等自己）。所以"先礼"只是把话递过去，
+    /// 结果由 `on_service_exited` 那条老路收尾（收实例 / 结未决调用 / 发敕令）。
+    fn request_service_stop(&mut self, id: &str, tool: &str) -> bool {
+        let corr = format!("stop-{}", self.ids.next_corr());
+        let env = self.mint(
+            MessageType::Request,
+            CTRL,
+            id,
+            Some(corr),
+            Authority::System,
+            json!({"tool": tool, "args": {}}),
+        );
+        self.route(env);
+        true
+    }
+
     // ---- 路由与仲裁 ------------------------------------------------------
 
     fn route(&mut self, env: Envelope) {
@@ -2777,7 +2838,18 @@ impl App {
                 // 运行期拉起来的服务**不给绑定**：绑定是中控签发的东西，
                 // 不该由一条消息现场决定；要给它授权，得写进服务表
                 let bindings = Vec::new();
-                match self.start_service(kind, id.clone(), cmd, role, bindings, self.tx.clone()) {
+                // 运行期 `spawn` 出来的服务**永远是普通服务**（stdin/stdout 那条）：
+                // 常驻是**部署配置**（要一个跨会话稳定的会合目录），
+                // 不该由一条消息现场决定 —— 同"绑定只许写进服务表"那条纪律。
+                match self.start_service(
+                    kind,
+                    id.clone(),
+                    cmd,
+                    role,
+                    bindings,
+                    Launcher::Stdio,
+                    self.tx.clone(),
+                ) {
                     Ok(()) => self.reply(
                         req,
                         json!({
@@ -2792,7 +2864,8 @@ impl App {
                             "effect": "refused",
                             "code": "invalid",
                             "why": format!("起不来：{e}"),
-                            "remedy": "检查 cmd 里的可执行文件路径是否存在；它必须接 --instance / --sid 两个参数"
+                            "remedy": "检查 cmd 里的可执行文件路径是否存在；它必须接 --instance / --sid 两个参数。\
+                                       要常驻（跨会话）得写进服务表，运行期 spawn 出来的永远是普通服务"
                         }),
                     ),
                 }
@@ -2867,20 +2940,106 @@ impl App {
                     );
                     return;
                 }
+                // **常驻服务要分两段收**（2026-09-20）：先**请它自己停**（它声明的
+                // `stop` 入口），再看它到底停没停 —— 因为**接上来的那个我手里
+                // 没有句柄**，"杀进程"这条路根本不存在。
+                //
+                // 这一条也是"责任向下传导"：**怎么体面地停，只有服务自己知道**
+                // （要落盘什么、要给谁留遗嘱）。中控只负责"请"和"再确认一次"。
+                let stop_entry = self.stop_entry_of(&id);
+                let resident_spec_dir = self
+                    .specs
+                    .iter()
+                    .find(|s| s.id.as_deref() == Some(id.as_str()) && s.resident)
+                    .and_then(|s| s.rendezvous.clone());
+                // 先礼：**请它自己停**（它声明的 `stop` 入口）。
+                // 只发不等 —— 中控是单线程的，在这儿等回信就是**死锁**
+                // （回信要由主循环处理，而主循环正在跑这一段）。
+                let asked = stop_entry
+                    .as_ref()
+                    .map(|tool| self.request_service_stop(&id, tool))
+                    .unwrap_or(false);
                 // **只关它的 stdin，不动注册表。**
                 // 剩下的交给它自己的读线程：EOF ⇒ 服务报 offline 并退出 ⇒
                 // `on_service_exited` 照常做那三件事（收实例 / 结未决调用 / 发敕令）。
                 // 在这里抢先 `reg.remove` 会把那条路变成空操作 —— 通知就丢了。
+                let mut how = "它不在这个会话的注册表里（可能已经没了）".to_string();
                 if let Some(svc) = self.reg.get_mut(&id).and_then(|i| i.service.as_mut()) {
-                    svc.shutdown();
+                    if svc.resident {
+                        // 常驻：先看看那句"请"有没有把它请走（给它一点时间，最多 600ms）
+                        let gone = resident_spec_dir
+                            .as_ref()
+                            .map(|d| {
+                                let dir = std::path::Path::new(d);
+                                let deadline =
+                                    std::time::Instant::now() + std::time::Duration::from_millis(600);
+                                while std::time::Instant::now() < deadline {
+                                    let alive = harness_ipc::Rendezvous::read(dir, &id)
+                                        .map(|rv| rv.alive())
+                                        .unwrap_or(false);
+                                    if !alive {
+                                        return true;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                                false
+                            })
+                            .unwrap_or(false);
+                        if gone {
+                            how = if asked {
+                                format!(
+                                    "**它自己停的**（调了它声明的 `stop` 入口 `{}`）—— \
+                                     会合文件已经不作数了",
+                                    stop_entry.clone().unwrap_or_default()
+                                )
+                            } else {
+                                "它自己退了（我没请它，也没杀它）".to_string()
+                            };
+                        } else {
+                            match svc.stop_now() {
+                                StopReport::Killed => {
+                                    how = if asked {
+                                        format!(
+                                            "先请它自己停了（`{}`），它没走 ⇒ **我手里有它的句柄，直接收掉了**",
+                                            stop_entry.clone().unwrap_or_default()
+                                        )
+                                    } else {
+                                        "我手里有它的句柄，直接收掉了".to_string()
+                                    };
+                                }
+                                StopReport::NotMine { pid } => {
+                                    how = if asked {
+                                        format!(
+                                            "它是**别的会话起来的**（pid {pid}），我手里没有它的句柄 —— \
+                                             已经**请它自己停了**（调了它声明的 `{}`）。\
+                                             它到底走没走，下一次 `list` 见（会合文件不作数 = 走了）",
+                                            stop_entry.clone().unwrap_or_default()
+                                        )
+                                    } else {
+                                        format!(
+                                            "⚠️ 它是**别的会话起来的**（pid {pid}），我没有它的句柄，\
+                                             它也没声明 `stop` 入口 —— **没收掉**。\
+                                             要么去它的宿主那个会话收，要么给这个服务补一个 `stop` 入口"
+                                        )
+                                    };
+                                }
+                            }
+                        }
+                        svc.shutdown();
+                    } else {
+                        svc.shutdown();
+                        how = "关掉它的 stdin，等它自己走".to_string();
+                    }
                 }
-                eprintln!("[ctrl] 用户收掉了 {id}（关掉它的 stdin，等它自己走）");
+                eprintln!("[ctrl] 用户收掉了 {id}：{how}");
                 self.reply(
                     req,
                     json!({
                         "effect": "confirmed", "code": null,
                         "data": {
                             "stopped": id,
+                            "how": how,
+                            "asked_to_stop": asked,
                             "note": "它的工具实例会跟着下线，未决调用会逐个结掉，\
                                      有智能体的话会收到一条敕令 —— 这些都是照常走的"
                         }
@@ -2903,7 +3062,7 @@ impl App {
         }
     }
 
-    // ---- 生命周期 --------------------------------------------------------
+// ---- 生命周期 --------------------------------------------------------
 
     fn start_service(
         &mut self,
@@ -2912,6 +3071,7 @@ impl App {
         cmd: Vec<String>,
         role: Option<String>,
         bindings: Vec<registry::Binding>,
+        launcher: Launcher,
         tx: Sender<Inbound>,
     ) -> io::Result<()> {
         let is_agent = role.as_deref() == Some("agent");
@@ -2933,20 +3093,77 @@ impl App {
         let generation = self.reg.generation_of(&id).unwrap_or(0) + 1;
         // `kind` 一会儿要移进注册表，先留一份给索引用
         let index_kind = kind.clone();
-        let svc = service::ServiceHandle::spawn(
-            id.clone(),
-            kind.clone(),
-            cmd.clone(),
-            &self.sid,
-            generation,
-            tx,
-        )?;
-        eprintln!(
-            "[ctrl] 拉起 {}{}（{}）",
-            id,
-            if is_agent { "［智能体］" } else { "" },
-            cmd.join(" ")
-        );
+        let svc = match &launcher {
+            Launcher::Stdio => {
+                let svc = service::ServiceHandle::spawn(
+                    id.clone(),
+                    kind.clone(),
+                    cmd.clone(),
+                    &self.sid,
+                    generation,
+                    tx,
+                )?;
+                eprintln!(
+                    "[ctrl] 拉起 {}{}（{}）",
+                    id,
+                    if is_agent { "［智能体］" } else { "" },
+                    cmd.join(" ")
+                );
+                svc
+            }
+            Launcher::Resident { dir, grace_ms } => {
+                // **先看有没有活着的**：有就接上，没有才拉。
+                //
+                // 顺序不能反过来 —— 先拉就会有两个进程抢同一份状态，
+                // 而那正是"一处只许一个进程写"（域锁）在防的事。
+                let live = harness_ipc::Rendezvous::read(dir, &id)
+                    .filter(|rv| rv.alive());
+                match live {
+                    Some(rv) => {
+                        let svc = service::ServiceHandle::attach(
+                            id.clone(),
+                            cmd.clone(),
+                            &rv,
+                            generation,
+                            tx,
+                        )?;
+                        eprintln!(
+                            "[ctrl] **接上** {id}（它已经在跑了：pid {}，起于 {}）—— 没有再起一个",
+                            rv.pid,
+                            rv.started_ms
+                        );
+                        svc
+                    }
+                    None => {
+                        // 文件在、但连不上 ⇒ 那是**上一次留下的僵尸会合文件**。
+                        // 说出来（别装作没有），然后拉一个新的覆盖它。
+                        if let Some(stale) = harness_ipc::Rendezvous::read(dir, &id) {
+                            eprintln!(
+                                "[ctrl] `{}` 的会合文件还在（pid {}），但它不应答 —— \
+                                 那是上次崩了留下的，我拉一个新的顶上",
+                                id, stale.pid
+                            );
+                        }
+                        let svc = service::ServiceHandle::spawn_resident(
+                            id.clone(),
+                            cmd.clone(),
+                            &self.sid,
+                            dir,
+                            *grace_ms,
+                            generation,
+                            tx,
+                        )?;
+                        eprintln!(
+                            "[ctrl] 拉起常驻 {}{}（{}）",
+                            id,
+                            if is_agent { "［智能体］" } else { "" },
+                            cmd.join(" ")
+                        );
+                        svc
+                    }
+                }
+            }
+        };
         self.reg.insert(Instance {
             id: id.clone(),
             kind,
@@ -3017,6 +3234,26 @@ impl App {
                 cmd.push(h);
             }
         }
+        // **常驻那条路要先有一个跨会话稳定的会合目录** —— 它不能在服务表里
+        // 留空（少了它，新会话找不到老进程，`resident` 就退化成"活得久一点的
+        // 普通服务"）。这是**部署配置缺了**，所以要在这里明说，而不是悄悄降级。
+        let launcher = if spec.resident {
+            match &spec.rendezvous {
+                Some(dir) => Launcher::Resident {
+                    dir: std::path::PathBuf::from(dir),
+                    grace_ms: 5000,
+                },
+                None => {
+                    return Err(io::Error::other(format!(
+                        "{id} 在服务表里写了 `resident: true`，但没给 `rendezvous` 目录 —— \
+                         没有它，别的会话找不到这个进程（`resident` 就白写了）。\
+                         给它一个**跨会话稳定**的目录（别用每次都会变的临时目录）"
+                    )))
+                }
+            }
+        } else {
+            Launcher::Stdio
+        };
         let started = self.start_service(
             spec.kind.clone(),
             id.clone(),
@@ -3026,6 +3263,7 @@ impl App {
                 .iter()
                 .map(|b| registry::Binding::new(b.instance(), b.capabilities()))
                 .collect(),
+            launcher,
             tx,
         );
         // **把"部署决定的拉起时机"记在实例上** —— `list` 上要和它自述的并排显示
@@ -3085,11 +3323,30 @@ impl App {
         }
         for id in tools.into_iter().chain(agents_to_stop) {
             if let Some(mut inst) = self.reg.remove(&id) {
+                // **常驻服务在这个会话里"下线"，但进程留着**（§11.10）——
+                // 账上要分开写：`exited` 是"它没了"，`detached` 是"我不再看它了"。
+                // 写成 `exited` 就是在撒谎，而身份索引将来是排查问题的第一本账。
+                let resident = inst.service.as_ref().map(|s| s.resident).unwrap_or(false);
                 if let Some(svc) = &mut inst.service {
                     svc.shutdown();
                 }
                 let gone = self.reg.remove_tools_of(&id);
-                eprintln!("[ctrl] {why}：收掉 {id}（连带 {} 个实例）", gone.len());
+                let sid = self.sid.clone();
+                if resident {
+                    self.index.append(
+                        &sid,
+                        &id,
+                        "service",
+                        "detached",
+                        json!({"why": format!("{why}：会话不再看它，**进程留着**")}),
+                    );
+                    eprintln!(
+                        "[ctrl] {why}：**松开** {id}（常驻，进程留着；连带 {} 个实例）",
+                        gone.len()
+                    );
+                } else {
+                    eprintln!("[ctrl] {why}：收掉 {id}（连带 {} 个实例）", gone.len());
+                }
             }
         }
         self.pending.clear();

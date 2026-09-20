@@ -282,6 +282,13 @@ pub struct ToolDecl {
     output_fields: Value,
     required_when: Vec<(Vec<String>, Vec<String>)>,
     lifecycle: &'static str,
+    /// **"停下来"的入口**（2026-09-20）：中控要收掉这个服务时，调哪个工具。
+    ///
+    /// 为什么这个入口得由服务自己声明：常驻服务（`resident`）**可能不是这个会话
+    /// 拉起来的** —— 那时候中控手里没有那个子进程句柄，"杀进程"根本做不到。
+    /// 而"我怎么体面地停"只有服务自己知道（要落盘什么、要留什么遗嘱）。
+    /// 形状照 `health` 抄：服务声明入口，中控照着调，**中控不猜**。
+    stop: Option<String>,
 }
 
 impl ToolDecl {
@@ -297,6 +304,7 @@ impl ToolDecl {
             input_schema,
             output_fields: json!({}),
             required_when: Vec::new(),
+            stop: None,
             // **默认必须和中控那边的部署默认一致**（都是"跟着会话"）。
             // 第一版我把默认写成 `per_call`，而几个工具显式写了 `per_session` ——
             // 于是**服务自己内部就不一致**，闸门当场把它拦了（那条"一个进程只能有一条
@@ -345,11 +353,17 @@ impl ToolDecl {
         self.lifecycle = l;
         self
     }
+    /// 声明"收我的时候调哪个工具"。**只给真的实现了停下来的服务用** ——
+    /// 声明了却停不下来，比不声明更糟（中控会等它，然后超时）。
+    pub fn stop_entry(mut self, tool: &str) -> Self {
+        self.stop = Some(tool.to_string());
+        self
+    }
     pub fn name(&self) -> &str {
         &self.name
     }
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema,
@@ -364,7 +378,11 @@ impl ToolDecl {
             "lifecycle": self.lifecycle,
             "idle_timeout": Value::Null,
             "health": "ping",
-        })
+        });
+        if let Some(s) = &self.stop {
+            v["stop"] = json!(s);
+        }
+        v
     }
 }
 
@@ -534,6 +552,12 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
         }
     };
     let mut seen: Vec<&str> = Vec::new();
+    // 先收一份**全部工具名**：`stop` 那条检查要能指向后面声明的工具，
+    // 用边扫边攒的 `seen` 会变成"顺序对了才查得出来"（那种检查等于没查）。
+    let all_tool_names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
     // 每个工具声明的 lifecycle（用来查"同一个服务的工具声明是否一致"）
     let mut lifecycle_seen: Vec<(String, String)> = Vec::new();
     for t in tools {
@@ -638,15 +662,30 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
             None => r.missing_optional
                 .push(format!("工具 `{name}` 没报 `health`（洞 #7）")),
         }
+        // **"停下来"的入口**（2026-09-20）。可选 —— 但声明了就得是**这个 manifest 里
+        // 真有的工具**，否则中控收它的时候会去调一个不存在的名字（那就成了下一个洞）。
+        if let Some(s) = t.get("stop") {
+            match s.as_str() {
+                Some(name_stop) if all_tool_names.iter().any(|t| t == name_stop) => {}
+                Some(name_stop) => r.errors.push(format!(
+                    "工具 `{name}` 声明的 `stop` 指向 `{name_stop}`，而这个 manifest 里没有那个工具 —— \
+                     中控收它会调一个不存在的名字"
+                )),
+                None => r.errors.push(format!("工具 `{name}` 的 `stop` 要不是字符串，要不是不写")),
+            }
+        }
         match t.get("lifecycle").and_then(Value::as_str) {
             // `per_call` / `per_session` 现在**真的会执行**（决定"什么时候拉起"），见 §11.10
             Some(l) if l == "per_call" || l == "per_session" => {}
-            // **`resident`（跨会话常驻）还没实现** —— 按老规矩：声明了没人执行的东西要拦下
-            Some("resident") => r.errors.push(format!(
-                "工具 `{name}` 声明了 `lifecycle: resident`（跨会话常驻）—— \
-                 **这个还没实现**：今天所有服务都跟着会话走（会话结束就收）。\
-                 先声明 `per_session`；哪天真要做常驻，得先有一个跨会话的服务管理器"
-            )),
+            // **`resident`（跨会话常驻）实现于 2026-09-20**：服务听在一个回环端口上、
+            // 把会合文件写出来，后来的会话**接上同一个进程**而不是再起一个。
+            //
+            // ⚠️ 但它**不是单靠 manifest 就能声明的**：还要求部署表里给出
+            // `"resident": true` + `"rendezvous": "<目录>"`（那是**部署配置**，
+            // 和 `wants_fence` 同一条分工）。少了会合目录，中控没法把
+            // "新会话接到老进程上"这件事做出来 —— 这条是部署侧的错，不是服务的错，
+            // 所以闸门**不拦**，但中控会在装配时明确报出来（见 `spawn_spec`）。
+            Some("resident") => {}
             Some(other) => r.errors.push(format!(
                 "工具 `{name}` 的 `lifecycle` 是 `{other}`，不在闭合取值里（{}）",
                 LIFECYCLES.join(" | ")
@@ -1061,16 +1100,44 @@ mod tests {
         );
     }
 
-    /// **`resident` 还没实现** —— 按老规矩，声明了没人执行的东西要拦下。
+    /// **`resident` 现在放行了**（2026-09-20 做出来的），但闸门**换了个地方管**：
+    /// 它不再拦"声明了常驻"，改拦"**你说收你要调哪个工具，可我这儿没那个工具**" ——
+    /// 因为中控收常驻服务时**调的就是那个名字**，指向空处的声明比不声明更糟。
+    ///
+    /// （这条测试是从它的反面改过来的：原来它断言"resident 被拦"。
+    ///  决策变了，测试跟着变 —— 但**不能只是删掉它**，
+    ///  那样"放行"就变成没人看的一行代码了。）
     #[test]
-    fn resident_is_refused_until_it_exists() {
+    fn resident_is_allowed_now_and_the_stop_entry_must_exist() {
         let mut m = conforming_manifest();
         m["tools"][0]["lifecycle"] = json!("resident");
-        let r = check_manifest(&m);
+        let ok = check_manifest(&m);
         assert!(
-            r.errors.iter().any(|w| w.contains("还没实现")),
-            "{:?}",
+            !ok.errors.iter().any(|w| w.contains("resident")),
+            "resident 该放行了：{:?}",
+            ok.errors
+        );
+
+        // 但 `stop` 指向一个不存在的工具 ⇒ 拦
+        let mut bad = conforming_manifest();
+        bad["tools"][0]["stop"] = json!("shutdown");
+        let r = check_manifest(&bad);
+        assert!(
+            r.errors.iter().any(|w| w.contains("shutdown")),
+            "指向不存在的工具该拦：{:?}",
             r.errors
+        );
+
+        // 指向存在的工具 ⇒ 放行（`conforming_manifest` 只有这一个工具，
+        // 那就让它指向自己 —— 闸门只管"这个名字在不在 manifest 里"）
+        let mut good = conforming_manifest();
+        let target = good["tools"][0]["name"].as_str().unwrap().to_string();
+        good["tools"][0]["stop"] = json!(target);
+        let r2 = check_manifest(&good);
+        assert!(
+            !r2.errors.iter().any(|w| w.contains("stop")),
+            "指向存在的工具该放行：{:?}",
+            r2.errors
         );
     }
 

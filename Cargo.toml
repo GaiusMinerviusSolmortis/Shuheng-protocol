@@ -11,6 +11,7 @@ members = [
     "crates/harness-agent",
     "crates/harness-mem",
     "crates/harness-skill",
+    "crates/harness-ipc",
 ]
 
 [workspace.package]

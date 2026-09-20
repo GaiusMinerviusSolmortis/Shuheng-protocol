@@ -1,0 +1,15 @@
+[package]
+name = "harness-ipc"
+version.workspace = true
+edition.workspace = true
+description = "第二个传输：回环 TCP + 口令 + 会合文件（resident 的底座）"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }

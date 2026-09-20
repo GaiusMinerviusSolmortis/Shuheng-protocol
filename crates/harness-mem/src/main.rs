@@ -19,6 +19,7 @@ use harness_core::codec::{self, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
 use harness_core::id::IdGen;
 use harness_core::now_ms;
+use harness_ipc::{Listener, Rendezvous};
 use harness_mem::store::{NewFrag, Query, Store, EPISTEMIC, MAX_TEXT_BYTES};
 use harness_service::contract::ToolDecl;
 use harness_service::domain_lock;
@@ -27,6 +28,7 @@ use serde_json::{json, Value};
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 
+#[derive(Clone)]
 struct Args {
     instance: String,
     sid: String,
@@ -35,6 +37,9 @@ struct Args {
     /// 默认寿命：`0` = 永不过期。默认给一个（30 天）而**不是**永远 ——
     /// 因为"永远"是那种看起来安全、实际把库变成垃圾场的选择。
     default_ttl_ms: i64,
+    /// **常驻**：不听 stdin、不吐 stdout，而是听在一个回环端口上，
+    /// 并把"我在哪、口令是什么"写进这个目录 —— 让**后来的会话**接上同一个进程。
+    resident: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -43,6 +48,7 @@ fn parse_args() -> Result<Args, String> {
     let mut kind = String::from("mem");
     let mut store = PathBuf::from("data/memory");
     let mut default_ttl_ms: i64 = 30 * 24 * 3600 * 1000;
+    let mut resident: Option<PathBuf> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -61,6 +67,13 @@ fn parse_args() -> Result<Args, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| "--default-ttl-ms 后面要跟一个毫秒数（0 = 不过期）".to_string())?
             }
+            "--resident" => {
+                resident = Some(
+                    it.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--resident 后面要跟一个会合目录".to_string())?,
+                )
+            }
             other => return Err(format!("不认识的参数 `{other}`；--help 看用法")),
         }
     }
@@ -73,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         kind,
         store,
         default_ttl_ms,
+        resident,
     })
 }
 
@@ -98,6 +112,15 @@ fn main() {
             std::process::exit(3);
         }
     };
+
+    // **常驻那条路**：不听 stdin、不吐 stdout —— 它听套接字，谁带口令谁来连。
+    // 为什么要这样：stdio 是**父子私有**的，中控一收摊那条通道就没了；
+    // 常驻的意义正是"活过这个会话"，所以它必须有一条**别的会话也能接上**的通道。
+    if let Some(dir) = args.resident.clone() {
+        serve_resident(args, store, dir);
+        return;
+    }
+
     let _lock = match domain_lock::acquire("mem", std::slice::from_ref(&args.store)) {
         Ok(l) => l,
         Err(c) => {
@@ -226,6 +249,147 @@ fn degraded_loop(args: &Args) {
     }
 }
 
+/// **常驻那条路**：听套接字、写会合文件、**服务多个会话**（2026-09-20）。
+///
+/// 三件事和 stdio 那条路不同，每一件都有理由：
+///
+/// | | stdio 那条 | 常驻这条 |
+/// |---|---|---|
+/// | 通道 | 父子私有（中控收摊就断） | **回环套接字 + 口令**：别的会话能接上 |
+/// | 什么时候退 | stdin EOF | **只有被请停（`shutdown`）或进程被杀** —— 会话结束不算 |
+/// | 谁在用 | 一个会话 | **多个会话同时**（各自一条连接，共享同一个 `Store`）|
+///
+/// 最后一条是这一整块的意义：**"记忆跨会话"从"新进程读同一个目录"变成了
+/// "同一个进程服务多个会话"** —— 内存里的东西不用重新读一遍。
+fn serve_resident(args: Args, store: Store, dir: PathBuf) {
+    // 域锁还是要的：**一处碎片库只许一个进程写**（这条不因为常驻而变）。
+    // 常驻只是让"那一个进程"活得更久，不是让"可以有两个"。
+    let _lock = match domain_lock::acquire("mem", std::slice::from_ref(&args.store)) {
+        Ok(l) => l,
+        Err(c) => {
+            eprintln!("[mem] 域锁撞上了：{}。{}", c.why, c.remedy);
+            std::process::exit(3);
+        }
+    };
+    let listener = match Listener::bind(&args.instance) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[mem] 端口听不上：{e}");
+            std::process::exit(3);
+        }
+    };
+    let rv = Rendezvous::new(&args.instance, &args.kind, listener.addr(), listener.token());
+    if let Err(e) = rv.write(&dir) {
+        eprintln!("[mem] 会合文件写不出来（{}）：{e}", dir.display());
+        std::process::exit(3);
+    }
+    let m = manifest(&args);
+    eprintln!(
+        "[mem] **常驻**：{} @ {}（会合文件在 {}）—— 会话结束不收我",
+        args.instance,
+        rv.addr,
+        dir.display()
+    );
+
+    // 共享的东西：碎片库、清单、会话计数。**每个连接一条线程**，
+    // 各自有自己的消息 id 生成器（tag 里带连接号，跨连接不会撞 id）。
+    let store = std::sync::Arc::new(store);
+    let manifest = std::sync::Arc::new(m);
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let started = rv.started_ms;
+    loop {
+        let conn = match listener.accept() {
+            Ok(c) => c,
+            Err(e) => {
+                // **口令不对不是致命错误**：说清是哪条连接被拒了，继续听
+                eprintln!("[mem] 拒了一条连接：{e}");
+                continue;
+            }
+        };
+        let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let store = store.clone();
+        let manifest = manifest.clone();
+        let dir = dir.clone();
+        let instance = args.instance.clone();
+        let sid = args.sid.clone();
+        let args_c = args.clone();
+        std::thread::spawn(move || {
+            let mut ids = IdGen::new(format!("{instance}-c{n}"));
+            let mut conn = conn;
+            eprintln!("[mem] 会话 {n} 接上了（共服务过 {n} 个）");
+            // **每一路上来都先自报家门**：接上来的那个会话也要看见 manifest
+            let hello = Envelope {
+                id: ids.next_message(),
+                ts: now_ms(),
+                kind: MessageType::Presence,
+                from: instance.clone(),
+                to: "ctrl".into(),
+                corr: None,
+                sid: sid.clone(),
+                authority: Authority::Observe,
+                payload: json!({
+                    "state": "online",
+                    "manifest": *manifest,
+                    // 这两样是"我是不是上次那个进程"的凭据（smoke 就靠它）
+                    "resident": true,
+                    "started_ms": started,
+                    "sessions_served": n,
+                }),
+            };
+            emit(&mut conn, &hello);
+            loop {
+                match conn.read_line() {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(env) = codec::decode(&line) else {
+                            eprintln!("[mem] 收到不合规的消息，跳过");
+                            continue;
+                        };
+                        match env.kind {
+                            MessageType::Request => {
+                                let after =
+                                    handle_request(&mut conn, &mut ids, &args_c, &store, &env);
+                                if let After::Shutdown = after {
+                                    // **把会合文件撤掉再走**：不然下一个会话会以为我还在
+                                    let _ = harness_ipc::Rendezvous::remove(&dir, &instance);
+                                    eprintln!("[mem] 被请停了：会合文件撤掉，走了");
+                                    std::process::exit(0);
+                                }
+                            }
+                            MessageType::Cancel => {
+                                let payload = json!({"route": null, "effect": "confirmed",
+                                    "code": null,
+                                    "why": "本地读写已经做完了 —— 没有可取消的中间态",
+                                    "data": {"canceled": false}});
+                                reply_to(&mut conn, &mut ids, &args_c, &env, payload);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None) => {
+                        // **一个会话走了而已，我不走** —— 这就是常驻。
+                        eprintln!("[mem] 会话 {n} 断开了（我留着）");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[mem] 读套接字失败：{e}");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// 处理完一条请求之后该干什么。
+enum After {
+    Keep,
+    /// 有人（只能是中控）请我停
+    Shutdown,
+}
+
 fn emit(out: &mut impl io::Write, env: &Envelope) {
     match codec::encode(env) {
         Ok(line) => {
@@ -249,7 +413,10 @@ fn required_caps(tool: &str) -> &'static [&'static str] {
         "pin" | "unpin" | "forget" => &["mem.curate"],
         "recall" | "list" => &["mem.read"],
         // 零能力：出问题的时候得有人能问它一句 —— 诊断通道不能跟着鉴权一起坏
-        "help" | "ping" | "status" => &[],
+        // 零能力：诊断那几句永远放行（"出问题的时候得有人能问它一句"）。
+        // `shutdown` 也在这儿，但它**另外还有一道门**：只认"没经过网关 + 发件人是中控"
+        // （见 `handle_request`）—— 零能力不等于谁都能关它。
+        "help" | "ping" | "status" | "shutdown" => &[],
         _ => &[],
     }
 }
@@ -289,6 +456,13 @@ fn manifest(args: &Args) -> Value {
 }
 
 fn tools(args: &Args) -> Vec<Value> {
+    // **常驻的服务，工具也报 `resident`** —— 闸门要求一个服务里的工具
+    // 对 lifecycle 的说法一致（同一个进程不可能有两种寿命）。
+    let lc: &'static str = if args.resident.is_some() {
+        "resident"
+    } else {
+        "per_session"
+    };
     let ttl_note = if args.default_ttl_ms == 0 {
         "默认：**永不过期**（这个服务被这么起的）".to_string()
     } else {
@@ -306,7 +480,7 @@ fn tools(args: &Args) -> Vec<Value> {
         )
         .read_only()
         .idempotent()
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
         ToolDecl::new(
@@ -316,7 +490,7 @@ fn tools(args: &Args) -> Vec<Value> {
         )
         .read_only()
         .idempotent()
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
         ToolDecl::new(
@@ -326,7 +500,7 @@ fn tools(args: &Args) -> Vec<Value> {
         )
         .read_only()
         .idempotent()
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
         ToolDecl::new(
@@ -345,7 +519,7 @@ fn tools(args: &Args) -> Vec<Value> {
                    }}),
         )
         .caps(&["mem.write"])
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .returns(json!({"data": {"type": "object"}}))
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
@@ -368,7 +542,7 @@ fn tools(args: &Args) -> Vec<Value> {
         .read_only()
         .idempotent()
         .caps(&["mem.read"])
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .returns(json!({"data": {"type": "object"}}))
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
@@ -381,7 +555,7 @@ fn tools(args: &Args) -> Vec<Value> {
         .read_only()
         .idempotent()
         .caps(&["mem.read"])
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .returns(json!({"data": {"type": "object"}}))
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
@@ -394,7 +568,7 @@ fn tools(args: &Args) -> Vec<Value> {
         )
         .caps(&["mem.curate"])
         .idempotent()
-        .lifecycle("per_session")
+        .lifecycle(lc)
         .returns(json!({"data": {"type": "object"}}))
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
@@ -408,7 +582,23 @@ fn tools(args: &Args) -> Vec<Value> {
         )
         .caps(&["mem.curate"])
         .destructive()
-        .lifecycle("per_session")
+        .lifecycle(lc)
+        .returns(json!({"data": {"type": "object"}}))
+        .requires_on(&["confirmed"], &["data"])
+        .to_json(),
+        // **"停下来"的入口**（`stop` 字段）：中控收我的时候调这个。
+        //
+        // 为什么非要有个入口：常驻服务**可能不是当前这个会话拉起来的** ——
+        // 那时候中控手里没有我的子进程句柄，"杀进程"根本做不到。
+        // 而"我怎么体面地停"只有我自己知道。
+        ToolDecl::new(
+            "shutdown",
+            "让这个记忆服务自己停下来（**只有宿主中控能调**）。",
+            json!({"type": "object", "additionalProperties": false, "properties": {}}),
+        )
+        .destructive()
+        .lifecycle(lc)
+        .stop_entry("shutdown")
         .returns(json!({"data": {"type": "object"}}))
         .requires_on(&["confirmed"], &["data"])
         .to_json(),
@@ -430,7 +620,9 @@ fn handle_line(
         }
     };
     match env.kind {
-        MessageType::Request => handle_request(out, ids, args, store, &env),
+        MessageType::Request => {
+            handle_request(out, ids, args, store, &env);
+        }
         MessageType::Cancel => {
             // 这一层的调用都是"读一本本地账、写一行"，快到没有可取消的窗口。
             // 照实说：**不是"我停下了"，是"它本来就做完了"**。
@@ -465,7 +657,13 @@ fn reply_to(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, req: &Envelo
     );
 }
 
-fn handle_request(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, store: &Store, req: &Envelope) {
+fn handle_request(
+    out: &mut impl io::Write,
+    ids: &mut IdGen,
+    args: &Args,
+    store: &Store,
+    req: &Envelope,
+) -> After {
     let tool = req.payload.get("tool").and_then(Value::as_str).unwrap_or("");
     let call = req.payload.get("args").cloned().unwrap_or(json!({}));
 
@@ -475,7 +673,31 @@ fn handle_request(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, store:
     if !g.allows(required) {
         let payload = grant::refuse_payload(tool, &g.missing(required), &g);
         reply_to(out, ids, args, req, payload);
-        return;
+        return After::Keep;
+    }
+
+    // **"停下来"这道门比能力更窄**：只认"没经过网关（`Unrouted`）+ 发件人是中控"。
+    //
+    // 为什么不是"零能力就放行"：零能力的意思是"出问题时谁都能问它一句"，
+    // 不是"谁都能把它关掉"。而中控自己发请求时**不带 `granted`**
+    // （盖章只盖"发给工具服务的、别人发起的"——它自己那几条不盖），
+    // 所以"没经过网关"在这里恰好等于"这句话是宿主亲口说的"。
+    if tool == "shutdown" {
+        let by_ctrl = matches!(g, Grant::Unrouted) && req.from == "ctrl";
+        let payload = if by_ctrl {
+            json!({"route": null, "effect": "confirmed", "code": null,
+                   "data": {"bye": true, "instance": args.instance,
+                            "resident": args.resident.is_some(),
+                            "hint": "会合文件撤掉之后就没人能找到我了 —— \
+                                     下一次有人要记忆会重新起一个"}})
+        } else {
+            json!({"route": null, "effect": "refused", "code": "refused",
+                   "why": "`shutdown` 只认**宿主中控**亲口说的那句",
+                   "remedy": "要停它得让中控去停（用户按 `stop`）—— \
+                              你是调用方，不是它的宿主。这条不是能力问题，是身份问题"})
+        };
+        reply_to(out, ids, args, req, payload);
+        return if by_ctrl { After::Shutdown } else { After::Keep };
     }
 
     let payload = match tool {
@@ -632,6 +854,7 @@ fn handle_request(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, store:
                         "remedy": "调 `help` 看有哪些 —— 别猜名字"}),
     };
     reply_to(out, ids, args, req, payload);
+    After::Keep
 }
 
 fn help_text(section: &str, args: &Args) -> String {
