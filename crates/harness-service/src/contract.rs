@@ -83,6 +83,25 @@ pub const INJECTION_POLICIES: &[&str] = &["card", "help", "full"];
 
 /// §11.1 E 组 `lifecycle` 的闭合取值。
 pub const LIFECYCLES: &[&str] = &["per_call", "per_session", "resident"];
+/// **中控认识的那一版契约**（规范-工具服务 §11.6 #8，2026-09-20 定）。
+///
+/// 规则（写在这儿，因为它是**闸门**在执行的）：
+///
+/// | 改动 | 算不算破坏性 | 版本怎么动 |
+/// |---|---|---|
+/// | **加必报字段** | ✅ 破坏性（老服务会突然不合规、被闸门拦）| **升**（`1` → `2`）|
+/// | 加**可选**字段 | 兼容 | 不动 |
+/// | 往**闭合枚举**里加值 | 兼容（不报那个值的老服务不受影响）| 不动 |
+/// | 删值 / 改语义 | ✅ 破坏性 | **升** |
+///
+/// ⚠️ **有一处例外要说清楚**：`sandbox` / `sandbox_note` 是 2026-09-20
+/// **加进 `"1"` 的必报字段** —— 按上表它本该升版。之所以没升：
+/// **那时还没有第三方服务**（六个服务全在这个仓库里，一起改完的）。
+/// 这是**唯一一次**可以这么干的情形；下一次加必报字段就得升版，
+/// 否则"版本号"这三个字就废了 —— 而版本号废掉之后，
+/// 对不上版本的两边只会互相报"你少了个字段"，谁也查不出真正的原因。
+pub const CONTRACT_VERSION: &str = "1";
+
 /// **沙箱的五个面**（04-安全 §5.8 决定二）—— 每个面一个**闭集**。
 ///
 /// 为什么要有这个字段（2026-09-20）：§5.8 把方向定死了（"策略写在**能枚举的维度**上"、
@@ -475,7 +494,22 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
     // ---- A 身份 ----
     {
         let e = &mut r.errors;
-        need_str(m, "contract_version", e);
+        // **契约版本**（2026-09-20 定下演进规则，见下面那段注释）：
+        // 只接受我们认识的版本 —— **不认识的版本不许照旧解析**，
+        // 那正是"版本号白写"的经典死法（拿到 2 的字段集合却按 1 去读，
+        // 报出来的错会指向"少字段"，而不是"版本不对"）。
+        match m.get("contract_version").and_then(Value::as_str) {
+            Some(v) if v == CONTRACT_VERSION => {}
+            Some(v) => e.push(format!(
+                "`contract_version` 是 `{v}`，我只认识 `{CONTRACT_VERSION}` —— \
+                 这不是「你写错了」，是**我们对不上**：要么你在实现更新的契约，\
+                 要么我太老。**别按旧版本硬解释它**（那样报出来的错会指向错的地方）"
+            )),
+            None => e.push(
+                "少 `contract_version` —— 没有它，中控就只能**猜**该按哪一版解释这份 manifest"
+                    .into(),
+            ),
+        }
         need_str(m, "id", e);
         need_str(m, "version", e);
         need_str(m, "title", e);
@@ -1322,6 +1356,33 @@ mod tests {
             r.errors.iter().any(|w| w.contains("sandbox_note")),
             "{:?}",
             r.errors
+        );
+    }
+
+    /// **契约版本对不上时不许硬解释**（2026-09-20 定下演进规则）。
+    ///
+    /// 这条要防的是那个经典死法：拿到一版**自己不认识**的 manifest，
+    /// 却按旧版本去读 —— 于是报出来的错会指向"你少了个字段"，
+    /// 而真正的原因（版本对不上）谁也看不见。
+    #[test]
+    fn an_unknown_contract_version_is_refused_by_name() {
+        let mut m = conforming_manifest();
+        m["contract_version"] = json!("2");
+        let r = check_manifest(&m);
+        assert!(
+            r.errors.iter().any(|w| w.contains("contract_version")),
+            "版本对不上该点名：{:?}",
+            r.errors
+        );
+        // 少写也一样要被拦（不然中控只能猜）
+        let mut m2 = conforming_manifest();
+        m2.as_object_mut().unwrap().remove("contract_version");
+        assert!(
+            check_manifest(&m2)
+                .errors
+                .iter()
+                .any(|w| w.contains("contract_version")),
+            "没写版本号也得拦"
         );
     }
 

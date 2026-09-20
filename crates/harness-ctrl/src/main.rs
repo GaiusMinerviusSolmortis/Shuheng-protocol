@@ -465,8 +465,14 @@ impl Session {
         })
     }
 
-    /// 落盘的 `meta.json` —— **记锚点，不记路径**（07-界面 §12.7）。
-    /// 锚点还没实现，所以先照实记路径，并**把它标出来**（别让它变成隐性假设）。
+    /// 落盘的 `meta.json` —— **记坐标，不记路径**（07-界面 §12.7）。
+    ///
+    /// ⚠️ **2026-09-20 澄清**：这里原来写着"记锚点，不记路径 …… 锚点还没实现"。
+    /// 而今天**不是"还没实现"，是那件事被取消了** —— §16.5 的修订删掉了
+    /// "项目层"那一档（原话："记忆跟着会话走，项目搬走就在会话里重新托管"），
+    /// 所以会话这一层**不需要**另算一套项目身份：它记的就是**托管的那条路径**，
+    /// 而记忆那层的"锚点"由**调用方**给（`harness-mem` 的 `deposit` 参数）。
+    /// 两件事，不是一件待办。
     fn meta(&self) -> serde_json::Value {
         json!({
             "sid": self.sid,
@@ -645,7 +651,8 @@ fn run() -> i32 {
             "path": canon,
             "hosted_at": now_ms(),
             "by": "启动参数",
-            "anchor_todo": "锚点还没实现（§16.5）；这里暂时记路径",
+            "anchor_note": "会话托管的是**路径**；记忆那层的「锚点」由调用方给\
+                            （§16.5 的修订已删掉『项目层』那一档，所以这里没有待实现的锚点）",
         }));
     }
 
@@ -1981,8 +1988,14 @@ impl App {
         // **中控自己发起的调用**（健康探针）也在这条规则里：规则四说"回给中控的
         // result 必须是中控发起过的 corr"。原来这儿是个空的 `awaiting`，
         // 也就是说**中控一旦自己调工具，回信就会被当成孤儿结果挡下** ——
-        // 所以那行留着 `TODO -- 未决`，直到 tick 让它第一次真的发生。
-        // 现在：把"我发出去还没回来的"如实填进去（`pending` 里 caller = ctrl 的那些）。
+        // 所以那行当时留着 `TODO -- 未决`，直到 tick 让它第一次真的发生。
+        // **2026-09-20 这件事查完并且修掉了**：把"我发出去还没回来的"如实填进去
+        // （`pending` 里 caller = ctrl 的那些）。
+        //
+        // ⚠️ 而那次审计的真正教训在后面：**这个"填进去"当年是对的，可它被另一处
+        // "抢先摘账"架空了** —— `on_service_line` 原来是**先 `pending.remove` 再 `route`**，
+        // 于是每条探针回包都被判成孤儿结果，18 发 18 中（见 `on_service_line` 那段）。
+        // 一句话：**一段代码"写对了"，不等于它那一刻手上的数据是对的。**
         let awaiting: Vec<String> = self
             .pending
             .iter()
@@ -2949,12 +2962,14 @@ impl App {
                 let canon = std::fs::canonicalize(&path)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| path.clone());
-                let anchor_todo = "锚点还没实现（§16.5）；这里暂时记路径";
+                let anchor_note = "会话托管的是**路径**（绑定范围与围栏都按它算）；\
+                                   记忆那层的「锚点」由调用方给 —— §16.5 的修订已删掉\
+                                   「项目层」那一档，所以这里**没有待实现的锚点**";
                 self.session.hosts.push(json!({
                     "path": canon,
                     "hosted_at": now_ms(),
                     "by": req.from,
-                    "anchor_todo": anchor_todo,
+                    "anchor_note": anchor_note,
                 }));
                 let _ = self.log.write_meta(&self.session.meta());
                 // **托管立即生效**：围栏由会话给的那些服务，照新路径重新装配。
@@ -2982,7 +2997,7 @@ impl App {
                     req,
                     json!({"effect": "confirmed", "code": null,
                            "data": {"hosted": canon, "hosts_count": n,
-                                    "services_rehosted": moved, "note": anchor_todo}}),
+                                    "services_rehosted": moved, "note": anchor_note}}),
                 );
             }
             "delegate" => {
@@ -3080,7 +3095,13 @@ impl App {
                 self.reply(
                     req,
                     json!({"effect": "confirmed", "code": null,
-                           "data": {"state": "ended", "note": "归档了；沉淀进记忆还没实现"}}),
+                           // ⚠️ 2026-09-20 把话说准：记忆**服务**有了（`harness-mem` 的 deposit），
+                           // 缺的是"**会话结束自动沉淀**"这个动作（§16.3 那座桥）。
+                           // 原来那句"沉淀进记忆还没实现"会让人以为整块都没做。
+                           "data": {"state": "ended",
+                                    "note": "归档了；**沉淀进记忆还是手动的** —— \
+                                             记忆服务有了（mem 的 deposit），\
+                                             但会话结束不会自动替你沉淀（§16.3 那个动作还没做）"}}),
                 );
                 self.exit_requested = true;
             }
