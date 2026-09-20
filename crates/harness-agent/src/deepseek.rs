@@ -285,6 +285,8 @@ mod tests {
             title: "终端".into(),
             summary: "跑命令".into(),
             when_to_use: "要执行程序时".into(),
+            injection_policy: "card".into(),
+            help_sections: Vec::new(),
             destructive: true,
             tools: vec![ToolDef {
                 name: "run".into(),

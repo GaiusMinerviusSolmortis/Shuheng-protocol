@@ -533,6 +533,16 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
         need_str(m, "summary", e);
         need_str(m, "when_to_use", e);
         match m.get("injection_policy").and_then(Value::as_str) {
+            // **`full` 在规范的闭合取值里，但没有执行者** —— 谁执行注入？提示词编译器。
+            // 而它拿不到手册**正文**（正文不在 manifest 里，要向服务要一次，那条路还没做）。
+            // 所以这里拦下来，理由和 `idle_timeout` 那条一样：
+            // **声明一个没人执行的能力，比不声明更糟** —— 部署方会以为它生效了。
+            Some("full") => e.push(
+                "`injection_policy: full` **没有执行者**：手册正文不在 manifest 里，\
+                 注入时要向服务要一次，那条路还没做（§11.1 B 组）。\
+                 现在真正有执行者的是 `card`（只报名片）与 `help`（名片 + 章节目录）"
+                    .into(),
+            ),
             Some(p) if INJECTION_POLICIES.contains(&p) => {}
             Some(p) => e.push(format!(
                 "`injection_policy` 是 `{p}`，不在闭合取值里（{}）",

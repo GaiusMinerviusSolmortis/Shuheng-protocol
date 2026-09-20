@@ -46,14 +46,16 @@ New-Item -ItemType Directory -Path $prompts -Force | Out-Null
 '@ | Set-Content -LiteralPath (Join-Path $prompts 'audit-mode.md') -Encoding utf8
 Set-Content -LiteralPath (Join-Path $prompts 'empty-one.md') -Value '' -Encoding utf8
 
-function Start-Ctrl2([string]$sid, [string]$tag, [bool]$withPrompts, [string]$channel) {
+function Start-Ctrl2([string]$sid, [string]$tag, [bool]$withPrompts, [string]$channel, [string]$inject = '') {
     $dataDir = Join-Path $work "data-$tag"
     $scriptPath = Join-Path $work "script-$tag.ndjson"
     Set-Content -LiteralPath $scriptPath -Value '{"step":"text","text":"我在。"}' -Encoding utf8
     $servicesPath = Join-Path $work "services-$tag.json"
+    # 注入策略那一档由**服务自己声明**（`--inject`），空的就用默认（`card`）
+    $injectArgs = if ($inject) { '"--inject", "' + $inject + '"' } else { '' }
     @"
 [
-  { "kind": "echo", "id": "echo:1", "role": "tool", "cmd": ["$(J $echo)"] },
+  { "kind": "echo", "id": "echo:1", "role": "tool", "cmd": ["$(J $echo)"], "args": [$injectArgs] },
   { "kind": "agent", "id": "agent:dada", "role": "agent", "bindings": ["echo:1"],
     "cmd": ["$(J $agentBin)"],
     "args": ["--persona", "达达", "--fence", "$(J $project)", "--script", "$(J $scriptPath)"] }
@@ -218,6 +220,42 @@ $n2 = WaitCorr $D 'n2'
 $Derr = Stop-Ctrl $D
 Check '13. **只有用户能注入规矩**：一条被降级到 agent 的通道发不出来' {
     $n2.payload.effect -eq 'refused' -and $n2.payload.why -like '*user*'
+}
+
+Write-Host '== 场景 E：`injection_policy` **真的有执行者** ==' -ForegroundColor Cyan
+# 这个字段原来是个**死声明**：五个服务都写 `card`，而没有任何一行代码读它
+# （2026-09-20 审计）。按本仓库自己那条规矩（"声明一个没人执行的能力比不声明更糟"），
+# 现在 `card` 与 `help` 由**提示词编译器**执行，`full` 由**注册关**挡下（它没有执行者）。
+$E = Start-Ctrl2 's-pe' 'e' $false '' 'help'
+$null = Wait-Agent $E
+Send $E 'agent:dada' 'pe1' @{ task = '随便说一句' }
+$pe1 = WaitCorr $E 'pe1'
+$Eerr = Stop-Ctrl $E
+$Erecs = Get-Content -LiteralPath (Join-Path (Join-Path (Join-Path $E.dataDir 'sessions') $E.sid) 'log.jsonl') |
+    Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_ | ConvertFrom-Json }
+$promptA = ($Arecs | Where-Object { $_.payload.kind -eq 'prompt_compiled' } | Select-Object -First 1).payload.system
+$promptE = ($Erecs | Where-Object { $_.payload.kind -eq 'prompt_compiled' } | Select-Object -First 1).payload.system
+
+Check '14. `card`（默认那档）：前缀里**没有**章节目录' {
+    $promptA -and ($promptA -notlike '*手册有这些章*')
+}
+Check '15. `help` 那档：前缀里**有章节目录**（标题，不是正文）' {
+    $promptE -and ($promptE -like '*手册有这些章*') -and ($promptE -like '*错误码与补救*')
+}
+Check '16. **只有标题进了前缀**：正文一个字都没进去' {
+    # ⚠️ 得挑**正文里**的话，别挑名片里本来就有的话（第一版我拿了 `summary`
+    # 里那句"只回话、不做事"，而那句话**本来就该在名片里** —— 判据错了，不是代码错）。
+    $promptE -notlike '*把系统的 bug*' -and $promptE -notlike '*不碰文件、不跑命令*'
+}
+
+$F = Start-Ctrl2 's-pf' 'f' $false '' 'full'
+$null = Wait-Agent $F
+$Ferr = Stop-Ctrl $F
+$Frecs = Get-Content -LiteralPath (Join-Path (Join-Path (Join-Path $F.dataDir 'sessions') $F.sid) 'log.jsonl') |
+    Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_ | ConvertFrom-Json }
+Check '17. `full`：**注册关把它拦下来**，理由点名"没有执行者"' {
+    $bad = $Frecs | Where-Object { $_.payload.code -eq 'manifest_nonconforming' } | Select-Object -First 1
+    $bad -and ($bad.payload.why -like '*没有执行者*')
 }
 
 Write-Host ''

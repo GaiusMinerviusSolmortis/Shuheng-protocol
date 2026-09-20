@@ -35,6 +35,14 @@ struct Args {
     /// **谎报沙箱**：声称"带路径的参数都过围栏"，却不报任何围栏 ——
     /// 2026-09-20 新加那条规则（"说了要围却没围栏"）的靶子。
     sandbox_lie: bool,
+    /// **注入策略摘哪一档**（`card` / `help` / `full`）。
+    ///
+    /// 为什么这个开关挂在这儿（而不是给真服务加一堆开关）：
+    /// `injection_policy` 是 §11.1 B 组里**由服务声明、由提示词编译器执行**的字段，
+    /// 要验"某一档真的进了前缀"就得有一个**能改这一档的服务**。
+    /// echo 的用途本来就是"演那些真服务不该演的"，`full` 那一档也一样
+    /// （它**没有执行者**，注册关会拦下它 —— 那正是要演的东西）。
+    inject: String,
 }
 
 fn parse_args() -> Args {
@@ -46,6 +54,7 @@ fn parse_args() -> Args {
     let mut bad_result = false;
     let mut freeze = false;
     let mut sandbox_lie = false;
+    let mut inject = String::from("card");
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -56,6 +65,7 @@ fn parse_args() -> Args {
             "--bad-result" => bad_result = true,
             "--freeze" => freeze = true,
             "--sandbox-lie" => sandbox_lie = true,
+            "--inject" => inject = it.next().unwrap_or(inject),
             _ => {}
         }
     }
@@ -67,6 +77,7 @@ fn parse_args() -> Args {
         bad_result,
         freeze,
         sandbox_lie,
+        inject,
     }
 }
 
@@ -145,7 +156,8 @@ fn manifest(args: &Args) -> Value {
         "summary": "只回话，不做事 —— 用来验证三方通路",
         "when_to_use": "阶段 1/4a 的联调；不要指望它改文件",
         "will": "它只是个 mock，什么都不持有、也不落盘 —— 它没了就是没了，没有后事要办。",
-        "injection_policy": "card",
+        // 可由 `--inject` 改档 —— 见 `Args::inject` 那段（要验"某一档真的进了前缀"）
+        "injection_policy": args.inject,
         "help_sections": [
             {"id": "overview", "title": "概览"},
             {"id": "tools", "title": "有哪些工具"},
@@ -420,6 +432,7 @@ mod tests {
             bad_result,
             freeze: false,
             sandbox_lie: false,
+            inject: "card".into(),
         }
     }
 

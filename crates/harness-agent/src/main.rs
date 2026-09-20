@@ -1621,6 +1621,8 @@ mod tests {
             title: instance.into(),
             summary: String::new(),
             when_to_use: String::new(),
+            injection_policy: "card".into(),
+            help_sections: Vec::new(),
             destructive: false,
             tools: tools
                 .iter()

@@ -38,6 +38,22 @@ pub struct ToolCard {
     pub title: String,
     pub summary: String,
     pub when_to_use: String,
+    /// **这份名片注入到哪一档**（§11.1 B 组的 `injection_policy`）。
+    ///
+    /// 它原来是个**声明了没人执行**的字段：五个服务都写 `card`，
+    /// 而没有任何一行代码读它（2026-09-20 审计）。按这个仓库自己那条规矩
+    /// （"声明一个没人执行的能力比不声明更糟"，见 `idle_timeout`），
+    /// 要么让它有执行者，要么别声明 —— 现在是前者：
+    ///
+    /// | 取值 | 注入什么 | 谁执行 |
+    /// |---|---|---|
+    /// | `card` | 名字 + 一句话 + 什么时候用 + **它的工具名** | 本模块（原来就有的那档）|
+    /// | `help` | 上面那些 **+ 这本手册有哪些章**（标题，不带正文）| 本模块（2026-09-20 加）|
+    /// | `full` | 封面 + 手册正文 | ❌ **没人执行** —— 正文不在 manifest 里，得向服务要一次；注册关会拦下它 |
+    pub injection_policy: String,
+    /// 手册的章节目录（`id` + 标题）。**只有当策略是 `help` 时才进前缀。**
+    #[serde(default)]
+    pub help_sections: Vec<(String, String)>,
     /// 只读 / 有副作用（抄 MCP 的 annotations，§11.1）
     pub destructive: bool,
     /// 它有哪些工具、各自怎么填。
@@ -96,11 +112,33 @@ pub fn card_from_manifest(instance: &str, m: &serde_json::Value) -> Option<ToolC
             .unwrap_or("")
             .to_string()
     };
+    // 手册的章节目录：**从服务自报的 manifest 里拿**（`help_sections`）——
+    // 正文不在这儿，那得调 `help`。这里要的只是"有哪几章"。
+    let help_sections: Vec<(String, String)> = m
+        .get("help_sections")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| {
+                    Some((
+                        s.get("id")?.as_str()?.to_string(),
+                        s.get("title")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Some(ToolCard {
         instance: instance.to_string(),
         title: s("title"),
         summary: s("summary"),
         when_to_use: s("when_to_use"),
+        // 没写就按最保守的来：**只报名片**（那档本来就不会多说什么）
+        injection_policy: {
+            let p = s("injection_policy");
+            if p.is_empty() { "card".to_string() } else { p }
+        },
+        help_sections,
         destructive,
         tools,
     })
@@ -175,6 +213,18 @@ pub fn compile(
             let names: Vec<&str> = t.tools.iter().map(|x| x.name.as_str()).collect();
             p.push_str(&format!("  它的工具：{}\n", names.join(" / ")));
         }
+        // **`injection_policy: "help"` 那一档**：把**章节目录**也带上。
+        //
+        // 为什么这一档有意义：模型不知道该工具的手册里有什么，就不知道
+        // **值不值得去问**（"不会就 `--help`"那条要它先知道有这一章）。
+        // 章节标题只有几十个字，正文可能几万字 —— 中间这一档就是给这个的。
+        if t.injection_policy == "help" && !t.help_sections.is_empty() {
+            let titles: Vec<&str> = t.help_sections.iter().map(|(_, title)| title.as_str()).collect();
+            p.push_str(&format!(
+                "  它的手册有这些章：{}（要看某一章就调 `help`）\n",
+                titles.join(" / ")
+            ));
+        }
     }
     p.push('\n');
 
@@ -218,6 +268,8 @@ mod tests {
             title: "终端".into(),
             summary: "跑单条命令".into(),
             when_to_use: "要执行程序时".into(),
+            injection_policy: "card".into(),
+            help_sections: vec![("cursor".into(), "输出与游标".into())],
             destructive: true,
             tools: vec![ToolDef {
                 name: "run".into(),
@@ -273,6 +325,31 @@ mod tests {
         let (p, m) = compile("agent:dada", &persona(), &[], &[], "s-1");
         assert!(p.contains("现在没有工具"));
         assert!(m.tool_instances.is_empty());
+    }
+
+    /// **`injection_policy` 是个真的有执行者的字段**（2026-09-20）。
+    ///
+    /// 它原来五个服务都声明、却没一行代码读它 —— 按这个仓库自己的规矩
+    /// （"声明一个没人执行的能力比不声明更糟"），那是要修的：现在
+    /// `card` 就报名片、`help` 额外报**章节目录**。
+    #[test]
+    fn the_help_injection_level_carries_the_chapter_titles() {
+        let plain = card("term:1"); // 它上面写着 `card`
+        let (p_card, _) = compile("agent:dada", &persona(), &[plain], &[], "s-1");
+        assert!(
+            !p_card.contains("手册有这些章"),
+            "`card` 那一档不该把章节目录塞进去"
+        );
+
+        let mut with_help = card("term:1");
+        with_help.injection_policy = "help".into();
+        let (p_help, _) = compile("agent:dada", &persona(), &[with_help], &[], "s-1");
+        assert!(
+            p_help.contains("手册有这些章") && p_help.contains("输出与游标"),
+            "`help` 那一档要带上章节标题：{p_help}"
+        );
+        // 多出来的只有标题，**正文一个字都不进前缀**（那是"full"那一档，还没做）
+        assert!(!p_help.contains("read 之后拿游标继续") , "正文不该进前缀");
     }
 
     #[test]
