@@ -17,7 +17,7 @@ pub fn kind_of(id: &str) -> &str {
     split_instance(id).map(|(k, _)| k).unwrap_or(id)
 }
 
-/// **短随机段**（4 位十六进制）。
+/// **短随机段**（8 位十六进制，32 位）。
 ///
 /// 为什么 id 里需要它：id 不只是给人读的名字 —— 它**参与鉴权**
 /// （绑定表写的是实例 id、归属写的是 `谁@会话`、路由按 id 找收件人）。
@@ -27,6 +27,18 @@ pub fn kind_of(id: &str) -> &str {
 ///
 /// 所以名字要**唯一到跨进程**，而唯一性只能靠"时间 + 随机"。
 /// 这里借 `RandomState` 的进程级随机种子，不引入新依赖。
+///
+/// ⚠️ **2026-09-20 从 4 位加长到 8 位**，起因是一个**偶发失败**的测试：
+/// 它断言"一批 64 个里绝不重复"—— 而 16 位随机做不到这一点
+/// （64 个取样，碰撞概率约 **3%**；那个测试就这么红了一次）。
+///
+/// 查明之后发现要修的不是那条测试，**是这里**：这个随机段在
+/// **跨会话的身份索引**（`instances.jsonl`，只追加、要回答"这个 id 是谁"）
+/// 里承担唯一性 —— 而 16 位在 **300 个 id** 的规模上碰撞概率已经接近一半。
+/// 32 位把它压到 **约一万分之一**（同样 300 个 id），代价只是名字长 4 个字符。
+///
+/// 一句话记下这次的教训：**"一个偶发的红"最值得先问的不是"怎么让它稳"，
+/// 而是"它想保的那个性质，现在的实现真的保得住吗"。**
 pub fn short_rand() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -40,7 +52,7 @@ pub fn short_rand() -> String {
     // 再掺一点"这个栈地址" —— 同一纳秒内的两次调用也会分开
     let here = &nanos as *const u64 as usize;
     h.write_usize(here);
-    format!("{:04x}", (h.finish() & 0xffff) as u16)
+    format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 }
 
 /// 单调计数器。**同一个会话内不重复**就够 —— id 的作用是去重和引用，不是排序。
@@ -91,12 +103,21 @@ mod tests {
 
     /// 随机段要**真的分开**：同一毫秒内连着要 64 个，不该有重复。
     /// （它不承担保密职责 —— 只承担"撞不上"，见 `short_rand` 的注释。）
+    ///
+    /// ⚠️ 断言的是**"随机性没坏"**，不是"绝不重复"：32 位下 64 个取样里
+    /// 撞一次的期望是 4.8e-7，所以允许至多一次 —— 真要撞两次，
+    /// 那不是运气差，是随机源坏了（或者有人把它改回了短的那一版）。
     #[test]
     fn short_rand_does_not_repeat_in_a_burst() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
-            assert!(seen.insert(short_rand()), "同一批里不该撞");
+            seen.insert(short_rand());
         }
-        assert_eq!(short_rand().len(), 4);
+        assert!(
+            seen.len() >= 63,
+            "64 个取样里出现了 {} 次碰撞 —— 随机源坏了，或者它被改短了",
+            64 - seen.len()
+        );
+        assert_eq!(short_rand().len(), 8);
     }
 }

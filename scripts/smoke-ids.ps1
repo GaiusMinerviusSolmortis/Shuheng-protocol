@@ -115,7 +115,7 @@ $et2 = $proc2.StandardError.ReadToEndAsync(); $et2.Wait(4000) | Out-Null
 
 Check '4. 两次 spawn 拿到**两个不同的 id**' { $id1 -and $id2 -and $id1 -ne $id2 }
 Check '5. 而且它们**带上随机段**（不是会重合的纯计数）' {
-    $id1 -match '^echo:\d+-[0-9a-f]{4}$' -and $id2 -match '^echo:\d+-[0-9a-f]{4}$'
+    $id1 -match '^echo:\d+-[0-9a-f]{8}$' -and $id2 -match '^echo:\d+-[0-9a-f]{8}$'
 }
 Check '6. 两次都没撞上服务表里那个 `echo:base`' {
     $id1 -ne 'echo:base' -and $id2 -ne 'echo:base'
@@ -138,8 +138,8 @@ foreach ($i in 1..2) {
         Select-Object -First 1
     if ($line -match '([^\\/]+)[\\/]log\.jsonl') { $sids += $Matches[1] }
 }
-Check '7. 会话 id 的形状是 `s-<毫秒>-<4 位十六进制>`' {
-    $sids.Count -eq 2 -and ($sids | Where-Object { $_ -notmatch '^s-\d+-[0-9a-f]{4}$' }).Count -eq 0
+Check '7. 会话 id 的形状是 `s-<毫秒>-<8 位十六进制>`（2026-09-20 从 4 位加长，见 id.rs）' {
+    $sids.Count -eq 2 -and ($sids | Where-Object { $_ -notmatch '^s-\d+-[0-9a-f]{8}$' }).Count -eq 0
 }
 Check '8. 先后开两个会话，**id 不同**（不会写进同一个日志目录）' {
     $sids.Count -eq 2 -and $sids[0] -ne $sids[1]

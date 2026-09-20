@@ -53,11 +53,18 @@ struct Args {
     model_name: String,
     max_tokens: u64,
     env_file: Option<String>,
+    /// **摘要器用谁**（待定 #103）。`None` = 按模型类型定默认（真 provider ⇒ model）
+    summarize: Option<SummarizeWith>,
     /// **恢复**：启动时向中控要回"我上次看到过的东西"
     resume: bool,
 }
 
 fn parse_args() -> Args {
+    // 抽一层出来是为了**能测**：`parse_args` 读进程参数，测试里没法喂。
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I: Iterator<Item = String>>(mut it: I) -> Args {
     let mut a = Args {
         instance: "agent:dada".into(),
         sid: "s-1".into(),
@@ -75,8 +82,8 @@ fn parse_args() -> Args {
         max_tokens: 1024,
         env_file: None,
         resume: false,
+        summarize: None,
     };
-    let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
         match x.as_str() {
             "--instance" => a.instance = it.next().unwrap_or(a.instance),
@@ -121,6 +128,15 @@ fn parse_args() -> Args {
                 a.max_tokens = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.max_tokens)
             }
             "--env-file" => a.env_file = it.next(),
+            "--summarize" => {
+                let v = it.next().unwrap_or_default();
+                match SummarizeWith::parse(&v) {
+                    Some(s) => a.summarize = Some(s),
+                    None => eprintln!(
+                        "[agent] `--summarize` 只认 `mock` / `model`，收到 `{v}` —— 忽略它"
+                    ),
+                }
+            }
             "--resume" => a.resume = true,
             _ => {}
         }
@@ -226,6 +242,126 @@ fn key_from_env_file(path: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// **摘要器**（待定 #103）：压缩时那一次"把这一段压成交接说明"的调用，用谁来做。
+///
+/// 在这之前它**永远是 mock**（确定性的填充文本）—— 那对"测系统"是对的，
+/// 但对"真的在长会话里干活"是错的：**摘要的质量就是压缩之后模型还能不能接着干**。
+///
+/// 三种取值：
+///
+/// | 取值 | 谁在做摘要 |
+/// |---|---|
+/// | `mock` | 确定性填充（测系统用 —— 让"系统对不对"和"模型听不听话"分得开）|
+/// | `model` | **真模型**（和主模型同一个 provider，另开一个客户端）|
+/// | 默认 | 真 provider ⇒ `model`；mock 脚本 ⇒ `mock`（显式、不猜：脚本那份是测试用的）|
+///
+/// ⚠️ **真模型那一路会失败**（网络、限流）。失败了**退回 mock 并把原因写进事件** ——
+/// 压缩这件事不能因为摘要器连不上就整个不做（那会把上下文顶爆），
+/// 但也**不许装作那是模型的摘要**。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SummarizeWith {
+    Mock,
+    Model,
+}
+
+impl SummarizeWith {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mock" => Some(Self::Mock),
+            "model" => Some(Self::Model),
+            _ => None,
+        }
+    }
+}
+
+/// **摘要用谁做**（待定 #103）：显式给了就听显式的；没给就**按模型类型定**。
+///
+/// 为什么默认不是"一律用真模型"：mock 脚本那套是**测试工具** ——
+/// 它吐的时间线是脚本，拿它去喂摘要模型只会得到一段没有意义的摘要，
+/// 而测试要的是**确定性**（"系统对不对"和"模型听不听话"分得开）。
+///
+/// 抽成自由函数，是为了**只有一个地方做这个判断** —— 两处各判一次迟早不一致。
+fn summarize_choice(a: &Args) -> SummarizeWith {
+    a.summarize.unwrap_or(if a.model == "deepseek" {
+        SummarizeWith::Model
+    } else {
+        SummarizeWith::Mock
+    })
+}
+
+/// 用模型做摘要的人。
+///
+/// 它握着**自己那份**模型客户端（不是主模型那个）—— 因为 `Summarizer::summarize`
+/// 拿的是 `&self`，而主模型在回合循环里是要 `&mut` 的。两份客户端的代价是
+/// 两个连接池，换来的是**不用去动 `harness-memory` 那个 trait**（它不该知道模型的事）。
+struct ModelSummarizer {
+    /// `RefCell` 是因为 `Summarizer::summarize` 拿的是 `&self`：
+    /// 调用模型要 `&mut`（provider 客户端是有状态的）。单线程，够用。
+    model: std::cell::RefCell<Box<dyn Model>>,
+    /// 上一次调用留下的痕迹（`&self` 里要记东西 ⇒ 内部可变性；单线程，够用）
+    last: std::cell::RefCell<SummarizerTrace>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SummarizerTrace {
+    /// 真模型报回来的输入 token（没有就是没走到那一步）
+    tokens_in: u64,
+    /// 真模型这条路失败了 ⇒ 退回了 mock，这里是原因
+    fell_back: Option<String>,
+}
+
+impl ModelSummarizer {
+    fn new(model: Box<dyn Model>) -> Self {
+        Self {
+            model: std::cell::RefCell::new(model),
+            last: std::cell::RefCell::new(SummarizerTrace::default()),
+        }
+    }
+}
+
+impl harness_memory::summarize::Summarizer for ModelSummarizer {
+    fn name(&self) -> &'static str {
+        "model"
+    }
+
+    fn summarize(&self, input: &harness_memory::summarize::SummaryInput) -> String {
+        let mut system = input.instructions.clone();
+        if let Some(prev) = &input.previous_summary {
+            // **新摘要必须看得见旧摘要**，否则越压越薄（memory 那边那条纪律）
+            system.push_str("\n\n另外，这是**上一次**的交接说明，你要把它折进新的里：\n");
+            system.push_str(prev);
+        }
+        let req = ModelRequest {
+            system,
+            items: vec![harness_memory::Item::user(format!(
+                "以下是需要压缩的那一段记录：\n\n{}",
+                input.transcript
+            ))],
+            // 摘要不调工具：它是"把话压成话"，不是"再干一遍活"
+            tools: Vec::new(),
+        };
+        let reply = self.model.borrow_mut().reply(&req);
+        let mut trace = self.last.borrow_mut();
+        if let Some(why) = reply.error {
+            // **失败就退回确定性那条，并把原因留在事件里**（不许装成模型的摘要）
+            trace.fell_back = Some(why);
+            trace.tokens_in = 0;
+            return harness_memory::summarize::MockSummarizer::default().summarize(input);
+        }
+        trace.tokens_in = reply.usage_input_tokens;
+        trace.fell_back = None;
+        match reply.text {
+            Some(text) if !text.trim().is_empty() => text,
+            // 模型回了空话 ⇒ **那是模型听不听话的问题**，不是系统坏了；
+            // 但空摘要放进上下文比不压还糟，所以同样退回确定性那条，并说清楚
+            _ => {
+                trace.fell_back = Some("模型回了个空摘要".to_string());
+                harness_memory::summarize::MockSummarizer::default().summarize(input)
+            }
+        }
+    }
 }
 
 /// 挑一个模型：mock（脚本）还是真 provider。
@@ -1128,6 +1264,10 @@ impl Agent {
     }
 
     /// **模型的参数没解出来**时回它的那一条 —— **报错即手册**（§5.5）。
+    fn summarize_with(&self) -> SummarizeWith {
+        summarize_choice(&self.args)
+    }
+
     ///
     /// 这是"我在两个项目里都干过"那个做法的落地：**一边报错，一边把正确格式给它**。
     /// 三件事必须齐（少一件这条就成了抱怨）：
@@ -1183,11 +1323,19 @@ impl Agent {
     /// 每轮前问一句"该压了吗" —— **回合中压缩，摘要贴到最后一条 user 之前**（§5.4.3 ④）。
     fn maybe_compact(&mut self, out: &mut impl Write) {
         let counter = HeuristicCounter::new();
-        let summarizer = MockSummarizer::default();
+        // **谁来摘要**（待定 #103）：真 provider 就用真模型，mock 脚本就用确定性那条。
+        // 判定写在 `summarize_with()` 一个地方 —— 两处各判一次迟早会不一致。
+        let with_model = self.summarize_with() == SummarizeWith::Model;
+        let real = with_model.then(|| ModelSummarizer::new(build_model(&self.args)));
+        let mock = MockSummarizer::default();
+        let summarizer: &dyn harness_memory::summarize::Summarizer = match &real {
+            Some(s) => s,
+            None => &mock,
+        };
         let compactor = Compactor {
             policy: self.policy.clone(),
             counter: &counter,
-            summarizer: &summarizer,
+            summarizer,
             session: self.args.sid.clone(),
         };
         // **算的是整个请求**（系统提示 + 历史），不是只有历史 ——
@@ -1215,6 +1363,24 @@ impl Agent {
                 "cut": r.cut,
                 "summary_at": r.summary_at,
                 "summary": self.history.previous_summary(),
+                // **摘要这件事是谁干的**（2026-09-20，待定 #103）：
+                // 只写"压过了"不够 —— 判词要能回答"这一刀是模型切的还是确定性切的、
+                // 那次调用花了多少 token、有没有失败退回来"。
+                // 摘要**正文**在上面那行（`summary`）里 —— 它必须进日志，
+                // 因为它是**模型接下来会看到**的东西（不变量二）。
+                "summarizer": summarizer.name(),
+                "summarizer_tokens_in": real
+                    .as_ref()
+                    .map(|s| s.last.borrow().tokens_in)
+                    .unwrap_or(0),
+                "summarizer_fell_back": real
+                    .as_ref()
+                    .and_then(|s| s.last.borrow().fell_back.clone()),
+                "summary_chars": self
+                    .history
+                    .previous_summary()
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0),
                 "reason": r.reason,
                 "window_before": r.window_before,
                 "window_after": r.window_after,
@@ -1371,6 +1537,71 @@ fn emit(out: &mut impl Write, env: &Envelope) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 只有测试里要造"失败的回包"和"空话的回包" —— 所以它在测试模块里引入
+    use harness_agent::model::ModelReply;
+
+    /// 一个**永远失败**的模型 —— 用来验"摘要模型挂了会怎样"。
+    struct Failing;
+    impl Model for Failing {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+        fn reply(&mut self, _req: &ModelRequest) -> ModelReply {
+            ModelReply::failed("网络断了")
+        }
+    }
+
+    /// 一个**回空话**的模型 —— 那也是"模型听不听话"的问题，不是系统坏了。
+    struct Silent;
+    impl Model for Silent {
+        fn name(&self) -> &'static str {
+            "silent"
+        }
+        fn reply(&mut self, _req: &ModelRequest) -> ModelReply {
+            ModelReply::text("   ", 7)
+        }
+    }
+
+    /// **摘要模型连不上时不把压缩整个取消，但也绝不装作那是它写的。**
+    #[test]
+    fn a_failing_summarizer_falls_back_and_says_so() {
+        use harness_memory::summarize::Summarizer;
+        let s = ModelSummarizer::new(Box::new(Failing));
+        let out = s.summarize(&harness_memory::summarize::SummaryInput::new("一段记录"));
+        assert!(!out.trim().is_empty(), "退回确定性那条也得有东西可用");
+        let t = s.last.borrow();
+        assert!(t.fell_back.as_deref().unwrap_or("").contains("网络"), "{t:?}");
+        assert_eq!(t.tokens_in, 0);
+        assert_eq!(s.name(), "model");
+    }
+
+    #[test]
+    fn an_empty_summary_also_falls_back() {
+        use harness_memory::summarize::Summarizer;
+        let s = ModelSummarizer::new(Box::new(Silent));
+        let out = s.summarize(&harness_memory::summarize::SummaryInput::new("一段记录"));
+        assert!(!out.trim().is_empty());
+        assert!(s.last.borrow().fell_back.is_some(), "空摘要要留下原因");
+    }
+
+    /// **默认按模型类型定**：真 provider 用真模型，脚本（测试工具）用确定性的那条。
+    #[test]
+    fn the_default_summarizer_follows_the_model_kind() {
+        // 走真正的参数解析（`parse_args_from` 就是为了让它可测才抽出来的）
+        let mut a = parse_args_from(
+            ["--model", "deepseek"].iter().map(|s| s.to_string()),
+        );
+        assert_eq!(
+            summarize_choice(&a),
+            SummarizeWith::Model,
+            "真 provider 该用模型摘要"
+        );
+        a.model = "mock".into();
+        assert_eq!(summarize_choice(&a), SummarizeWith::Mock);
+        // 显式给了就听显式的（哪怕和默认相反）
+        a.summarize = Some(SummarizeWith::Model);
+        assert_eq!(summarize_choice(&a), SummarizeWith::Model);
+    }
 
     fn card_of(instance: &str, tools: &[&str]) -> ToolCard {
         ToolCard {
