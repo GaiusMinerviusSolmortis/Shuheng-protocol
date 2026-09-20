@@ -68,6 +68,12 @@ struct Args {
     /// 必须能在启动时给：因为"围栏来自会话"的那些服务是在启动时装配的 ——
     /// 要是只能等控制台发 `host`，它们就永远起不来了。
     hosts: Vec<String>,
+    /// **提示词库**（2026-09-20）：一个目录，里面的 `.md` 是**可被引用的提示词片段**。
+    ///
+    /// 为什么它是 ctrl 的事、不是某个服务的事：片段的去处是**智能体的上下文**，
+    /// 而唯一能往上下文里塞东西的通道是 `inject` —— **只有中控能发**（方向规则一）。
+    /// 所以"把哪一段念给谁听"这件事，只能由中控来做。
+    prompts: Option<PathBuf>,
     /// **周期 tick 的间隔**。
     ///
     /// tick 只做两件事，而且**都不做自动动作**：探 `health`、更新"最后活动时间"。
@@ -104,6 +110,7 @@ fn parse_args() -> Args {
         channel_ceiling: Authority::User,
         resume: false,
         hosts: Vec::new(),
+        prompts: None,
         tick: Duration::from_millis(2000),
         debug_barriers: false,
         startup_grace: Duration::from_millis(2000),
@@ -122,6 +129,7 @@ fn parse_args() -> Args {
                 }
             }
             "--services" => args.services = it.next().map(PathBuf::from),
+            "--prompts" => args.prompts = it.next().map(PathBuf::from),
             "--resume" => args.resume = true,
             "--host" => {
                 if let Some(v) = it.next() {
@@ -295,6 +303,107 @@ struct Queued {
 
 /// 一次还没落地的调用。**中控记得"我替谁在等谁"** ——
 /// **怎么把它弄起来** —— 两种通道的决定就在这儿（2026-09-20）。
+/// **提示词库**（2026-09-20）：一个目录里的 `.md` 就是**可被引用的提示词片段**。
+///
+/// 形状照 §3 那张清单里给"提示词"的定义：**可被引用、可组合的文本片段，版本化**。
+///
+/// * **文件名就是名字**（`coding-rules.md` → `coding-rules`）；
+/// * **版本**写在第一行，形如 `@version 3`（不写就是 `0`）—— 那一行不进正文；
+/// * **组合**：一次可以按顺序引用好几段，拼起来时每段带一个抬头
+///   （`【提示词 名字@版本】`）—— **抬头必须留**，否则事后没人知道
+///   "这句话是哪个片段说的、哪一版"。
+///
+/// ⚠️ **坏文件不许悄悄跳过**：读不了的收进 `skipped`，`prompts` op 里报出来。
+/// "少了一段提示词"和"那一段坏了"是两件完全不同的事（同技能服务那条）。
+#[derive(Clone)]
+struct PromptLib {
+    dir: std::path::PathBuf,
+    frags: Vec<PromptFrag>,
+    skipped: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct PromptFrag {
+    name: String,
+    version: String,
+    text: String,
+}
+
+impl PromptLib {
+    fn load(dir: &std::path::Path) -> Self {
+        let mut frags = Vec::new();
+        let mut skipped = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut paths: Vec<std::path::PathBuf> =
+                entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for p in paths {
+                let is_md = p.extension().and_then(|s| s.to_str()) == Some("md");
+                let name = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                if !is_md || !p.is_file() {
+                    // 不是 `.md` 的东西**不当错误**（目录里可能有 README 之外的杂物）
+                    continue;
+                }
+                match std::fs::read_to_string(&p) {
+                    Ok(raw) => {
+                        let (version, text) = split_version(&raw);
+                        if text.trim().is_empty() {
+                            skipped.push((name, "这个片段是空的".to_string()));
+                            continue;
+                        }
+                        frags.push(PromptFrag {
+                            name,
+                            version,
+                            text,
+                        });
+                    }
+                    Err(e) => skipped.push((name, format!("读不了：{e}"))),
+                }
+            }
+        }
+        Self {
+            dir: dir.to_path_buf(),
+            frags,
+            skipped,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&PromptFrag> {
+        self.frags.iter().find(|f| f.name == name)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.frags.iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// **重读一份当下的库** —— 两个 op 都用它。
+    ///
+    /// 为什么两个 op 必须一致地重读：`prompts` 说"有 coding-rules@1"，
+    /// 而 `prompt` 念的是 coding-rules@2 —— 那种自相矛盾比"都不重读"更坏，
+    /// 因为它让人以为**看过了就等于念过了**。
+    fn now(&self) -> PromptLib {
+        PromptLib::load(&self.dir)
+    }
+}
+
+/// 第一行如果是 `@version X` 就当版本号（那一行**不进正文**）。
+fn split_version(raw: &str) -> (String, String) {
+    let mut lines = raw.lines();
+    let first = lines.next().unwrap_or("");
+    if let Some(v) = first.trim().strip_prefix("@version") {
+        let v = v.trim();
+        return (
+            if v.is_empty() { "0".into() } else { v.to_string() },
+            lines.collect::<Vec<_>>().join("\n"),
+        );
+    }
+    ("0".to_string(), raw.to_string())
+}
+
 enum Launcher {
     /// 父子私有那条：stdin/stdout（第一版就有的）
     Stdio,
@@ -390,6 +499,12 @@ struct App {
     session: Session,
     /// 服务表：**挂起之后要能照它重新装配起来**
     specs: Vec<ServiceSpec>,
+    /// **提示词库**：可被引用的文本片段（`--prompts <目录>`）。
+    ///
+    /// 它**每次注入时重新读一遍**（不缓存）：提示词是**文件**，
+    /// 写它的人不会来通知你 —— 而"刚改的规矩要重启中控才生效"是很讨厌的意外。
+    /// （同技能服务那条取舍；一个目录的读取代价可以忽略。）
+    prompts: Option<PromptLib>,
     /// 运行期再拉服务要用它（`spawn` 这个 op）
     tx: Sender<Inbound>,
     pending: HashMap<String, PendingCall>,
@@ -501,6 +616,10 @@ fn run() -> i32 {
             participants: Vec::new(),
         },
         specs: Vec::new(),
+        prompts: args
+            .prompts
+            .as_ref()
+            .map(|d| PromptLib::load(d)),
         tx: tx.clone(),
         pending: HashMap::new(),
         exit_requested: false,
@@ -2397,6 +2516,176 @@ impl App {
             // 区别很重要：前者由中控签发（§2.3），后者是把整个注册表交出去。
             // 工具定义（参数表）来自**服务自己的 manifest** —— 这样
             // "服务报家门"和"模型看到的工具"是同一份真相。
+            // **看提示词库里有什么**（2026-09-20）。
+            //
+            // 分成两个 op 是有意的：**看**（`prompts`，只读）和**用**（`prompt`，要 user 级别）。
+            // 合成一个的话，"看一眼有什么"就变成了一个能改上下文权限的动作。
+            "prompts" => {
+                let data = match &self.prompts {
+                    None => json!({
+                        "dir": Value::Null,
+                        "fragments": [],
+                        "note": "这次会话没有挂提示词库 —— 开会话时用 `--prompts <目录>` 挂一个"
+                    }),
+                    // **重读**：和 `prompt` op 一致 —— 两处报的必须是同一份
+                    Some(lib) => { let lib = lib.now(); json!({
+                        "dir": lib.dir.display().to_string(),
+                        "fragments": lib.frags.iter().map(|f| json!({
+                            "name": f.name,
+                            "version": f.version,
+                            "bytes": f.text.len(),
+                            // **看得到长度，看不到正文**：正文要 `prompt` 才注入
+                            // （"看"和"念给模型听"是两件事）
+                        })).collect::<Vec<_>>(),
+                        // **坏的不许藏**：少了一段和"那一段坏了"是两件事
+                        "skipped": lib.skipped.iter().map(|(n, why)| json!({
+                            "name": n, "why": why
+                        })).collect::<Vec<_>>(),
+                    }) }
+                };
+                self.reply(req, json!({"effect": "confirmed", "code": null, "data": data}));
+            }
+            // **把提示词片段注入某个智能体的上下文**（2026-09-20，§3 的"提示词实例"）。
+            //
+            // 为什么它是 `user` 级别：它写的是**规矩** —— 跟改授权同一类动作。
+            // 让智能体或工具能给自己灌指令，这套模型里最不能开的口子之一。
+            //
+            // 为什么走 `inject`：前缀是**字节冻结**的（§15.2），要加东西只能 append-only。
+            // 所以注入 = 一条敕令形状的通知，**不重编前缀**（判据就盯这个）。
+            "prompt" => {
+                if req.authority < Authority::User {
+                    self.reply(
+                        req,
+                        json!({"effect": "refused", "code": "refused",
+                               "why": format!(
+                                   "注入提示词要 `user` 级别，这条消息是 `{}` 级别",
+                                   req.authority.as_str()),
+                               "remedy": "提示词是**规矩**，只有用户能下 —— \
+                                          智能体或通道给自己灌指令是不允许的。\
+                                          要那样做，先让用户把这段话写进提示词库"}),
+                    );
+                    return;
+                }
+                let agent = req
+                    .payload
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if agent.is_empty() {
+                    self.reply(
+                        req,
+                        json!({"effect": "refused", "code": "invalid",
+                               "why": "`prompt` 需要 `agent`",
+                               "expect": {"op": "prompt", "agent": "agent:dada",
+                                          "fragments": ["coding-rules"]},
+                               "remedy": "说清念给谁听；`list` 能看到现在有哪些智能体"}),
+                    );
+                    return;
+                }
+                if !self.reg.get_ref(&agent).map(|i| i.is_agent).unwrap_or(false) {
+                    let agents: Vec<String> = self
+                        .reg
+                        .ids()
+                        .filter(|id| self.reg.get_ref(id).map(|i| i.is_agent).unwrap_or(false))
+                        .map(str::to_string)
+                        .collect();
+                    self.reply(
+                        req,
+                        json!({"effect": "refused", "code": "refused",
+                               "why": format!("`{agent}` 不是这次会话里的智能体"),
+                               "remedy": format!(
+                                   "现在有：{}",
+                                   if agents.is_empty() {
+                                       "（一个都没有）".to_string()
+                                   } else {
+                                       agents.join(" / ")
+                                   })}),
+                    );
+                    return;
+                }
+                let wanted: Vec<String> = req
+                    .payload
+                    .get("fragments")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                if wanted.is_empty() {
+                    self.reply(
+                        req,
+                        json!({"effect": "refused", "code": "invalid",
+                               "why": "`prompt` 需要 `fragments`（要念哪几段）",
+                               "remedy": "先 `prompts` 看一眼有哪些，再点名"}),
+                    );
+                    return;
+                }
+                let Some(lib) = self.prompts.clone() else {
+                    self.reply(
+                        req,
+                        json!({"effect": "refused", "code": "invalid",
+                               "why": "这次会话没有挂提示词库",
+                               "remedy": "开会话时加 `--prompts <目录>`；\
+                                          目录里每个 `.md` 就是一段可引用的提示词"}),
+                    );
+                    return;
+                };
+                // 重读一遍：提示词是文件，**刚改的规矩不该等重启**
+                let lib = lib.now();
+                for name in &wanted {
+                    if lib.get(name).is_none() {
+                        self.reply(
+                            req,
+                            json!({"effect": "refused", "code": "invalid",
+                                   "why": format!("库里没有 `{name}` 这一段"),
+                                   "remedy": format!(
+                                       "有这些：{}。**别猜名字**",
+                                       if lib.names().is_empty() {
+                                           "（一段都没有）".to_string()
+                                       } else {
+                                           lib.names().join(" / ")
+                                       })}),
+                        );
+                        return;
+                    }
+                }
+                // 拼起来 —— **每一段都带抬头**（谁说的、哪一版）
+                let mut text = String::from("【提示词】以下是用户给你的规矩，按顺序生效：\n\n");
+                let mut used: Vec<Value> = Vec::new();
+                for name in &wanted {
+                    let f = lib.get(name).expect("上面查过");
+                    text.push_str(&format!("【提示词 {}@{}】\n{}\n\n", f.name, f.version, f.text));
+                    used.push(json!({"name": f.name, "version": f.version, "bytes": f.text.len()}));
+                }
+                text.push_str(
+                    "这几段是**追加**进来的，前缀没动（§15.2）—— \
+                     它们和一开始就写死的规矩一样算数。",
+                );
+                let inject = self.mint(
+                    MessageType::Inject,
+                    CTRL,
+                    &agent,
+                    None,
+                    Authority::System,
+                    json!({"text": text, "reason": "prompt_fragment", "fragments": used}),
+                );
+                self.route(inject);
+                // 审计：这是一次**控制面的变更**（往谁的上下文里加了规矩），要留痕
+                let sid = self.sid.clone();
+                self.index.append(
+                    &sid,
+                    &agent,
+                    "agent",
+                    "prompt_injected",
+                    json!({"fragments": used, "by": req.from, "dir": lib.dir.display().to_string()}),
+                );
+                self.reply(
+                    req,
+                    json!({"effect": "confirmed", "code": null,
+                           "data": {"agent": agent, "fragments": used,
+                                    "note": "念给它了；它下一轮就看得见。\
+                                             前缀**没有重编** —— 变化只走这条追加的通知"}}),
+                );
+            }
             "my_tools" => {
                 let who = req.from.clone();
                 match self.reg.bindings_of(&who) {
