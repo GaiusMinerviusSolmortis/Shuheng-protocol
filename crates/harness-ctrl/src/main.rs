@@ -414,6 +414,22 @@ enum Launcher {
     },
 }
 
+/// **拉起一个服务要输入的那几样**（`start_service` 的入参）。
+///
+/// 为什么要打包成一个结构（clippy 的 `too_many_arguments` 是引子，不是理由）：
+/// 它已经到 7 个入参了，调用点上就是一串裸值 ——
+/// `"term"` 和 `"term:1"` 谁配谁、`None` 是"没角色"还是"没绑定"，
+/// 都要回到签名那里数一遍才看得懂。打包之后**调用点自己会说话**。
+struct Spawn {
+    kind: String,
+    id: String,
+    cmd: Vec<String>,
+    role: Option<String>,
+    bindings: Vec<registry::Binding>,
+    launcher: Launcher,
+    tx: Sender<Inbound>,
+}
+
 /// 一次还没落地的调用。**中控记得"我替谁在等谁"** ——
 /// 服务崩的时候要靠它给每个调用者一个诚实的交代（§4.6）。
 ///
@@ -979,10 +995,10 @@ fn reconstruct(
                     seen += 1;
                 }
             }
-            Some("compaction") if mine => {
-                if apply_compaction(&mut items, &r.envelope.payload) {
-                    seen += 1;
-                }
+            // 摘报合并进这一臂的守卫里（clippy 的 `collapsible_match`）——
+            // `mine` 必须留在前面：它不是自己那份的历史就别解析（短路）
+            Some("compaction") if mine && apply_compaction(&mut items, &r.envelope.payload) => {
+                seen += 1;
             }
             _ => {}
         }
@@ -3151,15 +3167,15 @@ impl App {
                 // 运行期 `spawn` 出来的服务**永远是普通服务**（stdin/stdout 那条）：
                 // 常驻是**部署配置**（要一个跨会话稳定的会合目录），
                 // 不该由一条消息现场决定 —— 同"绑定只许写进服务表"那条纪律。
-                match self.start_service(
+                match self.start_service(Spawn {
                     kind,
-                    id.clone(),
+                    id: id.clone(),
                     cmd,
                     role,
                     bindings,
-                    Launcher::Stdio,
-                    self.tx.clone(),
-                ) {
+                    launcher: Launcher::Stdio,
+                    tx: self.tx.clone(),
+                }) {
                     Ok(()) => self.reply(
                         req,
                         json!({
@@ -3374,16 +3390,16 @@ impl App {
 
 // ---- 生命周期 --------------------------------------------------------
 
-    fn start_service(
-        &mut self,
-        kind: String,
-        id: String,
-        cmd: Vec<String>,
-        role: Option<String>,
-        bindings: Vec<registry::Binding>,
-        launcher: Launcher,
-        tx: Sender<Inbound>,
-    ) -> io::Result<()> {
+    fn start_service(&mut self, s: Spawn) -> io::Result<()> {
+        let Spawn {
+            kind,
+            id,
+            cmd,
+            role,
+            bindings,
+            launcher,
+            tx,
+        } = s;
         let is_agent = role.as_deref() == Some("agent");
         // **同一个 id 在同一时刻只能有一个活的持有者。**
         //
@@ -3564,18 +3580,19 @@ impl App {
         } else {
             Launcher::Stdio
         };
-        let started = self.start_service(
-            spec.kind.clone(),
-            id.clone(),
+        let started = self.start_service(Spawn {
+            kind: spec.kind.clone(),
+            id: id.clone(),
             cmd,
-            spec.role.clone(),
-            spec.bindings
+            role: spec.role.clone(),
+            bindings: spec
+                .bindings
                 .iter()
                 .map(|b| registry::Binding::new(b.instance(), b.capabilities()))
                 .collect(),
             launcher,
             tx,
-        );
+        });
         // **把"部署决定的拉起时机"记在实例上** —— `list` 上要和它自述的并排显示
         if started.is_ok() {
             if let Some(inst) = self.reg.get_mut(&id) {

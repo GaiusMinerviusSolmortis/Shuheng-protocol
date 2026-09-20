@@ -93,7 +93,7 @@
 | [07-界面](07-界面.md) | **§9、§12** GUI 作为消息流的投影、表示层、点击策略、桌宠不在框架内。 |
 | [08-记忆](08-记忆.md) | **§16** 锚点、分层、沉淀，以及**大眼记忆实现的评估**。 |
 | [09-模型](09-模型.md) | **§8、§15** 提示词编译与模型拼装。 |
-| [10-决策](10-决策.md) | 已定 **286** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验 —— ⚠️ **这一行汇总它管不到**，2026-09-20 审计发现这里原来写 256、真值是 257（小节的数是对的，汇总的数没人查） |
+| [10-决策](10-决策.md) | 已定 **288** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
 | [**规范-消息协议**](规范-消息协议.md) | **规范性文件**：信封、消息种类、配对、会话日志、stdio 传输。 |
 | [规范-工具服务](规范-工具服务.md) | **规范性文件**，与其余探索性文档性质不同。 |
 | [附录-参考](附录-参考.md) | **§10、§17** 与已有工作的对照，以及和 MCP 的定位比较。 |
@@ -168,7 +168,7 @@
 crates/harness-core    信封 / NDJSON 编解码 / 会话日志 / 三条不变量
 crates/harness-ctrl    中控：注册表、路由、裁决、落盘屏障
 crates/harness-echo    mock 工具服务（上线自报 manifest）
-scripts/smoke-stdio.ps1   验收脚本，10 条判据
+scripts/smoke-stdio.ps1   验收脚本，11 条判据
 ```
 
 跑法：`pwsh -File scripts/smoke-stdio.ps1`（会自己 build，再拿手写的 NDJSON
@@ -244,6 +244,23 @@ scripts/smoke-term.ps1                     验收：19 条判据
 > **责任在哪一层，是一个容易记错的地方。**
 > 中控的职责边界是**注册与路由**，不是域内资源仲裁 ——
 > 让内核去懂每个工具的内部语义，正是这套设计一开始要避免的（§5.10、§5.15）。
+
+#### ⚠️ 2026-09-20 审计：上面那把域锁**只占了第一条围栏**
+
+代码是 `for f in fences { … return … }` —— **循环体第一条就 `return`**。
+而 `--fence` 是可重复的、manifest 里也写着 `owns.exclusive_per: "fence"`，
+所以 **[A,B] 与 [B,C] 各起一个编辑器时两个都拿到锁**，两个都在管 B，
+各自的进程内写锁表互不知情 —— 上面第 2 条修好的东西在这个组合下又漏了。
+
+它的可怕之处不是"能同时起两个"，是**看起来一切正常**：两边都自报"域锁拿到"。
+现在每一条围栏都占（按锁名排序依次取，否则两个多围栏服务会互相锁死；
+同一个根写两遍按 tag 去重，否则自己跟自己撞），半路失败把已占的还回去。
+验收：`scripts/smoke-domainlock.ps1`（10 条判据）——
+**它在老代码上是红的**（第 4/5/6 条），这是这条修复唯一值钱的证据。
+
+> 这个洞是 **clippy 的 `never_loop` 指出来的**，而测试一条都没发现它
+> （没有一条验收用过两个 `--fence`）。所以同一天补上了
+> `scripts/check-clippy.ps1`（警告即失败）与 `scripts/check-docs.ps1`（文档数字对账）。
 
 ### 阶段 3：线性记忆内核
 
@@ -1500,29 +1517,29 @@ pub fn assert_transport_agnostic() -> Result<(), String> {
 | 09-模型 | 拼装约束已定，复合模型归类待定 |
 | 10-决策 | **唯一入口，按主题组织** |
 | 规范-工具服务 | **五组字段已定，且有闸门保证实现不长歪**（§11.8）；剩下三个洞（`content` 取值 / `node_actions` 枚举 / 闲置回收语义）|
-| **代码** | **内核四层齐 + 可恢复 + 绑定（可运行期改签）+ 重新托管 + 手册/能力/取消/压缩/验证 + 契约闸门 + 实例独属 + id 铸造规则 + 身份索引 + 磁盘指纹 + 重试语义 + 中控生命周期管控 + 遗嘱 + 状态两轴 + 背压 + 报到 + lifecycle 三种取值全执行 + 三个落盘屏障边界 + 畸形输出的报错即手册 + 提示词实例 + 沉淀式记忆服务 + 技能（知识）服务 + 第二个传输（回环 TCP）+ MCP 桥 + 终端那棵树的硬限额 + **能力两张表逐条钉住****（**十二个** crate + **三十二个** smoke 脚本 + 2 个 check 脚本，**228** 个测试）；语言 = **Rust** |
+| **代码** | **内核四层齐 + 可恢复 + 绑定（可运行期改签）+ 重新托管 + 手册/能力/取消/压缩/验证 + 契约闸门 + 实例独属 + id 铸造规则 + 身份索引 + 磁盘指纹 + 重试语义 + 中控生命周期管控 + 遗嘱 + 状态两轴 + 背压 + 报到 + lifecycle 三种取值全执行 + 三个落盘屏障边界 + 畸形输出的报错即手册 + 提示词实例 + 沉淀式记忆服务 + 技能（知识）服务 + 第二个传输（回环 TCP）+ MCP 桥 + 终端那棵树的硬限额 + 能力两张表逐条钉住 + **域锁把每一条围栏都占上（多围栏全占、去重、排序、失败不留残锁）** + **lint 闸门**（clippy 零警告）**（**12** 个 crate + **33** 个 smoke 脚本 + **4** 个 check 脚本，**231** 个测试）；语言 = **Rust** |
 
 ### 怎么跑
 
 ```powershell
-cargo test                                       # 160 个测试（159 单元 + 1 doc-test）
+cargo test                                       # 231 个测试（单元 + doc-test，由 check-docs 对账）
 pwsh -File scripts/smoke-stdio.ps1               # 阶段 1 验收（11 条判据）
 pwsh -File scripts/smoke-editor.ps1              # 阶段 2 验收（18 条判据）
-pwsh -File scripts/smoke-term.ps1                # 阶段 2 验收（19 条判据）
+pwsh -File scripts/smoke-term.ps1                # 阶段 2 验收（21 条判据）
 pwsh -File scripts/smoke-memory.ps1              # 阶段 3 验收（14 条判据）
-pwsh -File scripts/smoke-agent.ps1               # 智能体层验收（13 条判据）
-pwsh -File scripts/smoke-deepseek.ps1            # 真实模型验收（7 条判据；没 key 就跳过）
+pwsh -File scripts/smoke-agent.ps1               # 智能体层验收（18 条判据）
+pwsh -File scripts/smoke-deepseek.ps1            # 真实模型验收（11 条判据；没 key 就跳过）
 pwsh -File scripts/smoke-graph.ps1               # 图上第三层验收（9 条判据）
-pwsh -File scripts/smoke-session.ps1             # 通道与会话验收（13 条判据）
+pwsh -File scripts/smoke-session.ps1             # 通道与会话验收（12 条判据）
 pwsh -File scripts/smoke-resume.ps1              # 跨进程恢复验收（7 条判据）
 pwsh -File scripts/smoke-binding.ps1             # 绑定验收（7 条判据）
 pwsh -File scripts/smoke-rehost.ps1              # 重新托管验收（8 条判据）
-pwsh -File scripts/smoke-help-grant.ps1          # 手册与能力校验（9 条判据）
+pwsh -File scripts/smoke-help-grant.ps1          # 手册与能力校验（10 条判据）
 pwsh -File scripts/smoke-cancel.ps1              # 取消（7 条判据）
-pwsh -File scripts/smoke-compact-turn.ps1        # 循环里真的触发压缩（6 条判据）
+pwsh -File scripts/smoke-compact-turn.ps1        # 循环里真的触发压缩（9 条判据）
 pwsh -File scripts/smoke-verify.ps1              # 独立验证（6 条判据）
-pwsh -File scripts/smoke-contract.ps1            # 契约闸门：注册 + 投递（11 条判据）
-pwsh -File scripts/smoke-regrant.ps1             # 运行期改签：grant/revoke + 敕令 + 换名册 + 盖章（18 条判据）
+pwsh -File scripts/smoke-contract.ps1            # 契约闸门：注册 + 投递（14 条判据）
+pwsh -File scripts/smoke-regrant.ps1             # 运行期改签：grant/revoke + 敕令 + 换名册 + 盖章（20 条判据）
 pwsh -File scripts/smoke-ownership.ps1           # 实例独属：谁的实例谁动（11 条判据）
 pwsh -File scripts/smoke-ids.ps1                 # id 铸造：撞 id 被拒、spawn 只增不减（8 条判据）
 pwsh -File scripts/smoke-index.ps1               # 身份索引：跨会话追溯 + 那条链（8 条判据）
@@ -1538,15 +1555,18 @@ pwsh -File scripts/smoke-resident.ps1            # 第二个传输 + 常驻服�
 pwsh -File scripts/smoke-mcp.ps1                 # MCP 桥：对端工具表 / 白名单默认拒绝 / isError 映射 / 整棵树被收掉（14 条判据）
 pwsh -File scripts/smoke-prompt.ps1              # 提示词实例：看 / 念分开、只有 user 能注入、前缀不重编（13 条判据）
 pwsh -File scripts/smoke-limits.ps1              # 终端那棵树的硬限额：内存 / 进程数 / CPU 时间（8 条判据）
+pwsh -File scripts/smoke-domainlock.ps1          # 域锁的形状：多围栏要全占、去重、排序、失败不留残锁（10 条判据）
 pwsh -File scripts/check-decisions.ps1           # 决策册的计数校验（不是验收，是查账）
 pwsh -File scripts/check-manifests.ps1           # manifest 体检：六个服务的家门逐项查，并打出那张沙箱表
+pwsh -File scripts/check-docs.ps1                # 文档里的数字对账：脚本条数 / 判据条数 / 测试总数 / 行数
+pwsh -File scripts/check-clippy.ps1              # lint 闸门：clippy 一条警告都不许有
 pwsh -File scripts/dump-manifest.ps1 -Service term   # 把活服务自报的 manifest 打出来
 ```
 
 ### 已知的文档债
 
 - **10-决策 里只有最早的 16 条标了来源**，后面每轮新增的还没标。
-- **06-操控.md 仍有 1205 行**（下一步该再拆：理论 / 实测）。
+- **06-操控.md 仍有 850 行**（下一步该再拆：理论 / 实测）。
 - 待定条目里混着"必答""可延后""已解决"三种，第 2 节和第 5 节已经分开了，
   但第 4 节里仍有可合并的条目。
 - **规范-工具服务 §11.6 那份"填完的示例"还是手写的** —— 它现在有一份差异说明

@@ -207,7 +207,7 @@ fn recall_matches_literally_and_says_so_by_behavior() {
     s.deposit(n).unwrap();
     s.deposit(new("/p", "跟这个话题无关的另一条")).unwrap();
     assert_eq!(
-        s.recall(&"/p".to_string(), &Query { text: Some("proc.exec".into()), ..Default::default() })
+        s.recall("/p", &Query { text: Some("proc.exec".into()), ..Default::default() })
             .unwrap()
             .items
             .len(),

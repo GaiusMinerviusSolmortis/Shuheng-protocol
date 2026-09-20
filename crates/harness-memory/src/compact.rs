@@ -276,8 +276,10 @@ mod tests {
     fn compacts_when_over_the_trigger_and_resets_the_window() {
         let counter = HeuristicCounter::new();
         let summarizer = MockSummarizer::default();
-        let mut policy = CompactionPolicy::default();
-        policy.keep_recent_turns = 1;
+        let policy = CompactionPolicy {
+            keep_recent_turns: 1,
+            ..Default::default()
+        };
         let c = compactor(policy, &counter, &summarizer);
         let mut h = build(6);
         // 窗口要小到**真的会触发** —— 这是测试数据的事，不是被测逻辑的事
@@ -406,6 +408,6 @@ mod tests {
             second_summary.contains("折进上一次的摘要"),
             "第二次的摘要要把第一次折进去：{second_summary}"
         );
-        assert!(first_summary.len() > 0);
+        assert!(!first_summary.is_empty());
     }
 }

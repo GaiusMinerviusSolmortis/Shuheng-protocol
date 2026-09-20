@@ -103,8 +103,10 @@ mod tests {
 
     #[test]
     fn aggressiveness_is_clamped() {
-        let mut p = CompactionPolicy::default();
-        p.aggressiveness = 3.0;
+        let mut p = CompactionPolicy {
+            aggressiveness: 3.0,
+            ..Default::default()
+        };
         assert!((p.target_ratio() - 0.0).abs() < 1e-9);
         p.aggressiveness = -1.0;
         assert!((p.target_ratio() - 0.8).abs() < 1e-9, "负的当 0 处理");

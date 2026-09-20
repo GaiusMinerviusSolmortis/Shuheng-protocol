@@ -1004,9 +1004,8 @@ impl Agent {
     /// 一个回合：拿任务 → 反复（调模型 → 调工具 → 收结果）→ 出结论。
     fn run_turn(&mut self, out: &mut impl Write, rx: &Receiver<Inbound>, req: &Envelope, task: String) {
         self.busy = true;
-        let result = self.run_turn_inner(out, rx, req, task);
+        self.run_turn_inner(out, rx, req, task);
         self.busy = false;
-        result
     }
 
     fn run_turn_inner(

@@ -72,7 +72,7 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
-    let mut ids = IdGen::new(format!("{}", args.instance.replace([':', '.'], "-")));
+    let mut ids = IdGen::new(args.instance.replace([':', '.'], "-"));
     let mut out = io::stdout();
 
     // 上线自报家门：**静态的是"我能干什么"**（§5.10）

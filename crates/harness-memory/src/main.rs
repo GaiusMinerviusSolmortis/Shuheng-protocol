@@ -159,7 +159,7 @@ fn main() {
             policy.target_tokens(args.window),
             policy.keep_recent_turns
         );
-        println!("{:>4}  {:>8}  {:>6}  {}", "轮", "估算token", "窗口", "事件");
+        println!("{:>4}  {:>8}  {:>6}  事件", "轮", "估算token", "窗口");
     }
     let mut steps: Vec<Step> = Vec::new();
 
