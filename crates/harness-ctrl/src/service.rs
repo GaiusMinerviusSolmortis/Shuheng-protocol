@@ -185,7 +185,7 @@ impl ServiceHandle {
         // **别让它顺走中控自己的输出管道**：它活得比中控久，管道就永远不到 EOF
         // （详见 `harness_ipc::inherit` 的那段注释）。这几毫秒里中控的标准句柄
         // 是不可继承的，拉完立刻还原。
-        let _no_inherit = harness_ipc::NoInheritStdio::hide();
+        let _no_inherit = harness_service::inherit::NoInheritStdio::hide();
         let child = Command::new(program)
             .args(rest)
             .arg("--instance")

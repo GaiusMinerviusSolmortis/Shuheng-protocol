@@ -73,6 +73,11 @@ impl McpClient {
                 "用 `--server <可执行文件>` 加若干 `--arg <参数>` 指一个 MCP server",
             )
         })?;
+        // **拉起之前先摘掉我们自己那几根句柄的"可继承"位**（2026-09-20）：
+        // 对端是**别人写的**，它顺手起的孙子进程会继承它的句柄 ——
+        // 包括一份**我们和 ctrl 之间那根协议管道的副本**。那样我们死了之后
+        // 那根管子还开着，而"对端没了"这件事就又变成"等满超时才发现"。
+        let no_inherit = harness_service::inherit::NoInheritStdio::hide();
         let mut child = Command::new(program)
             .args(rest)
             .stdin(Stdio::piped())
@@ -87,6 +92,7 @@ impl McpClient {
                     "检查那个可执行文件在不在、参数对不对",
                 )
             })?;
+        drop(no_inherit); // 拉起来就还原 —— 只遮那几毫秒
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| {
             McpError::new("invalid", "拿不到 MCP server 的 stdout", "这是环境问题")

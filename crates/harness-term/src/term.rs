@@ -276,7 +276,14 @@ impl Terminal {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // **拉起之前先摘掉我们自己那几根句柄的"可继承"位**（2026-09-20）：
+        // 这条命令可能起一个活得比我们久的孙子（`start /B`），
+        // 而它会顺走一份**我们和 ctrl 之间那根协议管道的副本** ——
+        // 于是我们死了之后那根管子还开着，Ctrl 那边等不到 EOF。
+        // （同一个坑中控在"常驻服务"上撞过，见 `harness-service::inherit`。）
+        let _no_inherit = harness_service::inherit::NoInheritStdio::hide();
         let mut child = command.spawn()?;
+        drop(_no_inherit); // 拉起来就还原 —— 只遮那几毫秒
         // 先把它收进 job，再去读它的输出 —— **顺序不能反**：
         // 反过来的话，一个起得极快的命令可能在 assign 之前就已经生了孙子进程。
         let job = Job::assign(&child, self.limits);

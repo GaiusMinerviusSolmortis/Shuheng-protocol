@@ -8,12 +8,6 @@ description = "第二个传输：回环 TCP + 口令 + 会合文件（resident �
 serde.workspace = true
 serde_json.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
-    "Win32_Foundation",
-    "Win32_System_Console",
-] }
-
 [dev-dependencies]
 # ⚠️ **只在测试里**依赖 core —— 目的是把"§6.2 第一条：承载全部 7 种消息"
 # 变成一条真的跑得起来的判据（用**真的信封**、真的编解码器、真的套接字）。

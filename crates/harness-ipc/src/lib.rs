@@ -31,9 +31,6 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 /// 以后换实现时，老客户端看见不认识的名字该拒绝，而不是猜着乱连。
 pub const PROTOCOL: &str = "ndjson-tcp-1";
 
-pub mod inherit;
-pub use inherit::NoInheritStdio;
-
 /// 一条连接。**只搬行**：每一行对上面那层是一个 NDJSON 消息。
 #[derive(Debug)]
 pub struct Conn {
