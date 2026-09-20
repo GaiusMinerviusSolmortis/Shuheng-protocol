@@ -1,0 +1,16 @@
+[package]
+name = "harness-mem"
+version.workspace = true
+edition.workspace = true
+description = "沉淀式记忆服务：碎片 + 锚点 + ETag/TTL（08-记忆 §16）"
+
+[[bin]]
+name = "harness-mem"
+path = "src/main.rs"
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-service = { path = "../harness-service" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"

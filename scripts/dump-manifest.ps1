@@ -11,7 +11,7 @@
 # 另外：这么跑出来的 manifest 还会**顺带过一遍闸门** ——
 # 中控收到 presence 时会查它（§11.8）。上面那门是注册关，它不吼就说明合规。
 param(
-    [ValidateSet('editor', 'term', 'echo')][string]$Service = 'editor'
+    [ValidateSet('editor', 'term', 'echo', 'mem')][string]$Service = 'editor'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,7 +20,12 @@ $bin = Join-Path $root "target\debug\harness-$Service.exe"
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("harness-dump-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 $svcArgs = @('--instance', "$Service`:1", '--sid', 's-dump')
-if ($Service -ne 'echo') { $svcArgs += @('--fence', $work) }
+if ($Service -eq 'mem') {
+    # 记忆服务不吃 `--fence`（它不碰你的文件）；它的"域"是**那个碎片库目录**
+    $svcArgs += @('--store', (Join-Path $work 'memory'))
+} elseif ($Service -ne 'echo') {
+    $svcArgs += @('--fence', $work)
+}
 # 服务上线就把 manifest 写在第一条 presence 里；这里只读那一行，之后让它自己退出。
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $bin

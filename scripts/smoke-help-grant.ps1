@@ -134,6 +134,19 @@ Check '9. 那次调用的请求里带着中控签发的 granted' {
     $req = $B.records | Where-Object { $_.type -eq 'request' -and $_.from -eq 'agent:dada' -and $_.payload.tool -eq 'open' } | Select-Object -First 1
     $req -and ($req.payload.granted -contains 'proc.exec')
 }
+<#
+  第 10 条是 **2026-09-20 审计**补的。它是那种"躺在日志里、没人看"的东西：
+
+  服务拒绝时回的 `refuse_payload` 里有一个 `caller_kind`（"我认为你是谁"），
+  而**没有任何一个工具的 `output_schema` 声明过它** —— 契约是闭合的，
+  于是**每一次能力拒绝都在违反它自己声明的形状**，投递闸门每次都得贴一张
+  `schema_violation`。这条判据把它钉死：拒得对不对是一回事，
+  **拒绝的结果本身也得合形**是另一回事。
+#>
+Check '10. 能力拒绝的结果**也合它自己声明的形**（不许带 schema_violation）' {
+    @($A.records | Where-Object { $_.payload.schema_violation }).Count -eq 0 -and `
+        @($B.records | Where-Object { $_.payload.schema_violation }).Count -eq 0
+}
 Write-Host ''
 Write-Host '== 场景 A 的那次拒绝 ==' -ForegroundColor Cyan
 if ($denied) { Write-Host "  why:     $($denied.payload.why)"; Write-Host "  granted: $($denied.payload.granted)"; Write-Host "  remedy:  $($denied.payload.remedy)" }

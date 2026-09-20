@@ -188,6 +188,17 @@ fn build_result_schema(
     }
     props.insert("expect".into(), json!({"type": ["object", "string"]}));
     props.insert("granted".into(), json!({"type": ["string", "array"]}));
+    // **`caller_kind` 是协议自己定的字段，不是哪个服务自己的**（2026-09-20 审计补）。
+    //
+    // 它和 `granted` 是一对：`granted` 说"你手里有什么"，`caller_kind` 说
+    // "**我认为你是谁**"（agent / user / channel / unrouted）。拒的时候两个都要给 ——
+    // "你没经过网关"和"你经过了但没这个能力"是**两种不同的补救**，
+    // 模型得能分清自己撞上的是哪一种（`refuse_payload` 就是照这个分的文案）。
+    //
+    // ⚠️ 它原来**漏在这儿**，于是**每一次能力拒绝都在违反它自己声明的形状**：
+    // 投递闸门每次都得贴一张 `schema_violation`。抓它的是 2026-09-20 那轮算账 ——
+    // `smoke-help-grant` 的日志里躺着一条，只是当时没人看那个字段。
+    props.insert("caller_kind".into(), json!({"type": "string"}));
     props.insert("degraded".into(), json!({"type": "boolean"}));
     props.insert("degraded_reason".into(), json!({"type": "string"}));
     props.insert("data".into(), json!({"type": "object"}));
