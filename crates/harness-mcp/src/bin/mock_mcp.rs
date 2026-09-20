@@ -13,6 +13,7 @@
 //! | `boom` | **工具自己报错**：`isError: true` —— 要证"工具失败 ≠ 调用失败" |
 //! | `crash` | **对端进程直接死**（不回话）—— 要证"对端没了立刻说得清，不用等超时"|
 //! | `sleep` | 睡一会儿再回 —— 要证**超时是"不知道结果"，不是"它失败了"** |
+//! | `spawn_child` | **起一个长命的孙子进程**并回它的 pid —— 要证"整棵树会被收掉" |
 //!
 //! 另外：不认识的工具回 **JSON-RPC error**（不是 isError）—— 两者在我们的桥里
 //! 映射成不同的东西，得分别测。
@@ -71,7 +72,9 @@ fn main() {
                      "inputSchema": {"type": "object", "properties": {}}},
                     {"name": "sleep", "description": "睡一会儿再回。",
                      "inputSchema": {"type": "object", "required": ["ms"],
-                                     "properties": {"ms": {"type": "integer"}}}}
+                                     "properties": {"ms": {"type": "integer"}}}},
+                    {"name": "spawn_child", "description": "起一个长命的孙子进程，回答它的 pid。",
+                     "inputSchema": {"type": "object", "properties": {}}}
                 ]}
             }),
             "tools/call" => {
@@ -121,6 +124,23 @@ fn main() {
                             "jsonrpc": "2.0", "id": id,
                             "result": {"content": [{"type": "text",
                                 "text": format!("睡完了 {ms} ms")}], "isError": false}
+                        })
+                    }
+                    "spawn_child" => {
+                        // 起一个**会活很久**的孙子进程（120 秒的 ping）。
+                        // 它存在的意义：**桥死的时候，它得跟着走** ——
+                        // 只 `child.kill()` 的话，它会留下来占着东西。
+                        let spawned = std::process::Command::new("cmd")
+                            .args(["/C", "ping -n 120 127.0.0.1 > NUL"])
+                            .spawn();
+                        let text = match spawned {
+                            Ok(c) => format!("孙子进程起来了，pid {}", c.id()),
+                            Err(e) => format!("起不来：{e}"),
+                        };
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"content": [{"type": "text", "text": text}],
+                                       "isError": false}
                         })
                     }
                     other => json!({

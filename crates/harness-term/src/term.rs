@@ -17,7 +17,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use crate::Inbound;
-use crate::job::{Job, Limits};
+use harness_service::job::{Job, JobAccount, Limits};
 
 /// 一次 `run` 的结局。
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ pub struct Running {
     job: Option<Job>,
     /// 这次跑完时 job 账本上的痕迹（峰值内存 / 起过几个进程）。
     /// **它不是结论，是证据**：用来把"很可能撞了限额"说成推断。
-    pub account: crate::job::JobAccount,
+    pub account: JobAccount,
     /// 还有几个读线程没读完（stdout / stderr 各一个）
     readers_left: u8,
     /// 进程自己已经退出了吗（退了但读线程没读完时**还不能回结果**，
@@ -294,7 +294,7 @@ impl Terminal {
             deadline: timeout.map(|d| Instant::now() + d),
             child,
             job,
-            account: crate::job::JobAccount::default(),
+            account: JobAccount::default(),
             readers_left: 2,
             exit: None,
             timed_out: false,
@@ -665,7 +665,7 @@ mod tests {
             deadline: None,
             child: shell("exit").spawn().unwrap(),
             job: None,
-            account: crate::job::JobAccount::default(),
+            account: JobAccount::default(),
             readers_left: 2,
             exit: None,
             timed_out: false,
@@ -691,7 +691,7 @@ mod tests {
             deadline: None,
             child: Command::new("cmd").arg("/C").arg("exit").spawn().unwrap(),
             job: None,
-            account: crate::job::JobAccount::default(),
+            account: JobAccount::default(),
             readers_left: 2,
             exit: None,
             timed_out: false,

@@ -49,12 +49,22 @@ pub const EFFECTS: &[&str] = &[
 ];
 
 /// §11.2.2 的投递方式。**枚举的是"怎么送出去的"，不是"哪个应用"。**
+///
+/// ⚠️ **2026-09-20：这一份和 schema 里那份原来是两份抄写 —— 已经合成一份了。**
+/// 加 `"process"` 那一档时只改了 schema 那边的字面量，于是**闸门当场把桥的每一条
+/// 结果都判成违规**（"`route` 是 `process`，不在闭合取值里"）——
+/// 十次调用十条违规。这正是项目一直说的"**两份真相一定会漂**"，
+/// 而它漂的地方还偏偏是"自己查自己"的那道闸门。
 pub const ROUTES: &[&str] = &[
     "accessibility",
     "synthetic_events",
     "global_input",
     "dom",
     "trusted_input",
+    // **交给另一个进程**（stdio / 套接字 / 管道）：投递到了，"做没做"只有它的回执说了算。
+    // 加它是为了让 MCP 桥能诚实地说"这条账是关于那条路的"（原来它只能报 `null`，
+    // 而那会撞上"`route` 为 null 时不许说 unverifiable"那条不变量）。
+    "process",
 ];
 
 /// 五态里**表示"不知道对方做没做"**的那两个。
@@ -230,11 +240,11 @@ fn build_result_schema(
     let mut props = Map::new();
     props.insert("effect".into(), json!({"enum": EFFECTS}));
     props.insert("code".into(), json!({"type": ["string", "null"]}));
-    props.insert(
-        "route".into(),
-        json!({"enum": [Value::Null, json!("accessibility"), json!("synthetic_events"),
-                        json!("global_input"), json!("dom"), json!("trusted_input")]}),
-    );
+    // **从 `ROUTES` 派生**，不许再抄一遍字面量 —— 抄一份就会漂一份
+    // （2026-09-20 加 `"process"` 时漂过，闸门自己把桥的十条结果全判成违规）。
+    let mut route_values: Vec<Value> = vec![Value::Null];
+    route_values.extend(ROUTES.iter().map(|r| json!(r)));
+    props.insert("route".into(), json!({"enum": route_values}));
     for k in ["why", "remedy"] {
         props.insert(k.into(), json!({"type": "string"}));
     }

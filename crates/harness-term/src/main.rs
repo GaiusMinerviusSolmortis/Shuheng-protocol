@@ -25,7 +25,6 @@
 //! 声明一个做不到的工具比不声明更糟。
 
 mod term;
-mod job;
 
 use harness_core::codec::{self, CodecError, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
@@ -62,7 +61,7 @@ struct Args {
     /// 默认全空 = 不限额。为什么默认不设：多严算"合理"是 **profile** 的事（待定 #3），
     /// 而"默认开一个我拍的数"会在正常需求上碰壁（一次大编译就可能撞上）。
     /// 打开之后 manifest 里那一面就从 `timeout` 变成 `limits` —— **声明跟着事实走**。
-    limits: job::Limits,
+    limits: harness_service::job::Limits,
 }
 
 fn parse_args() -> Args {
@@ -76,7 +75,7 @@ fn parse_args() -> Args {
         inline_limit: 50_000,
         memory_cap: 1_048_576,
         spill_dir: PathBuf::from("data/spill"),
-        limits: job::Limits::default(),
+        limits: harness_service::job::Limits::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -1309,7 +1308,10 @@ impl Term {
 ///   只报测量值（离上限多远），**不说"它被杀了"** —— 那句话是假的。
 ///
 /// 两半分开：**测量的数每次都报**（那是事实），**推断只在有证据时说**。
-fn limits_note(limits: &job::Limits, account: &job::JobAccount) -> Option<String> {
+fn limits_note(
+    limits: &harness_service::job::Limits,
+    account: &harness_service::job::JobAccount,
+) -> Option<String> {
     if !limits.any() {
         return None;
     }
@@ -1413,7 +1415,7 @@ mod tests {
             holder.into(),
             std::env::temp_dir().join("harness-term-test-spill.log"),
             1_048_576,
-            job::Limits::default(),
+            harness_service::job::Limits::default(),
         )
     }
 
@@ -1462,7 +1464,7 @@ mod tests {
             memory_cap: 1_048_576,
             spill_dir: PathBuf::from("data/spill"),
             // 这一条测的是"**没开限额**时 manifest 也合规"（`resources: timeout`）
-            limits: job::Limits::default(),
+            limits: harness_service::job::Limits::default(),
         };
         let report = harness_service::contract::check_manifest(&manifest(&args, &fence));
         assert!(report.is_ok(), "{:?}", report.errors);

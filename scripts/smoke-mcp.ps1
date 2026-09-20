@@ -55,6 +55,8 @@ $servicesPath = Join-Path $work 'services.json'
     "cmd": ["$(J $bridge)"],
     "args": ["--server", "$(J $mock)",
              "--allow", "echo", "--allow", "add", "--allow", "boom", "--allow", "crash",
+             "--allow", "spawn_child",
+             "--mem-limit-mb", "512", "--max-procs", "8",
              "--timeout-ms", "5000"] },
   { "kind": "agent", "id": "agent:yes", "role": "agent",
     "bindings": [{"instance": "mcp:1", "capabilities": ["mcp.call"]}],
@@ -125,6 +127,14 @@ Send 'mcp:1' 'a1' @{ tool = 'add'; args = @{ a = 1; b = 2 } }
 $a1 = WaitCorr 'a1'
 Send 'mcp:1' 'u1' @{ tool = '没有这个工具'; args = @{} }
 $u1 = WaitCorr 'u1'
+# **孙子进程**：让 MCP server 起一个长命的孙子，记住它的 pid ——
+# 等桥没了之后要验它**跟着走了**（只 child.kill() 的话它会留下来）
+Send 'mcp:1' 'gc' @{ tool = 'spawn_child'; args = @{} }
+$gc = WaitCorr 'gc'
+$grandPid = $null
+if ($gc -and $gc.payload.output -match 'pid (\d+)') { $grandPid = [int]$Matches[1] }
+Send 'mcp:1' 'st' @{ tool = 'status'; args = @{} }
+$st = WaitCorr 'st'
 # 两个只差凭证的智能体，各跑一遍
 Send 'agent:yes' 'ty' @{ task = '调一次 MCP 的 echo' }
 $ty = WaitCorr 'ty'
@@ -136,6 +146,15 @@ $c1 = WaitCorr 'c1' 15000
 Start-Sleep -Milliseconds 800
 Send 'ctrl' 'l2' @{ op = 'list' }
 $l2 = WaitCorr 'l2'
+# 桥已经走了（对端崩了）——**那个孙子进程也得跟着走**
+$grandAlive = $false
+if ($grandPid) {
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Milliseconds 200
+        $grandAlive = $null -ne (Get-Process -Id $grandPid -ErrorAction SilentlyContinue)
+        if (-not $grandAlive) { break }
+    }
+}
 
 $proc.StandardInput.Close()
 $proc.WaitForExit(8000) | Out-Null
@@ -201,6 +220,18 @@ Check '10. **对端死了**：桥报 offline 走了，中控那条现成的路�
 }
 Check '11. 这一路没有任何一条结果**违反自己声明的形**' {
     @($records | Where-Object { $_.payload.schema_violation }).Count -eq 0
+}
+Check '12. **整棵树会被收掉**：MCP server 起的孙子进程，在桥没了之后也不在了' {
+    # 只 `child.kill()` 的话孙子会留下来（终端那边踩过同一个坑）
+    $grandPid -ne $null -and (-not $grandAlive)
+}
+Check '13. `status` 里看得见那棵树的账（测量值，不是推断）' {
+    $st -and $st.payload.data.account -and `
+        $st.payload.data.account.total_processes -ge 1 -and `
+        $st.payload.data.account.limits.mem_mb -eq 512
+}
+Check '14. 而声明跟着事实走：开了限额就报 `resources: limits`' {
+    $manifest.sandbox.resources -eq 'limits' -and $manifest.sandbox_note.Length -gt 0
 }
 
 Write-Host ''

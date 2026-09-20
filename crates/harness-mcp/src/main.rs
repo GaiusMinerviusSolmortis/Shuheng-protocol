@@ -40,6 +40,8 @@ struct Args {
     allow: Vec<String>,
     allow_all: bool,
     timeout_ms: u64,
+    /// **给那棵树上的硬限额**（§5.8 决定二的"资源"面）。默认全空 = 不限额。
+    limits: harness_service::job::Limits,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,6 +53,7 @@ fn parse_args() -> Result<Args, String> {
         allow: Vec::new(),
         allow_all: false,
         timeout_ms: 30_000,
+        limits: harness_service::job::Limits::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -83,6 +86,21 @@ fn parse_args() -> Result<Args, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| "--timeout-ms 后面要跟毫秒数".to_string())?
             }
+            "--mem-limit-mb" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+                    a.limits.mem_bytes = Some(v.saturating_mul(1024 * 1024));
+                }
+            }
+            "--max-procs" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u32>().ok()) {
+                    a.limits.max_procs = Some(v);
+                }
+            }
+            "--cpu-time-ms" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+                    a.limits.cpu_time_ms = Some(v);
+                }
+            }
             other => return Err(format!("不认识的参数 `{other}`")),
         }
     }
@@ -103,7 +121,7 @@ fn main() {
 
     // 起对端 → 握手 → 问工具表。**三步分开报错**：起不来 / 谈不成 / 没工具
     // 是三件不同的事，混成一句"连不上"就没人查得动了。
-    let mut client = match McpClient::start(&args.server) {
+    let mut client = match McpClient::start_with(&args.server, args.limits) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[mcp] 拉不起 MCP server：{}。{}", e.why, e.remedy);
@@ -319,7 +337,8 @@ fn manifest(args: &Args, client: &McpClient, tools: &[Value]) -> Value {
             "network": "unrestricted",
             "identity": "same-user",
             "executables": "inherit",
-            "resources": "timeout"
+            // 和终端同一条纪律：**声明跟着事实走**（开了限额才报 `limits`）
+            "resources": if args.limits.any() { "limits" } else { "timeout" }
         },
         "sandbox_note": "**它会跑一个别人写的子进程**：那个进程和你自己跑它的世界一样。\
                           我加的「白名单」管的是**能调哪几个工具**，**不是**「它能碰什么」——\
@@ -434,6 +453,7 @@ fn handle_request(
             return alive;
         }
         "status" => {
+            let acct = client.account();
             reply(
                 out,
                 ids,
@@ -447,7 +467,19 @@ fn handle_request(
                            "protocol_version": client.protocol_version,
                            "server_info": client.server_info,
                            "tools": names_of(tools),
-                           "whitelist": if args.allow_all { json!("*") } else { json!(args.allow) }
+                           "whitelist": if args.allow_all { json!("*") } else { json!(args.allow) },
+                           // **那棵树的账**：它起了几个进程、峰值多少内存、花了多少 CPU。
+                           // 对"别人写的子进程"尤其该看得见 —— 而这是**测量值**，不是推断。
+                           "account": {
+                               "peak_mem_mb": (acct.peak_mem_bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0,
+                               "total_processes": acct.total_processes,
+                               "cpu_time_ms": acct.cpu_time_ms,
+                               "limits": {
+                                   "mem_mb": args.limits.mem_bytes.map(|b| b / 1_048_576),
+                                   "max_procs": args.limits.max_procs,
+                                   "cpu_time_ms": args.limits.cpu_time_ms
+                               }
+                           }
                        }}),
             );
             return true;
@@ -542,7 +574,9 @@ fn handle_request(
                 ids,
                 args,
                 req,
-                json!({"route": null, "effect": "confirmed", "code": null,
+                // **`route: "process"`**：这份账是关于"**交给了另一个进程**"那条路的 ——
+                // 不是同步系统调用（`null`），也不属于那五档 GUI 投递方式。
+                json!({"route": "process", "effect": "confirmed", "code": null,
                        "output": text,
                        "data": {
                            "mcp": result,
@@ -577,7 +611,9 @@ fn handle_request(
                 ids,
                 args,
                 req,
-                json!({"route": null, "effect": effect, "code": code,
+                // 超时/对端拒绝都在**"交给另一个进程"**这条路上，
+                // 所以 `route` 是 `process` 而不是 `null`（§11.2.2 那条不变量）
+                json!({"route": "process", "effect": effect, "code": code,
                        "why": e.why, "remedy": e.remedy}),
             );
             true

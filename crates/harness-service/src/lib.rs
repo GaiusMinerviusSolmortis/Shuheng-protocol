@@ -9,6 +9,7 @@
 //! | [`domain_lock`] | 域锁：同一个域只能有一个服务进程 | 02-工具 §5.15 第五节 |
 //! | [`grant`] | 凭证：中控签发，**服务自己校验** | 04-安全 §7 |
 //! | [`contract`] | **契约闸门**：manifest 合不合规、结果合不合自己声明的形 | 规范-工具服务 §11.1 / §11.3 |
+//! | [`job`] | **一棵进程树**：放进 Job Object，能整棵掐、能上硬限额 | 04-安全 §5.8 决定二 |
 //!
 //! 这里**不放**协议、不放消息循环 —— 那些归 `harness-core` 和各服务自己。
 
@@ -16,3 +17,4 @@ pub mod contract;
 pub mod domain_lock;
 pub mod fence;
 pub mod grant;
+pub mod job;

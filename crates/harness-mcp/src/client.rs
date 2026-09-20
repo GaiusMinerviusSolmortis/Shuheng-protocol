@@ -36,6 +36,13 @@ impl McpError {
 /// 一个跑着的 MCP server（我们就它这一个客户端）。
 pub struct McpClient {
     child: Child,
+    /// **把它整棵树管起来**（2026-09-20 从终端那边抄来的教训）。
+    ///
+    /// 为什么 MCP 这边更需要：这个子进程**是别人写的** —— 它自己起不起孙子进程，
+    /// 我们不知道也管不着。只 `child.kill()` 的话，**孙子会留下来**，
+    /// 而且继续占着端口、文件、日志。放进 Job Object 之后，
+    /// 句柄一关（`Drop`）整棵树跟着走（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。
+    job: Option<harness_service::job::Job>,
     stdin: Option<ChildStdin>,
     rx: Receiver<String>,
     next_id: u64,
@@ -48,6 +55,17 @@ impl McpClient {
     /// 把它拉起来。**这一步不做握手** —— 握手是 [`Self::initialize`] 的事，
     /// 因为"起得来"和"谈得成"是两个结论，报错时要能分开说。
     pub fn start(cmd: &[String]) -> Result<Self, McpError> {
+        Self::start_with(cmd, harness_service::job::Limits::default())
+    }
+
+    /// 同 [`Self::start`]，但可以给这棵树上硬限额（§5.8 决定二的"资源"面）。
+    ///
+    /// ⚠️ 限额**默认不开**：它是别人的程序，"多少算合理"得由部署方说 ——
+    /// 而"默认开一个我拍的数"会把一个正常的 MCP server 弄瘸。
+    pub fn start_with(
+        cmd: &[String],
+        limits: harness_service::job::Limits,
+    ) -> Result<Self, McpError> {
         let (program, rest) = cmd.split_first().ok_or_else(|| {
             McpError::new(
                 "invalid",
@@ -73,6 +91,16 @@ impl McpClient {
         let stdout = child.stdout.take().ok_or_else(|| {
             McpError::new("invalid", "拿不到 MCP server 的 stdout", "这是环境问题")
         })?;
+        // **先收进 job，再去读它的输出** —— 顺序不能反：反过来，
+        // 一个起得极快的 server 可能在 assign 之前就已经生了孙子进程。
+        // 失败也不拦路（装不进 job 是环境限制，不是这次调用的错），只是退回"只杀一层"。
+        let job = harness_service::job::Job::assign(&child, limits);
+        if job.is_none() {
+            eprintln!(
+                "[mcp] 警告：这个 MCP server 装不进 Job Object —— \
+                 它起的孙子进程在它死后**可能留下来**（能杀掉的只有它自己那一层）"
+            );
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -96,6 +124,7 @@ impl McpClient {
         });
         Ok(Self {
             child,
+            job,
             stdin,
             rx,
             next_id: 0,
@@ -160,6 +189,17 @@ impl McpClient {
         self.child.id()
     }
 
+    /// **这棵树的账**：峰值内存 / 起过几个进程 / 用掉的 CPU 时间。
+    ///
+    /// 对 MCP 桥尤其有用：那个子进程是**别人写的**，它的资源占用本来就该看得见。
+    /// 同一个教训：**数据是事实，推断要标明**（见 `harness-service::job` 的文件头）。
+    pub fn account(&self) -> harness_service::job::JobAccount {
+        self.job
+            .as_ref()
+            .map(|j| j.account())
+            .unwrap_or_default()
+    }
+
     fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError> {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
         self.write(&msg)
@@ -208,6 +248,26 @@ impl McpClient {
                 ));
             }
             match self.rx.recv_timeout(left) {
+                Err(RecvTimeoutError::Timeout) => {
+                    // **在"还没回话"的每一轮里问一句"你还在吗"**（2026-09-20 补）。
+                    //
+                    // 为什么光靠 EOF 不行：**它自己的孩子会攥着那根管子** ——
+                    // 一个 MCP server 起了个长命的孙子进程，孙子继承了它的 stdout，
+                    // 于是**它死了、管子还开着**，读线程永远等不到 EOF。
+                    // 现象是：对端明明没了，我们却**等满整个超时**才说话
+                    // （而且那时说的是"超时"，不是"它没了"—— 两件事差得远）。
+                    //
+                    // `try_wait()` 问的是**进程本身**，不经过管子 —— 它才是硬证据。
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        return Err(McpError::new(
+                            "child_down",
+                            "MCP server 这个进程已经退出了（它自己的孩子还攥着那根输出管子，\
+                             所以 EOF 来得晚）",
+                            "去看它的 stderr。**在它回来之前，这些工具都调不动**",
+                        ));
+                    }
+                    continue;
+                }
                 Ok(line) => {
                     let v: Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
@@ -238,7 +298,6 @@ impl McpClient {
                     }
                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                 }
-                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(McpError::new(
                         "child_down",
@@ -258,9 +317,15 @@ impl Drop for McpClient {
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
+                // 它自己走了 —— job 的句柄跟着 drop，**孙子也一起走**
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // 后兵：**先掐整棵树**，再补一刀在孩子身上。
+        // 只 `child.kill()` 的话，孙子进程会留下来占着端口/文件（终端那边踩过）。
+        if let Some(job) = &self.job {
+            job.terminate();
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
