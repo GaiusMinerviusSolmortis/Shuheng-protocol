@@ -162,7 +162,14 @@ fn main() {
     let mut reader = NdjsonReader::new(BufReader::new(io::stdin()));
     loop {
         match reader.next_line_checked() {
-            Ok(NextLine::Line(line)) => handle_line(&mut out, &mut ids, &args, &store, &line),
+            Ok(NextLine::Line(line)) => {
+                // **被请停就真的停**（哪怕这条是 stdio 那条路）——
+                // 中控的 `stop` 走的正是这个入口，所以这里必须认它。
+                if let After::Shutdown = handle_line(&mut out, &mut ids, &args, &store, &line) {
+                    eprintln!("[mem] 被请停了（stdio 那条路），走了");
+                    break;
+                }
+            }
             Ok(NextLine::Invalid { bytes }) => {
                 eprintln!("[mem] 跳过一行非 UTF-8 的输入（{bytes} 字节）")
             }
@@ -611,18 +618,16 @@ fn handle_line(
     args: &Args,
     store: &Store,
     line: &str,
-) {
+) -> After {
     let env = match codec::decode(line) {
         Ok(env) => env,
         Err(e) => {
             eprintln!("[mem] 收到不合规的消息：{e}");
-            return;
+            return After::Keep;
         }
     };
     match env.kind {
-        MessageType::Request => {
-            handle_request(out, ids, args, store, &env);
-        }
+        MessageType::Request => return handle_request(out, ids, args, store, &env),
         MessageType::Cancel => {
             // 这一层的调用都是"读一本本地账、写一行"，快到没有可取消的窗口。
             // 照实说：**不是"我停下了"，是"它本来就做完了"**。
@@ -638,6 +643,7 @@ fn handle_line(
         }
         _ => {}
     }
+    After::Keep
 }
 
 fn reply_to(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, req: &Envelope, payload: Value) {
