@@ -110,8 +110,80 @@ if ($edErr -like '*域冲突*') {
     Write-Host "      新的编辑器被挡住了：$($edErr.Trim())" -ForegroundColor DarkGray
 }
 
+Write-Host '== 反面：常驻服务**不该**跟着死 ==' -ForegroundColor Cyan
+# 同一条规矩的两面，写在一起才看得清：
+#   · **stdio 那条**（父子私有通道）：中控没了 ⇒ 通道断了 ⇒ 服务自己收摊（上面第 2 条）；
+#   · **常驻那条**（回环 TCP + 会合文件）：它的整条命就是"跨会话活着"，
+#     所以中控死了**不许**跟着死 —— 否则"接上同一个进程"这件事根本无从谈起。
+$rv = Join-Path $work 'rendezvous'
+New-Item -ItemType Directory -Path $rv -Force | Out-Null
+$rvServices = Join-Path $work 'services-resident.json'
+@"
+[
+  { "kind": "mem", "id": "mem:1", "role": "tool",
+    "resident": true, "rendezvous": "$(J $rv)",
+    "cmd": ["$(J (Join-Path $bin 'harness-mem.exe'))"],
+    "args": ["--store", "$(J (Join-Path $work 'memory'))"] }
+]
+"@ | Set-Content -LiteralPath $rvServices -Encoding utf8
+
+function Start-CtrlR([string]$sid, [string]$tag) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ctrl
+    $psi.Arguments = "--sid $sid --data-dir `"$work\data-$tag`" --services `"$rvServices`" --drain-ms 3000 --tick-ms 0"
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+    return [System.Diagnostics.Process]::Start($psi)
+}
+
+$c1 = Start-CtrlR 's-rv1' 'rv1'
+Start-Sleep -Seconds 2
+$rvProc = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ParentProcessId -eq $c1.Id -and $_.Name -eq 'harness-mem.exe' })
+$rvPid = if ($rvProc.Count -gt 0) { $rvProc[0].ProcessId } else { 0 }
+$c1.Kill()
+$c1.WaitForExit(3000) | Out-Null
+Start-Sleep -Seconds 2
+$rvAlive = if ($rvPid) { $null -ne (Get-Process -Id $rvPid -ErrorAction SilentlyContinue) } else { $false }
+$rvErr = ''
+if ($rvAlive) {
+    # 常驻服务的日志在它自己的 stderr 上，这里只能拿到 ctrl 的 —— 所以用"还活着"当证据
+    $rvErr = ''
+}
+
+# 新中控（**换一个 data 目录**，模拟"下一次会话"）应当**接上**它，而不是再拉一个。
+#
+# ⚠️ 取证方式有讲究：我第一版去读**新 ctrl 的 stderr**找那句"接上"——
+# 结果**读不到**（常驻子进程攥着那根管道，`ReadToEndAsync` 等不到 EOF，
+# 2 秒超时之后我那段代码默默跳过了，于是判据 5 假红）。
+# 换成**进程事实**：老 pid 还在 + 新中控**没有**再拉一个 ⇒ 就是接上了。
+$c2 = Start-CtrlR 's-rv2' 'rv2'
+Start-Sleep -Seconds 3
+$spawnedByNew = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ParentProcessId -eq $c2.Id -and $_.Name -eq 'harness-mem.exe' })
+$oldStill = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'harness-mem.exe' -and $_.ProcessId -eq $rvPid })
+$rvAlive = $rvAlive -and ($oldStill.Count -eq 1)
+$attached = ($spawnedByNew.Count -eq 0) -and ($oldStill.Count -eq 1)
+$c2.StandardInput.Close()
+$c2.WaitForExit(6000) | Out-Null
+if (-not $c2.HasExited) { $c2.Kill() }
+
+# 收尾：清掉这次可能残留的（正常情况下一条都没有）
+# ...
+Check '4. 而**常驻**服务反过来：中控死了它必须活着（它就是为这个存在的）' {
+    $rvAlive -and $rvErr -notlike '*读 stdin 失败*'
+}
+Check '5. 而且新中控**接上**的是同一个进程（老 pid 还在 + 它没有再拉一个）' {
+    $attached
+}
+
 # 收尾：清掉这次可能残留的（正常情况下一条都没有）
 foreach ($x in (MineAlive)) { try { Stop-Process -Id $x.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+if ($rvPid) { try { Stop-Process -Id $rvPid -Force -ErrorAction SilentlyContinue } catch { } }
 
 Write-Host ''
 if ($failures.Count -gt 0) {

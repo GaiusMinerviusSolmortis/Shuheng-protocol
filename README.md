@@ -1559,7 +1559,7 @@ pwsh -File scripts/smoke-limits.ps1              # 终端那棵树的硬限额�
 pwsh -File scripts/smoke-domainlock.ps1          # 域锁的形状：多围栏要全占、去重、排序、失败不留残锁（10 条判据）
 pwsh -File scripts/smoke-args.ps1                # 服务回给你的话：未知工具教对的名字 / 没填 vs 不存在 / 抱怨的顺序 / 手册别漂（21 条判据）
 pwsh -File scripts/smoke-parallel.ps1            # 交错：一次发 24 条不等回包 —— 一条不落、一条不多、不许串台（10 条判据）
- pwsh -File scripts/smoke-orphan.ps1              # 中控被硬杀：服务不许变孤儿，域锁要跟着放（3 条判据）
+ pwsh -File scripts/smoke-orphan.ps1              # 硬杀中控：stdio 服务不许变孤儿、域锁要跟着放、常驻服务反过来必须活着（5 条判据）
 pwsh -File scripts/check-decisions.ps1           # 决策册的计数校验（不是验收，是查账）
 pwsh -File scripts/check-manifests.ps1           # manifest 体检：六个服务的家门逐项查，并打出那张沙箱表
 pwsh -File scripts/check-docs.ps1                # 文档里的数字对账：脚本条数 / 判据条数 / 测试总数 / 行数
