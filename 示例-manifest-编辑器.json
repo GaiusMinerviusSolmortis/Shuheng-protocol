@@ -1,0 +1,1278 @@
+{
+  "content": [
+    "document",
+    "log"
+  ],
+  "contract_version": "1",
+  "domain": "fs",
+  "error_codes": [
+    "service_down",
+    "instance_gone",
+    "busy",
+    "refused",
+    "invalid",
+    "timeout"
+  ],
+  "fence": [
+    "D:\\proj"
+  ],
+  "help_sections": [
+    {
+      "id": "overview",
+      "title": "概览"
+    },
+    {
+      "id": "lock",
+      "title": "锁与写互斥"
+    },
+    {
+      "id": "edit",
+      "title": "edit 的参数与回滚"
+    },
+    {
+      "id": "errors",
+      "title": "错误码与补救"
+    }
+  ],
+  "id": "editor",
+  "injection_policy": "card",
+  "instance_types": [
+    "file"
+  ],
+  "kind": "editor",
+  "node_actions": [
+    "close",
+    "force_close"
+  ],
+  "node_kind": "editor",
+  "owns": {
+    "domain": "fs",
+    "exclusive_per": "fence"
+  },
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "sandbox": {
+    "executables": "none",
+    "filesystem": "fence-args",
+    "identity": "same-user",
+    "network": "none",
+    "resources": "none"
+  },
+  "sandbox_note": "**围栏是真的，但它只围「这个服务自己」**：它不拉子进程，所以「看得见的只有托管那条路径」成立。⚠️ 这不是内核级隔离（那是 `filesystem: os`，没人做到）——它靠的是**每次读写都自己检查一遍**。",
+  "state_vocabulary": [
+    "idle",
+    "held",
+    "closed"
+  ],
+  "summary": "按路径持有一份文件的写权，读、改、回滚都在持有期内完成。",
+  "title": "编辑器",
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "capabilities": [],
+      "description": "这本手册本身：不带参数看章节清单，带 section 看那一章，带 search 找内容。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "search": {
+            "type": "string"
+          },
+          "section": {
+            "description": "章节 id，见不带参数时的清单",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "help",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "data"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "capabilities": [
+        "fs.read"
+      ],
+      "description": "独立验证文件现在的样子：从**磁盘**读一遍，对比你给的判据，回 satisfied / unsatisfied / unknown。**unknown 永远不能被当成成功。**",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "expect": {
+            "description": "至少给一条：contains / bytes",
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "contains": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "instance_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "instance_id",
+          "expect"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "verify",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "data"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "capabilities": [
+        "fs.write"
+      ],
+      "description": "打开一个文件并取得它的写权，返回 instance_id。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "create": {
+            "description": "文件不存在时是否新建（默认 false，不给就拒）",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "必须落在托管路径内",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "open",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "instance_id"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "held_by": {
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "held_ms": {
+                "type": "integer"
+              },
+              "sid": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sid",
+              "agent",
+              "held_ms"
+            ],
+            "type": "object"
+          },
+          "idempotent": {
+            "type": "boolean"
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "capabilities": [
+        "fs.read"
+      ],
+      "description": "读实例当前持有的内容，可带字节偏移与上限。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instance_id": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instance_id"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "read",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "text"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "disk_changed": {
+            "type": "boolean"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "next_offset": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "spilled_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "capabilities": [
+        "fs.write"
+      ],
+      "description": "对持有中的文件做一次替换。old 必须**恰好命中一次**。写即落盘。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instance_id": {
+            "type": "string"
+          },
+          "new": {
+            "type": "string"
+          },
+          "old": {
+            "description": "要唯一命中；命中 0 处或 2 处以上都报 invalid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instance_id",
+          "old",
+          "new"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "edit",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "changed",
+                "revision"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "caller_kind": {
+            "type": "string"
+          },
+          "changed": {
+            "type": "integer"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "now_revision": {
+            "type": "integer"
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "revision": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "capabilities": [
+        "fs.write"
+      ],
+      "description": "把文件写回某个 revision（edit 返回的那个），并丢掉它之后的历史。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instance_id": {
+            "type": "string"
+          },
+          "revision": {
+            "description": "0 = 刚打开时的内容",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instance_id",
+          "revision"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "revert",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "revision"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "restored_from": {
+            "type": "integer"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "capabilities": [],
+      "description": "释放写权。不写盘、不撤销 —— 要撤销用 revert。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instance_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "instance_id"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "close",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "released"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "released": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "capabilities": [],
+      "description": "看现在持有哪些文件、锁在谁手里。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "status",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "data"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "capabilities": [],
+      "description": "看这个服务还在不在。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "ping",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "data"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "version": "0.1.0",
+  "when_to_use": "需要改动托管路径内的文件时。只是看一眼不必用它 —— 直接读文件。",
+  "will": "它持有的那些文件写权随着进程一起没了（锁由操作系统释放），别人可以重新 open；已经落盘的 edit **不会**撤销 —— 要退回去得用文件自己的 revision 或者 git。"
+}

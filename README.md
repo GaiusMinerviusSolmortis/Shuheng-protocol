@@ -93,10 +93,11 @@
 | [07-界面](07-界面.md) | **§9、§12** GUI 作为消息流的投影、表示层、点击策略、桌宠不在框架内。 |
 | [08-记忆](08-记忆.md) | **§16** 锚点、分层、沉淀，以及**大眼记忆实现的评估**。 |
 | [09-模型](09-模型.md) | **§8、§15** 提示词编译与模型拼装。 |
-| [10-决策](10-决策.md) | 已定 **288** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
+| [10-决策](10-决策.md) | 已定 **289** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
 | [**规范-消息协议**](规范-消息协议.md) | **规范性文件**：信封、消息种类、配对、会话日志、stdio 传输。 |
 | [规范-工具服务](规范-工具服务.md) | **规范性文件**，与其余探索性文档性质不同。 |
 | [附录-参考](附录-参考.md) | **§10、§17** 与已有工作的对照，以及和 MCP 的定位比较。 |
+| [示例-manifest-编辑器.json](示例-manifest-编辑器.json) | **产物，不是源码**：规范 §11.6 那份"完整示例"就是它 —— 由 `scripts/gen-manifest-example.ps1` 从**活着的编辑器服务**里 dump 出来（只把临时托管路径换成 `D:\proj`）。体检第 7 条拿活服务跟它逐字节比，漂了就红 |
 
 ---
 
@@ -1560,6 +1561,7 @@ pwsh -File scripts/check-decisions.ps1           # 决策册的计数校验（�
 pwsh -File scripts/check-manifests.ps1           # manifest 体检：六个服务的家门逐项查，并打出那张沙箱表
 pwsh -File scripts/check-docs.ps1                # 文档里的数字对账：脚本条数 / 判据条数 / 测试总数 / 行数
 pwsh -File scripts/check-clippy.ps1              # lint 闸门：clippy 一条警告都不许有
+pwsh -File scripts/gen-manifest-example.ps1      # 重新生成规范 §11.6 那份示例（改了服务就跑它）
 pwsh -File scripts/dump-manifest.ps1 -Service term   # 把活服务自报的 manifest 打出来
 ```
 
@@ -1569,5 +1571,7 @@ pwsh -File scripts/dump-manifest.ps1 -Service term   # 把活服务自报的 man
 - **06-操控.md 仍有 850 行**（下一步该再拆：理论 / 实测）。
 - 待定条目里混着"必答""可延后""已解决"三种，第 2 节和第 5 节已经分开了，
   但第 4 节里仍有可合并的条目。
-- **规范-工具服务 §11.6 那份"填完的示例"还是手写的** —— 它现在有一份差异说明
-  挂在上面，但真正干净的形态是**从 `scripts/dump-manifest.ps1` 的输出生成**。
+- ~~规范-工具服务 §11.6 那份"填完的示例"还是手写的~~ → **2026-09-20 改成生成的了**：
+  `示例-manifest-编辑器.json` + `scripts/gen-manifest-example.ps1`，
+  体检第 7 条拿活服务跟它逐字节比。顺带把 §11.6 / §11.7 **错位的正文**摆回了原处
+  （§11.6 的正文原来挂在 §11.7 后面）。

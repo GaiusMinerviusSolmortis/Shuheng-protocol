@@ -122,6 +122,16 @@ Check '5. **`not_implemented` 必须真的有那个字段**（说过要写就得
 Check '6. `error_codes` 每个都不空（模型靠它判断重试有没有用）' {
     (@($manifests.Keys | Where-Object { @($manifests[$_].error_codes).Count -ge 1 }).Count) -eq 6
 }
+# **7. 规范里那份"完整示例"要就是活服务报的那一份**（2026-09-20）。
+#
+# 这条挂在体检里而不是别处，理由很直接：它们查的是同一件事 ——
+# "文档说的"和"服务报的"是不是一份东西。§11.6 那份示例**曾经是手写的**，
+# 而它真的漂过（`summary` vs `description`、`parameters` vs `input_schema`）。
+# 现在是生成的：`示例-manifest-编辑器.json`。
+$gen = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'gen-manifest-example.ps1') -Check
+$genOk = $LASTEXITCODE -eq 0
+Check '7. 规范 §11.6 那份示例 == 活着的编辑器自报的那一份（逐字节）' { $genOk }
+if (-not $genOk) { $gen | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray } }
 
 Write-Host ''
 Write-Host '== 六个服务自报的沙箱五面（这张表是从活服务里读出来的）==' -ForegroundColor Cyan
