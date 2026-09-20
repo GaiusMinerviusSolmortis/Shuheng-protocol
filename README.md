@@ -1557,7 +1557,7 @@ pwsh -File scripts/smoke-mcp.ps1                 # MCP 桥：对端工具表 / �
 pwsh -File scripts/smoke-prompt.ps1              # 提示词实例：看 / 念分开、只有 user 能注入、前缀不重编（13 条判据）
 pwsh -File scripts/smoke-limits.ps1              # 终端那棵树的硬限额：内存 / 进程数 / CPU 时间（8 条判据）
 pwsh -File scripts/smoke-domainlock.ps1          # 域锁的形状：多围栏要全占、去重、排序、失败不留残锁（10 条判据）
-pwsh -File scripts/smoke-args.ps1                # 报错即手册：未知工具教对的名字 / 没填 vs 不存在 / 抱怨的顺序（16 条判据）
+pwsh -File scripts/smoke-args.ps1                # 服务回给你的话：未知工具教对的名字 / 没填 vs 不存在 / 抱怨的顺序 / 手册别漂（21 条判据）
 pwsh -File scripts/check-decisions.ps1           # 决策册的计数校验（不是验收，是查账）
 pwsh -File scripts/check-manifests.ps1           # manifest 体检：六个服务的家门逐项查，并打出那张沙箱表
 pwsh -File scripts/check-docs.ps1                # 文档里的数字对账：脚本条数 / 判据条数 / 测试总数 / 行数

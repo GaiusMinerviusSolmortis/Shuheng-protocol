@@ -171,6 +171,30 @@ Check 'term：两种错的判词**没有空的名字**（`` `` 那种）' {
 }
 
 Write-Host ''
+Write-Host '== 手册自己别漂：manifest 里那张章节表和 help 报的那张**是同一张** ==' -ForegroundColor Cyan
+# 同一族第五次：**同一件事被手写在两处**（manifest 的 `help_sections` 一份、
+# `help` 回复里再列一份）。今天四家都对得上 —— 这条判据是**保险**，不是补窟窿：
+# 加了章节忘改另一处，模型就会看到"手册里有、取不到"或者反过来。
+$helpEd = (Call $procs['editor'] $pendings['editor'] 'help' '{}')[0]
+$helpTm = (Call $procs['term']   $pendings['term']   'help' '{}')[0]
+$helpMem = (Call $procs['mem']   $pendings['mem']    'help' '{}')[0]
+$helpSk = (Call $procs['skill']  $pendings['skill']  'help' '{}')[0]
+function SameChapters($pay, $manifest) {
+    $a = @($manifest.help_sections | ForEach-Object { $_.id }) -join ','
+    $b = @($pay.data.sections | ForEach-Object { $_.id }) -join ','
+    ($a -eq $b) -and ($a.Length -gt 0)
+}
+Check 'editor：manifest.help_sections == help 报的章节（顺序也要一样）' { SameChapters $helpEd $manifests['editor'] }
+Check 'term：manifest.help_sections == help 报的章节' { SameChapters $helpTm $manifests['term'] }
+Check 'mem：manifest.help_sections == help 报的章节' { SameChapters $helpMem $manifests['mem'] }
+Check 'skill：manifest.help_sections == help 报的章节' { SameChapters $helpSk $manifests['skill'] }
+# 手册里写着"要找内容就传 search" —— 那就得**真的能用**（说一套做一套也是漂）
+$hitEd = (Call $procs['editor'] $pendings['editor'] 'help' '{"search":"锁"}')[0]
+Check 'editor：help 的 search 真的能命中（"锁"至少命中一章）' {
+    $hitEd.data.search -eq '锁' -and @($hitEd.data.sections).Count -ge 1
+}
+
+Write-Host ''
 Write-Host '== 值和参数名分开说 / 抱怨的顺序 ==' -ForegroundColor Cyan
 # ⚠️ 这几条**被改过一次**：第一版断言的是"`run {错 id}` 回 invalid"，
 # 而修完顺序之后它回 `instance_gone` —— **那次是判据过期，不是代码坏了**。
