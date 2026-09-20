@@ -11,7 +11,7 @@
 # 另外：这么跑出来的 manifest 还会**顺带过一遍闸门** ——
 # 中控收到 presence 时会查它（§11.8）。上面那门是注册关，它不吼就说明合规。
 param(
-    [ValidateSet('editor', 'term', 'echo', 'mem')][string]$Service = 'editor'
+    [ValidateSet('editor', 'term', 'echo', 'mem', 'skill')][string]$Service = 'editor'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -23,6 +23,9 @@ $svcArgs = @('--instance', "$Service`:1", '--sid', 's-dump')
 if ($Service -eq 'mem') {
     # 记忆服务不吃 `--fence`（它不碰你的文件）；它的"域"是**那个碎片库目录**
     $svcArgs += @('--store', (Join-Path $work 'memory'))
+} elseif ($Service -eq 'skill') {
+    # 技能服务也不吃 `--fence`：它的范围是**那个根目录里放了什么**
+    $svcArgs += @('--root', (Join-Path $work 'skills'))
 } elseif ($Service -ne 'echo') {
     $svcArgs += @('--fence', $work)
 }
