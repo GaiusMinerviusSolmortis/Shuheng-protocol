@@ -1,0 +1,15 @@
+[package]
+name = "harness-ctrl"
+version.workspace = true
+edition.workspace = true
+description = "中控（无 GUI 版）：注册表、路由、签发与裁决、契约闸门、会话与装配、周期探针、身份索引"
+
+[[bin]]
+name = "harness-ctrl"
+path = "src/main.rs"
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-service = { path = "../harness-service" }
+serde.workspace = true
+serde_json.workspace = true

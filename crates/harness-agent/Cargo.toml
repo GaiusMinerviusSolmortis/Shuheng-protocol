@@ -1,0 +1,16 @@
+[package]
+name = "harness-agent"
+version.workspace = true
+edition.workspace = true
+description = "智能体实例：拼装提示词、驱动模型、调工具、管上下文"
+
+[[bin]]
+name = "harness-agent"
+path = "src/main.rs"
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-memory = { path = "../harness-memory" }
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "3.4.2", features = ["json"] }

@@ -1,0 +1,15 @@
+[package]
+name = "harness-service"
+version.workspace = true
+edition.workspace = true
+description = "工具服务的公共件：路径围栏、域锁、能力凭证、契约校验"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

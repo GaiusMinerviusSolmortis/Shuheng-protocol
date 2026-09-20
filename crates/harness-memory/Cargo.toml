@@ -1,0 +1,13 @@
+[package]
+name = "harness-memory"
+version.workspace = true
+edition.workspace = true
+description = "线性记忆内核：窗口预算 + 安全切点 + 摘要替换 + 可观测"
+
+[[bin]]
+name = "harness-memory"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

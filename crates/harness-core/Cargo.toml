@@ -1,0 +1,9 @@
+[package]
+name = "harness-core"
+version.workspace = true
+edition.workspace = true
+description = "内核协议层：信封、编解码、会话日志、实例事件、三条不变量"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
