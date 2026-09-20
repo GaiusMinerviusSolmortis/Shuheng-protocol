@@ -193,6 +193,16 @@ fn manifest(args: &Args, cat: &Catalog) -> Value {
         "tools": tools(),
         "error_codes": ["invalid", "refused"],
         "owns": {"domain": "skill-root", "exclusive_per": "none"},
+        // 它只读自己的 `--root`：不碰你的文件、不联网、不拉子进程。
+        "sandbox": {
+            "filesystem": "none",
+            "network": "none",
+            "identity": "same-user",
+            "executables": "none",
+            "resources": "none"
+        },
+        "sandbox_note": "它只读 `--root` 那个目录 —— 不碰你的项目、不联网、不拉子进程。\
+                          这里没有围栏要报（`fence` 是空的，这是真的）。",
         "not_implemented": {
             "scope": "v1 不做「只给某个智能体看其中几份技能」—— 范围就是 `--root` 里放了什么；\
                       要更细，得先有「技能级的绑定」，那条还没定",

@@ -83,6 +83,36 @@ pub const INJECTION_POLICIES: &[&str] = &["card", "help", "full"];
 
 /// §11.1 E 组 `lifecycle` 的闭合取值。
 pub const LIFECYCLES: &[&str] = &["per_call", "per_session", "resident"];
+/// **沙箱的五个面**（04-安全 §5.8 决定二）—— 每个面一个**闭集**。
+///
+/// 为什么要有这个字段（2026-09-20）：§5.8 把方向定死了（"策略写在**能枚举的维度**上"、
+/// "身份 ID 选的是**这个进程看得见什么世界**"），但**没有任何一处声明**告诉我：
+/// 这个服务**实际**强制了哪几个面。于是"围栏"这个词在代码里指两件不同的事 ——
+///
+/// * **绑定的范围**（这个实例管哪条路径，中控拿它做授权检查）；
+/// * **沙箱**（它拉起的进程看得见多大的世界）。
+///
+/// 终端那份围栏是前者：**`run` 拉起的命令看得见整台机器**。
+/// 这两件事混着叫"围栏"，是"看起来有边界、其实没有"最容易发生的地方。
+///
+/// 所以：**五个面必须逐面声明**，而且取值只能从**有实现支撑的**那几个里挑
+/// （"没实现的不许声明"—— 同 `lifecycle` 那条纪律）。
+///
+/// ⚠️ **它还只是"声明"，不是"强制"** —— 没有这个字段照样能被绕过。
+/// 它买到的是**可读性**：谁能一眼看出"这套系统现在到底挡得住什么"。
+/// 挑 profile 那件事（待定 #3）要先有这个，否则是在猜。
+pub const SANDBOX_FACES: &[(&str, &[&str])] = &[
+    // 它自己（或它拉起的进程）能碰到哪些路径
+    ("filesystem", &["fence-args", "none"]),
+    // 能不能出网
+    ("network", &["none", "unrestricted"]),
+    // 以哪个 OS 用户跑 —— 现在只有一种（**别的都还没实现**）
+    ("identity", &["same-user"]),
+    // 拉起的进程看得见哪些可执行文件
+    ("executables", &["none", "inherit"]),
+    // CPU / 内存 / 时间上限
+    ("resources", &["none", "timeout"]),
+];
 
 /// **存活状态**的词表 —— 这一轴归**中控**，不归服务。
 ///
@@ -516,6 +546,78 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
             if !f.is_array() {
                 e.push("`fence` 要是字符串数组（它报的是规范化之后的围栏）".into());
             }
+        }
+        // ---- **沙箱五面**（2026-09-20）----
+        //
+        // 三件事都要查，而它们的形状不一样：
+        //   ① **齐不齐**（五个面一个不许少）—— "说不清"就是没说清；
+        //   ② **值合不合法**（每面一个闭集）—— 而且闭集里只放**有实现支撑的**值；
+        //   ③ **声明和自己的围栏对不对得上**：声称 `fence-args` 却没报围栏
+        //      ⇒ 那是"说我围了、其实没围"。
+        //
+        // ⚠️ **反方向不查**（报了围栏但 filesystem 是 `none` 是合法的）：
+        // 围栏在代码里还兼着"**绑定的范围**"那件事 —— 一个终端可以"管着这条路径"
+        // 而"拉起的命令看得见整台机器"。这两件事混着叫"围栏"，
+        // 正是这个字段要拆开的东西。
+        match m.get("sandbox") {
+            Some(Value::Object(faces)) => {
+                for (face, allowed) in SANDBOX_FACES {
+                    match faces.get(*face).and_then(Value::as_str) {
+                        Some(v) if allowed.contains(&v) => {}
+                        Some(v) => e.push(format!(
+                            "`sandbox.{face}` 是 `{v}`，不在这一面的闭集里（{}）—— \
+                             闭集里只放**有实现支撑的**值：没实现的东西不许声明",
+                            allowed.join(" / ")
+                        )),
+                        None => e.push(format!(
+                            "`sandbox` 少了 `{face}` 这一面 —— \
+                             五个面（{}）一个都不许少：**说不清就是没说清**",
+                            SANDBOX_FACES
+                                .iter()
+                                .map(|(f, _)| *f)
+                                .collect::<Vec<_>>()
+                                .join(" / ")
+                        )),
+                    }
+                }
+                for k in faces.keys() {
+                    if !SANDBOX_FACES.iter().any(|(f, _)| f == k) {
+                        e.push(format!(
+                            "`sandbox` 里有个没听说过的面 `{k}` —— \
+                             要么它是新的面（那样得先加进规范），要么是打错了"
+                        ));
+                    }
+                }
+                if faces.get("filesystem").and_then(Value::as_str) == Some("fence-args") {
+                    let has_fence = m
+                        .get("fence")
+                        .and_then(Value::as_array)
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false);
+                    if !has_fence {
+                        e.push(
+                            "`sandbox.filesystem: fence-args` 说「带路径的参数都过围栏」—— \
+                             可它没报任何 `fence`。**说了要围却没围栏**，这条声明是假的"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            Some(_) => e.push("`sandbox` 要是对象（五个面做它的键）".into()),
+            None => e.push(
+                "少 `sandbox`（§11.1 的五个面）—— 少它的话，\
+                 「这套系统现在到底挡得住什么」就只能靠读代码猜"
+                    .into(),
+            ),
+        }
+        match m.get("sandbox_note").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => {}
+            _ => e.push(
+                "少 `sandbox_note`（或者说它是空的）—— \
+                 **一句话说清这套声明意味着什么、不意味着什么。**\
+                 它比那五个格子更重要：格子说的是「我盖了章」，这句话说的是「章盖在哪儿」"
+                    .into(),
+            ),
         }
     match m.get("error_codes") {
         Some(Value::Array(a)) if a.iter().all(Value::is_string) => {}
@@ -996,6 +1098,12 @@ mod tests {
             "will": "我没了就是没了，什么都不持有。",
             "injection_policy": "card",
             "help_sections": [{"id": "overview", "title": "概览"}],
+            // 沙箱五面（2026-09-20 起是必报项）
+            "sandbox": {
+                "filesystem": "none", "network": "none", "identity": "same-user",
+                "executables": "none", "resources": "none"
+            },
+            "sandbox_note": "这个示例什么都不碰 —— 五个面全是「没有东西可管」。",
             "error_codes": ["invalid"],
             "tools": [{
                 "name": "ping",
@@ -1138,6 +1246,82 @@ mod tests {
             !r2.errors.iter().any(|w| w.contains("stop")),
             "指向存在的工具该放行：{:?}",
             r2.errors
+        );
+    }
+
+    /// **沙箱五面：一个都不许少**（"说不清就是没说清"）。
+    #[test]
+    fn the_five_sandbox_faces_are_all_required() {
+        let mut m = conforming_manifest();
+        m["sandbox"].as_object_mut().unwrap().remove("network");
+        let r = check_manifest(&m);
+        assert!(
+            r.errors.iter().any(|w| w.contains("network")),
+            "少一面该点名：{:?}",
+            r.errors
+        );
+    }
+
+    /// **每一面一个闭集**，而且闭集里只放有实现支撑的值
+    /// —— `filesystem: "os"`（内核级隔离）现在**没人做到**，所以它不在闭集里。
+    #[test]
+    fn sandbox_values_come_from_a_closed_set() {
+        let mut m = conforming_manifest();
+        m["sandbox"]["filesystem"] = json!("os");
+        let r = check_manifest(&m);
+        assert!(
+            r.errors.iter().any(|w| w.contains("filesystem")),
+            "闭集外的值该拦：{:?}",
+            r.errors
+        );
+    }
+
+    /// 没听说过的面也要拦（要么是打错了，要么得先加进规范）。
+    #[test]
+    fn an_unknown_sandbox_face_is_refused() {
+        let mut m = conforming_manifest();
+        m["sandbox"]["time_travel"] = json!("enabled");
+        let r = check_manifest(&m);
+        assert!(
+            r.errors.iter().any(|w| w.contains("time_travel")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    /// **"说了要围、却没围栏"是假的** —— 这条规则是从编辑器那儿抓出来的：
+    /// 它的 `filesystem` 原来写死 `fence-args`，而没给围栏时那就成了假话。
+    #[test]
+    fn claiming_a_fence_without_one_is_refused() {
+        let mut m = conforming_manifest();
+        m["sandbox"]["filesystem"] = json!("fence-args");
+        let r = check_manifest(&m);
+        assert!(
+            r.errors.iter().any(|w| w.contains("假") || w.contains("没围栏")),
+            "{:?}",
+            r.errors
+        );
+        // 报上围栏之后就合法了
+        m["fence"] = json!(["C:\\proj"]);
+        assert!(
+            check_manifest(&m)
+                .errors
+                .iter()
+                .all(|w| !w.contains("filesystem")),
+            "报了围栏就该放行"
+        );
+    }
+
+    /// `sandbox_note` 必报：**格子说的是"我盖了章"，那句话说的是"章盖在哪儿"**。
+    #[test]
+    fn the_sandbox_note_is_required_too() {
+        let mut m = conforming_manifest();
+        m.as_object_mut().unwrap().remove("sandbox_note");
+        let r = check_manifest(&m);
+        assert!(
+            r.errors.iter().any(|w| w.contains("sandbox_note")),
+            "{:?}",
+            r.errors
         );
     }
 

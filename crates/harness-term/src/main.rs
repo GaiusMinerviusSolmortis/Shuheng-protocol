@@ -318,6 +318,21 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
                 .collect::<Vec<_>>()
         },
         "owns": {"domain": "shell", "exclusive_per": "fence"},
+        // ⚠️ **这里必须诚实**：终端报的围栏是"**绑定的范围**"（哪些路径归它管），
+        // **不是沙箱** —— 它拉起的命令继承整台机器的文件系统视图。
+        // 写成 `fence-args` 会是一句让人安心的假话，而这正是 §5.8 要避免的那种东西。
+        "sandbox": {
+            "filesystem": "none",
+            "network": "unrestricted",
+            "identity": "same-user",
+            "executables": "inherit",
+            "resources": "timeout"
+        },
+        "sandbox_note": "**五个面里只有「时间」是真的**：`timeout_ms` 到点就整棵树掐掉。\
+                          文件系统 / 网络 / 身份 / 可执行文件**都没有限制** ——\
+                          它跑的命令和你自己在命令行里跑的是同一个世界。\
+                          我报的那个 `fence` 是**绑定范围**（哪些路径归这个实例管），\
+                          **不是沙箱**；把这两件事混着叫「围栏」是这里最容易骗人的地方。",
         // **参数表与结果形状都是服务自己的义务**（规范 §11.1 的 C 组）：
         // 只报工具名不报参数，等于让人猜怎么调；不报结果形状，就没人能验它。
         "tools": tools(),

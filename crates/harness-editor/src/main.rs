@@ -268,6 +268,26 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
         },
         // **注册时就把"我占了什么"讲清楚** —— 冲突要在这一层可见
         "owns": {"domain": "fs", "exclusive_per": "fence"},
+        //
+        // ⚠️ **`filesystem` 跟着事实走，不写死**：没有围栏的编辑器
+        // 就不是"每一步都检查过"，那时候它必须报 `none`。
+        // （第一版这里写死了 `fence-args`，**闸门当场把它拦下来了** ——
+        //   那条规则要的就是这个：声称围了、却没围栏，是一句让人安心的假话。）
+        "sandbox": {
+            "filesystem": if fence.is_empty() { "none" } else { "fence-args" },
+            "network": "none",
+            "identity": "same-user",
+            "executables": "none",
+            "resources": "none"
+        },
+        "sandbox_note": if fence.is_empty() {
+            "**这次它没有托管任何路径**：`filesystem: none` 说的是「没有可围的东西」——\
+             不是「没管住」。真有路径要读写时，会话必须先托管一条。"
+        } else {
+            "**围栏是真的，但它只围「这个服务自己」**：它不拉子进程，\
+             所以「看得见的只有托管那条路径」成立。⚠️ 这不是内核级隔离\
+             （那是 `filesystem: os`，没人做到）——它靠的是**每次读写都自己检查一遍**。"
+        },
         // **参数表与结果形状都是服务自己的义务**（规范 §11.1 的 C 组）。
         // 信封那一半（effect / code / route / why / remedy …）由
         // `ToolDecl` 与 `contract::result_schema` 补 —— 服务只写它独有的字段。

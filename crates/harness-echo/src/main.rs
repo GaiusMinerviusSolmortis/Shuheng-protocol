@@ -32,6 +32,9 @@ struct Args {
     /// 崩了会有 EOF（中控立刻知道），挂了只会让探针一直不回话。
     /// 健康探针那条路（`service_unresponsive`）就靠它才测得动。
     freeze: bool,
+    /// **谎报沙箱**：声称"带路径的参数都过围栏"，却不报任何围栏 ——
+    /// 2026-09-20 新加那条规则（"说了要围却没围栏"）的靶子。
+    sandbox_lie: bool,
 }
 
 fn parse_args() -> Args {
@@ -42,6 +45,7 @@ fn parse_args() -> Args {
     let mut manifest_holes = false;
     let mut bad_result = false;
     let mut freeze = false;
+    let mut sandbox_lie = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -51,6 +55,7 @@ fn parse_args() -> Args {
             "--manifest-holes" => manifest_holes = true,
             "--bad-result" => bad_result = true,
             "--freeze" => freeze = true,
+            "--sandbox-lie" => sandbox_lie = true,
             _ => {}
         }
     }
@@ -61,6 +66,7 @@ fn parse_args() -> Args {
         manifest_holes,
         bad_result,
         freeze,
+        sandbox_lie,
     }
 }
 
@@ -147,6 +153,16 @@ fn manifest(args: &Args) -> Value {
         ],
         // 参数表与结果形状都是服务自己的义务（规范 §11.1 C 组）
         "tools": tools(),
+        // 它是 mock：**什么都不碰** —— 五个面全是"没有"，而这是真话（不是"没管住"）
+        "sandbox": {
+            "filesystem": "none",
+            "network": "none",
+            "identity": "same-user",
+            "executables": "none",
+            "resources": "none"
+        },
+        "sandbox_note": "它是个 mock：不碰文件、不联网、不拉子进程 —— \
+                          五个面全是「没有东西可管」，不是「没管住」。",
         "error_codes": ["invalid", "canceled"]
     });
     if args.manifest_holes {
@@ -156,6 +172,10 @@ fn manifest(args: &Args) -> Value {
                 obj.remove("input_schema");
             }
         }
+    }
+    if args.sandbox_lie {
+        // **说了要围、却没围栏** —— 这条声明是假的，闸门该在注册时拦下
+        m["sandbox"]["filesystem"] = json!("fence-args");
     }
     m
 }
@@ -399,6 +419,7 @@ mod tests {
             manifest_holes,
             bad_result,
             freeze: false,
+            sandbox_lie: false,
         }
     }
 

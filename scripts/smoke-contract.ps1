@@ -30,6 +30,7 @@ $servicesPath = Join-Path $work 'services.json'
   { "kind": "echo",   "id": "echo:1",     "role": "tool", "cmd": ["$(J $echo)"] },
   { "kind": "echo",   "id": "echo:holes", "role": "tool", "cmd": ["$(J $echo)"], "args": ["--manifest-holes"] },
   { "kind": "echo",   "id": "echo:liar",  "role": "tool", "cmd": ["$(J $echo)"], "args": ["--bad-result"] },
+  { "kind": "echo",   "id": "echo:sandbox-liar", "role": "tool", "cmd": ["$(J $echo)"], "args": ["--sandbox-lie"] },
   { "kind": "editor", "id": "editor:1",   "role": "tool",
     "cmd": ["$(J $editor)"], "args": ["--fence", "$(J $project)"] }
 ]
@@ -154,6 +155,26 @@ Check '10. 控制台上另有一条审计事件（"这个服务在说谎"是一�
 Check '11. **守规矩的服务一切照旧**：它的结果没有 schema_violation' {
     $good -and $good.payload.effect -eq 'confirmed' -and -not $good.payload.schema_violation -and
         $good.payload.data.text -eq '正常的那个'
+}
+<#
+  第 12-14 条是 **2026-09-20** 加的：**沙箱那五个面成了必报项**。
+
+  为什么值得单独立一条：在做它之前，"这套系统现在到底挡得住什么"**只能靠读代码猜** ——
+  而且"围栏"这个词在代码里指两件不同的事（**绑定的范围** vs **沙箱**）。
+  终端的 `run` 拉起的命令看得见整台机器，可它报的 `fence` 让人以为它被围住了。
+
+  这三条判据盯的正是那个：**说了要围、却没围栏**，闸门要在**注册**时拦下来。
+#>
+$sandboxLiar = @($nonconforming | Where-Object { $_.payload.instance -eq 'echo:sandbox-liar' })
+Check '12. **"说了要围、却没围栏"被注册闸门拦下**（新规则）' {
+    $sandboxLiar.Count -ge 1
+}
+Check '13. 判词点的是**那一面**（`filesystem`），不是一句含糊的"不合规"' {
+    ($sandboxLiar[0].payload.problems -join ' ') -like '*filesystem*'
+}
+Check '14. 而守着规矩的那些照旧（`echo:1` 与 `editor:1` 都没被误报）' {
+    $named = @($nonconforming | ForEach-Object { $_.payload.instance })
+    ($named -notcontains 'echo:1') -and ($named -notcontains 'editor:1') -and ($named -notcontains 'echo:liar')
 }
 
 Write-Host ''

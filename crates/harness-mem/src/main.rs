@@ -459,6 +459,18 @@ fn manifest(args: &Args) -> Value {
         "tools": tools(args),
         "error_codes": ["invalid", "refused", "busy", "canceled"],
         "owns": {"domain": "memory-store", "exclusive_per": "store"}
+        // **它不碰你的文件**：碎片写在它自己的 `--store` 目录里，
+        // 而那是它的**域**（一处只许一个进程），不是"围栏"。
+        ,"sandbox": {
+            "filesystem": "none",
+            "network": "none",
+            "identity": "same-user",
+            "executables": "none",
+            "resources": "none"
+        },
+        "sandbox_note": "**它根本不动你的文件** —— 只读写自己那个 `--store` 目录。\
+                          所以这里没有「围栏」要报（`fence` 是空的，这是真的）。\
+                          `filesystem: none` 的意思不是「没管住」，而是「**没有你给它的路径可管**」。"
     })
 }
 

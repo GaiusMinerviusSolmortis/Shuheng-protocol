@@ -312,6 +312,18 @@ fn manifest(args: &Args, client: &McpClient, tools: &[Value]) -> Value {
         "tools": decls,
         "error_codes": ["invalid", "refused", "timeout", "service_down", "canceled"],
         "owns": {"domain": "mcp-server", "exclusive_per": "process"},
+        // ⚠️ 它拉一个**别人写的**子进程，那个子进程继承整台机器的视图。
+        // "白名单"管的是**调哪几个工具**，不是"那个进程能碰什么" —— 两件事别混。
+        "sandbox": {
+            "filesystem": "none",
+            "network": "unrestricted",
+            "identity": "same-user",
+            "executables": "inherit",
+            "resources": "timeout"
+        },
+        "sandbox_note": "**它会跑一个别人写的子进程**：那个进程和你自己跑它的世界一样。\
+                          我加的「白名单」管的是**能调哪几个工具**，**不是**「它能碰什么」——\
+                          把它当成沙箱看，会得出很危险的结论。",
         "not_implemented": {
             "reconnect": "对端没了我不自动重连 —— 我报 offline 然后退出，\
                           让中控那条现成的 `service_down` 路接管（结未决调用 + 发敕令）。\
