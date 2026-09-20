@@ -2439,23 +2439,53 @@ impl App {
                 } else {
                     self.reg.revoke(&agent, &instance)
                 };
-                let shown: Vec<String> = after
-                    .unwrap_or_default()
+                // 改完之后的**整张清单**：既用来报"你现在有哪些实例"，
+                // 也用来报"**这一个实例放你用什么**"（下面那段）。
+                let after_list = after.unwrap_or_default();
+                let shown: Vec<String> = after_list.iter().map(|b| b.instance.clone()).collect();
+                let caps_now: Vec<String> = after_list
                     .iter()
-                    .map(|b| b.instance.clone())
-                    .collect();
+                    .find(|b| b.instance == instance)
+                    .map(|b| b.capabilities.clone())
+                    .unwrap_or_default();
+                // **把"凭什么能用"一起说清**（2026-09-20 补）。
+                //
+                // 原来这条敕令只说"你现在可以用 `term:1` 了" —— 而**授权的粒度和
+                // 能力的粒度不是一个**：绑定挂在**实例**上，能干的动作却由
+                // **能力清单**决定（§7）。只签了 `proc.read` 却宣布"你能用 term:1"，
+                // 那句话是**真的、但会误导** —— 模型会以为能 `run`，撞一次墙才知道。
+                //
+                // 它不改变"谁校验"：校验仍然在服务那边（§2.3 的责任分配没动）。
+                // 变的只是**告诉模型它有哪几条**，让它不必靠试错去发现。
+                let caps_text = if caps_now.iter().any(|c| c == "*") {
+                    "它给你的是一条通配（`*`）—— 这个实例上的动作你都能用。".to_string()
+                } else if caps_now.is_empty() {
+                    "**不过一条能力都没给你** —— 你调它会被它自己挡下来，\
+                     理由是「你没这条资格」。要动它，先让用户给你签能力。"
+                        .to_string()
+                } else {
+                    format!(
+                        "它放你用的是这几条动作：`{}`。**这几条之外它仍然会拒** —— \
+                         拒的时候它会告诉你缺哪一条。",
+                        caps_now.join("` / `")
+                    )
+                };
                 let (fact, impact, exit) = if op == "grant" {
                     (
                         format!("你现在**可以用** `{instance}` 了。"),
-                        "你的名册会多出这一个工具实例 —— 下一个回合开始前我会重新扫一遍并换掉它。\
-                         前缀（人设和规矩）**不会因此重写**：变化只走这条追加的通知。",
+                        format!(
+                            "你的名册会多出这一个工具实例 —— 下一个回合开始前我会重新扫一遍并换掉它。\
+                             前缀（人设和规矩）**不会因此重写**：变化只走这条追加的通知。\
+                             {caps_text}"
+                        ),
                         "拿不准它怎么用，先调它的 `help`。",
                     )
                 } else {
                     (
                         format!("`{instance}` 你**不再能用**了。"),
                         "下个回合你的名册里就没有它了；**已经发出去的调用不受影响** —— \
-                         那是已经发生的事，收回授权追不回来。",
+                         那是已经发生的事，收回授权追不回来。"
+                            .to_string(),
                         "如果这正是你正在干的活，直说做不了，别换个名字重试。",
                     )
                 };

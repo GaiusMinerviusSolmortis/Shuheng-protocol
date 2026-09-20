@@ -109,6 +109,23 @@ Send @{ op = 'revoke'; agent = 'agent:dada'; instance = 'echo:1' } 'r1'
 $rv = Wait-Corr 'r1'
 Send @{ task = '第三次用 echo' } 't3' 'agent:dada'
 $r3 = Wait-Corr 't3'
+# ---- 第四幕（2026-09-20 加）：**只改凭证、不改名册** ----
+#
+# 这一段盯的是"授权的粒度"和"能力的粒度"不是一个东西（§7）：
+# ① 带**显式能力清单**的 grant ⇒ 敕令必须把能力名报出来（不能只说"你能用 X 了"）；
+# ② 同一个实例再改签一次（只换能力）⇒ **名册一个字都不该动**
+#    （动名册 = 后面的缓存全作废），但账要留（`caps_changed`）。
+Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('echo.read') } 'g9'
+$g9 = Wait-Corr 'g9'
+Send @{ task = '第四幕：先用一次 echo' } 't4' 'agent:dada'
+$r4 = Wait-Corr 't4'
+$changesBeforeCapsOnly = @((Get-Content -LiteralPath (Join-Path (Join-Path (Join-Path $dataDir 'sessions') $sid) 'log.jsonl') |
+    Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_ | ConvertFrom-Json }) |
+    Where-Object { $_.payload.kind -eq 'toolset_changed' }).Count
+Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('echo.read', 'echo.write') } 'g10'
+$g10 = Wait-Corr 'g10'
+Send @{ task = '第四幕：再用一次 echo' } 't5' 'agent:dada'
+$r5 = Wait-Corr 't5'
 $proc.StandardInput.Close()
 $proc.WaitForExit(10000) | Out-Null
 $et = $proc.StandardError.ReadToEndAsync(); $et.Wait(4000) | Out-Null
@@ -122,6 +139,7 @@ $injRevoke = @($records | Where-Object { $_.type -eq 'inject' -and $_.payload.re
 $changes = @($records | Where-Object { $_.payload.kind -eq 'toolset_changed' })
 $promptEvents = @($records | Where-Object { $_.payload.kind -eq 'prompt_compiled' })
 $injected = @($records | Where-Object { $_.payload.kind -eq 'model_item' -and $_.payload.item.kind -eq 'injected' })
+$capsChanged = @($records | Where-Object { $_.payload.kind -eq 'caps_changed' })
 
 Check '1. 第一幕：**没授权就够不着** —— 中控挡下了那次 echo 调用' { $rejected.Count -ge 2 }
 Check '2. `grant` 生效了，回复里带着改签之后的整张清单' {
@@ -161,6 +179,16 @@ Check '11. 第三幕：又被挡下了，而且拒绝里说清**它被授权的�
 }
 Check '12. 三次任务都收掉了（授权变动没把回合打断）' {
     $r1.payload.effect -eq 'confirmed' -and $r3.payload.effect -eq 'confirmed'
+}
+Check '19. 带**显式能力清单**的 grant，敕令里把能力名报出来了（不只说"你能用 X 了"）' {
+    $t = ($injGrant | Select-Object -Last 1).payload.text
+    $t -like '*echo.read*' -and $t -notlike '*通配*'
+}
+Check '20. 同一个实例**只换凭证**时：不换名册（缓存不动），但账要留' {
+    # 名册事件数在"只换凭证"那两次之间**没有增长**，而 caps_changed 记了一笔。
+    # 老写法（只比工具名）这一条会红：那次改签被当成"什么都没发生"。
+    (@($changes).Count -eq $changesBeforeCapsOnly) -and ($capsChanged.Count -ge 1) -and `
+        $g10.payload.effect -eq 'confirmed'
 }
 
 # ---------------------------------------------------------------- 场景 B

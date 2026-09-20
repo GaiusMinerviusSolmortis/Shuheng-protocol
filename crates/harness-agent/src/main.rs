@@ -175,6 +175,40 @@ fn toolset_signature(cards: &[ToolCard]) -> Vec<(String, Vec<String>)> {
     out
 }
 
+/// **凭证的指纹**：每个实例上，我被放行的是哪几条能力。
+///
+/// 和 [`toolset_signature`] 分开记，是因为它们**能单独变**：
+/// 用户可以把 `term:1` 从"通配"改签成"只给 `proc.read`" ——
+/// 实例没变、工具名没变，而模型**能做的事变了**。
+/// 只比工具名的话这一刀就漏了，于是模型靠撞墙发现（§7）。
+fn caps_signature(data: &Value) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = data
+        .get("bindings")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| {
+                    let inst = b.get("instance")?.as_str()?.to_string();
+                    let mut caps: Vec<String> = b
+                        .get("capabilities")
+                        .and_then(Value::as_array)
+                        .map(|c| {
+                            c.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    caps.sort();
+                    Some((inst, caps))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
 /// 从 `.env` 风格的文件里取一个键。**只为方便本地测试**（像 WXBot 那份 .env）。
 fn key_from_env_file(path: &str, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -272,6 +306,13 @@ struct Agent {
     ids: IdGen,
     /// 中控发下来的工具名片（从服务自报的 manifest 拼的）
     cards: Vec<ToolCard>,
+    /// **我手里这几张凭证**（`my_tools` 的 `bindings`）—— 上一次扫到的样子。
+    ///
+    /// 为什么它要单独记：**"有哪些工具"和"能对它做什么"是两个变化源**。
+    /// 只比工具名的话，`grant` 一个"只给了 `proc.read` 的 term:1" 会被当成
+    /// "名册没变"（实例还是 term:1）—— 于是模型被蒙在鼓里，靠撞墙去发现
+    /// 自己不能跑命令（2026-09-20 审计）。
+    caps_sig: Vec<(String, Vec<String>)>,
     /// 编译一次就冻住的那段前缀（§15.2）
     system: String,
     manifest: prompt::CompositionManifest,
@@ -314,7 +355,8 @@ fn main() {
             compiler: "harness-agent/prompt v1".into(),
             compiled_at: 0,
         },
-        cards: Vec::new(),
+    cards: Vec::new(),
+    caps_sig: Vec::new(),
         history: History::new(),
         window: Window::first(&args.sid, args.model_window),
         policy: CompactionPolicy::default(),
@@ -570,6 +612,8 @@ impl Agent {
                         id.as_str().unwrap_or("?")
                     );
                 }
+                // **顺手记下"我手里这几张凭证"** —— 回合边界要靠它比出"只有凭证变了"。
+                self.caps_sig = caps_signature(&data);
                 return (cards, bound);
             }
             std::thread::sleep(Duration::from_millis(150));
@@ -608,13 +652,44 @@ impl Agent {
                 waiting.join(", ")
             );
         }
-        if toolset_signature(&self.cards) == toolset_signature(&cards) {
+        // **两个变化源分别比**（2026-09-20）：名册（有哪些实例、各有哪几个工具）
+        // 和**凭证**（每个实例放我走哪几条动作）。它们能单独变 —— 只比前者的话，
+        // "把 term:1 从通配改签成只给 `proc.read`"会被当成"什么都没发生"。
+        //
+        // ⚠️ **名册没变时不许换名册**：换 `tools` 数组 = 后面的缓存全作废（§5.4）。
+        // 凭证变了照样要对模型说 —— 但说话的渠道是**中控那条敕令**（grant/revoke
+        // 的时候它已经把能力名列出来了），这里只是**把账记上**，别重复喊一遍。
+        let tools_same = toolset_signature(&self.cards) == toolset_signature(&cards);
+        let caps_same = self.caps_sig == caps_signature(&data);
+        if tools_same && caps_same {
+            return;
+        }
+        if tools_same {
+            // 只有凭证变了：名册一个字都不动，但这件事要留痕（可审计"它当时凭什么能用"）
+            let after_caps = caps_signature(&data);
+            eprintln!("[agent] 凭证变了（名册没变）：{:?} → {:?}", self.caps_sig, after_caps);
+            self.caps_sig = after_caps.clone();
+            let ev = self.mint(
+                MessageType::Event,
+                "ctrl",
+                None,
+                Authority::Agent,
+                json!({
+                    "kind": "caps_changed",
+                    "caps": after_caps.iter().map(|(i, c)| json!({"instance": i, "capabilities": c})).collect::<Vec<_>>(),
+                    "why": "回合开始前扫了一遍授权：**名册没变、凭证变了** —— \
+                            function 定义数组不动（省一次缓存作废），但该记的账要记（§7、§4.4）",
+                }),
+            );
+            emit(out, &ev);
+            self.drain_inbox(out, rx);
             return;
         }
         let before: Vec<String> = self.cards.iter().map(|c| c.instance.clone()).collect();
         let after: Vec<String> = cards.iter().map(|c| c.instance.clone()).collect();
         eprintln!("[agent] 名册变了：{before:?} → {after:?}");
         self.cards = cards;
+        self.caps_sig = caps_signature(&data);
         let listing: Vec<Value> = self
             .cards
             .iter()
