@@ -294,6 +294,11 @@ struct Pending {
 struct Trace {
     steps: usize,
     tool_calls: usize,
+    /// **参数没解出来、因此根本没发出去的调用数**。
+    ///
+    /// 为什么它要是个单独的数：它是**"模型不听话"和"我们的解析坏了"之间的分界**。
+    /// 只看 `tool_calls` 的话，这两种情况长得一模一样（都是"没调成"）。
+    bad_calls: usize,
     injects: usize,
     compactions: usize,
     tokens: u64,
@@ -369,6 +374,7 @@ fn main() {
         trace: Trace {
             steps: 0,
             tool_calls: 0,
+            bad_calls: 0,
             injects: 0,
             compactions: 0,
             tokens: 0,
@@ -960,11 +966,34 @@ impl Agent {
             self.note_item(out, Item::assistant(format!("[调用] {rendered}")));
 
             for call in reply.calls {
-                self.trace.tool_calls += 1;
                 let corr = self.ids.next_corr();
                 // provider 给了 id 就用它（真模型必须原样带回去）；
                 // mock 不给，就用我们的 corr 当 id —— 两者都能配对。
                 let call_id = call.id.clone().unwrap_or_else(|| corr.clone());
+                // **参数都没解出来的调用：根本不许发出去。**（2026-09-20）
+                //
+                // 为什么：解不开的时候我们**不知道模型想调什么**。以前那种做法
+                // （编一个 `{_raw,_parse_error}` 发过去）有三个坏处：
+                // ① 等于替模型编了它没说的话；② 工具会回一句"缺少参数"，
+                // **指不到真正的原因**；③ 那一轮就成了"一次没人知道想干什么的调用"——
+                // 而它**本来是能救回来的**。
+                //
+                // 现在的做法是**报错即手册**：把它的原话 + 这个工具的正确参数形状
+                // **一起**回给它，让它改一版再来。**这条调用没有发生**，所以
+                // 不进 `pending`、不发请求、也不算一次工具调用。
+                if let Some(why) = call.parse_error.clone() {
+                    self.trace.bad_calls += 1;
+                    let manual = self.manual_for_bad_call(&call, &why);
+                    // 仍然要回一条 `tool_result` 挂同一个 call_id：provider 那边
+                    // 「assistant 的 tool_calls 必须有对应的 tool 回信」，少一条就是协议违规
+                    self.note_item(out, Item::tool_result_with(&call.tool, &manual, &call_id));
+                    eprintln!(
+                        "[agent] 模型给的参数解不出来（{why}）—— \
+                         这一条**没有发出去**，回了它一条报错即手册"
+                    );
+                    continue;
+                }
+                self.trace.tool_calls += 1;
                 let item = Item::tool_call_with(&call.tool, &call.args, &call_id);
                 self.note_item(out, item);
                 self.pending.insert(
@@ -1096,6 +1125,59 @@ impl Agent {
             p["last_compaction"] = json!({"window_after": c.window_after, "turns": c.turns_compacted});
         }
         p
+    }
+
+    /// **模型的参数没解出来**时回它的那一条 —— **报错即手册**（§5.5）。
+    ///
+    /// 这是"我在两个项目里都干过"那个做法的落地：**一边报错，一边把正确格式给它**。
+    /// 三件事必须齐（少一件这条就成了抱怨）：
+    ///
+    /// 1. **事实**：它给的原话是什么、哪儿不对；
+    /// 2. **影响**：**这次调用没有发生**（工具那边根本不知道它调过）；
+    /// 3. **出口**：这个工具**正确的参数形状**长什么样 —— 参数表我们手里就有
+    ///    （名片里那份 `input_schema` 就是从服务的 manifest 抄来的），
+    ///    所以"正确格式"不是我们编的，**是抄的**。
+    ///
+    /// 拿不准还有一条退路：让它先调那个工具的 `help`（§5.3 渐进披露）。
+    fn manual_for_bad_call(&self, call: &ToolCall, why: &str) -> String {
+        let mut out = format!(
+            "**[参数不合法]** 你给 `{}` 的参数{}。\n",
+            call.tool, why
+        );
+        out.push_str(
+            "- **这次调用没有发生**：工具那边根本不知道你调过它 —— \
+             别以为它做了一半。\n",
+        );
+        // 参数表：**从名片里抄**，不是这里编的
+        let schema = self
+            .cards
+            .iter()
+            .flat_map(|c| c.tools.iter())
+            .find(|t| t.name == call.tool)
+            .map(|t| {
+                let s = t.input_schema.to_string();
+                if s.chars().count() > 900 {
+                    let head: String = s.chars().take(900).collect();
+                    format!("{head}…（太长，截断了）")
+                } else {
+                    s
+                }
+            });
+        out.push_str(&format!(
+            "- **`{}` 的参数长这样**：{}\n",
+            call.tool,
+            schema.unwrap_or_else(|| {
+                // 找不到那张名片：**照实说找不到**，别编一个形状
+                "（我手里没有它的参数表 —— 它的服务没在 manifest 里报，或者它不在你的名册上）"
+                    .to_string()
+            })
+        ));
+        out.push_str(
+            "- 拿不准就**先调它的 `help`**（渐进披露那条：别猜参数）—— \
+             一轮只改一次，把参数写成一个**合法 JSON 对象**再来。\n\
+             - **别原样重发**：解不出来的那一版再发一次，结果还是这个。",
+        );
+        out
     }
 
     /// 每轮前问一句"该压了吗" —— **回合中压缩，摘要贴到最后一条 user 之前**（§5.4.3 ④）。

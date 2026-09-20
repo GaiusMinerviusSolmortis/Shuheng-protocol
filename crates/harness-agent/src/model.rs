@@ -22,6 +22,67 @@ pub struct ToolCall {
     pub tool: String,
     #[serde(default)]
     pub args: serde_json::Value,
+    /// 脚本用它演"模型给的参数**不是合法 JSON**"。
+    ///
+    /// 为什么要有这一格：真 provider 在那一刻给的**就是一个字符串**
+    /// （`function.arguments`），我们要能演"那个字符串解不出来"这件事 ——
+    /// 而不是演"模型给了一个奇怪的参数对象"（那是两回事）。
+    #[serde(default)]
+    pub args_raw: Option<String>,
+    /// **参数没解出来时的原话。**
+    ///
+    /// ⚠️ 有它 ⇒ 这条调用**没有发生**：不许把它当成模型的意思发出去。
+    /// 这一格的存在本身就是那条纪律的落点（2026-09-20）：
+    /// 在它之前，解不出来的参数会被编成 `{"_raw":…,"_parse_error":true}`
+    /// **发给工具** —— 那等于替模型编了它没说的话。
+    #[serde(default)]
+    pub parse_error: Option<String>,
+}
+
+impl ToolCall {
+    /// 从"provider 给的那个字符串"建一条调用：解得开就是参数，解不开就是 `parse_error`。
+    ///
+    /// 真 provider 和 mock **走的是同一条路**（这条函数），所以 mock 演出来的
+    /// 畸形输出，和真的畸形输出是**同一种形状**。
+    pub fn from_raw_args(id: Option<String>, to: String, tool: String, raw: &str) -> Self {
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(v) if v.is_object() => Self {
+                id,
+                to,
+                tool,
+                args: v,
+                args_raw: None,
+                parse_error: None,
+            },
+            Ok(v) => Self {
+                // 解出来了，但**不是个对象**：`{"tool":"run","args":42}` 这种也进不来
+                id,
+                to,
+                tool,
+                args: serde_json::Value::Null,
+                args_raw: None,
+                parse_error: Some(format!(
+                    "参数解得开，但它是个 {}，不是对象：{v}",
+                    match v {
+                        serde_json::Value::Array(_) => "数组",
+                        serde_json::Value::Number(_) => "数字",
+                        serde_json::Value::String(_) => "字符串",
+                        serde_json::Value::Bool(_) => "布尔值",
+                        serde_json::Value::Null => "null",
+                        _ => "别的",
+                    }
+                )),
+            },
+            Err(e) => Self {
+                id,
+                to,
+                tool,
+                args: serde_json::Value::Null,
+                args_raw: None,
+                parse_error: Some(format!("不是合法 JSON：{e}")),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,8 +151,14 @@ pub enum Step {
     },
     /// 产出最终文本，回合结束
     Text { text: String, #[serde(default)] usage_input_tokens: Option<u64> },
-    /// **坏的那部分**：直接给一段原始文本（畸形 JSON、半截输出……）
-    /// —— 4a 要测的"报错即手册的前半"就靠它
+    /// **回包整体读不懂**：直接给一段原始文本（半截输出、根本不是 JSON……）。
+    ///
+    /// ⚠️ 它对应的是**"模型这条路断了"**，不是"模型说了这句话"——
+    /// 所以它走 `ModelReply::failed`，**不许**被当成回答交给用户
+    /// （那正是"把故障说成结论"，README 里点过名的那个坑）。
+    ///
+    /// 想演"**工具调用**的参数是畸形 JSON"，用 [`Step::Tool`] 的 `args_raw` ——
+    /// 那才是它在真实 provider 那儿的形状。
     Raw { text: String, #[serde(default)] usage_input_tokens: Option<u64> },
 }
 
@@ -133,7 +200,19 @@ impl Model for MockModel {
             Step::Tool {
                 calls,
                 usage_input_tokens,
-            } => ModelReply::calls(calls, usage_input_tokens.unwrap_or(est)),
+            } => {
+                // 脚本里写 `args_raw` 的，在这儿走**和真 provider 同一条路**
+                let calls = calls
+                    .into_iter()
+                    .map(|c| match c.args_raw.clone() {
+                        Some(raw) => {
+                            ToolCall::from_raw_args(c.id.clone(), c.to.clone(), c.tool.clone(), &raw)
+                        }
+                        None => c,
+                    })
+                    .collect();
+                ModelReply::calls(calls, usage_input_tokens.unwrap_or(est))
+            }
             Step::Text {
                 text,
                 usage_input_tokens,
@@ -141,7 +220,11 @@ impl Model for MockModel {
             Step::Raw {
                 text,
                 usage_input_tokens,
-            } => ModelReply::text(text, usage_input_tokens.unwrap_or(est)),
+            } => {
+                let _ = usage_input_tokens;
+                // 路断了 ⇒ **失败**，不是回答
+                ModelReply::failed(format!("provider 的回包读不懂：{text}"))
+            }
         }
     }
 }
@@ -158,6 +241,35 @@ mod tests {
         }
     }
 
+    /// **解得开就是参数**：合法 JSON 对象照常进来。
+    #[test]
+    fn raw_args_that_parse_become_args() {
+        let c = ToolCall::from_raw_args(None, "term:1".into(), "run".into(), r#"{"cmd":"ls"}"#);
+        assert_eq!(c.args["cmd"], serde_json::json!("ls"));
+        assert!(c.parse_error.is_none());
+    }
+
+    /// **解不开就是 `parse_error`** —— 而且**不许**编一个参数对象出来。
+    ///
+    /// 这条是从反面改过来的：老写法在这里塞 `{"_raw":…,"_parse_error":true}`，
+    /// 然后那条调用**照样发给工具**（等于替模型编了它没说的话）。
+    #[test]
+    fn raw_args_that_do_not_parse_never_become_fake_args() {
+        let c = ToolCall::from_raw_args(None, "term:1".into(), "open".into(), "{path: \".\"");
+        assert!(c.parse_error.is_some(), "解不开就该记下来");
+        assert!(c.args.is_null(), "**不许**替它编一个参数对象：{}", c.args);
+    }
+
+    /// 解得开、但**不是一个对象**（数组 / 数字 / 字符串）—— 同样不许当参数用。
+    #[test]
+    fn args_that_parse_to_a_non_object_are_refused_too() {
+        for raw in ["[1,2]", "42", "\"ls\""] {
+            let c = ToolCall::from_raw_args(None, "term:1".into(), "run".into(), raw);
+            assert!(c.parse_error.is_some(), "{raw} 不该被当成参数");
+            assert!(c.args.is_null(), "{raw}");
+        }
+    }
+
     #[test]
     fn script_is_consumed_in_order() {
         let mut m = MockModel::new(vec![
@@ -167,6 +279,8 @@ mod tests {
                     to: "term:1".into(),
                     tool: "run".into(),
                     args: serde_json::json!({"cmd": "ls"}),
+                    args_raw: None,
+                    parse_error: None,
                 }],
                 usage_input_tokens: None,
             },

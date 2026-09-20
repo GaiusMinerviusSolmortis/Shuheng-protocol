@@ -182,6 +182,41 @@ Check '13. 第二次调用用的是对的实例，而且真的开成了' {
     $ok -ne $null
 }
 Write-Host ''
+Write-Host '== 场景 C：模型吐了畸形 JSON（参数根本解不出来）==' -ForegroundColor Cyan
+# 这一格演的是真 provider 那儿的形状：`arguments` **是一个字符串**，
+# 而那个字符串不是合法 JSON。第一版的做法会编一个 `{_raw,_parse_error}` 发出去 ——
+# 那等于**替模型编了它没说的话**，而工具会回一句"缺少参数"，指不到真正的原因。
+$scriptC = @'
+{"step":"tool","calls":[{"to":"term:1","tool":"open","args_raw":"{path: \".\", purpose: 半截"}]}
+{"step":"tool","calls":[{"to":"term:1","tool":"open","args":{"path":".","purpose":"读了手册之后改对的"}}]}
+{"step":"text","text":"第一版参数写坏了，读了报错里的参数表改对，开好了。"}
+'@
+$C = Run-Scenario 'C' $scriptC '把项目打开'
+$rc = $C.replies['c-task']
+Check '14. **那一条调用根本没发出去**：工具那边一条请求都没收到' {
+    $toTerm = @($C.log | Where-Object { $_.type -eq 'request' -and $_.from -eq 'agent:dada' -and $_.to -eq 'term:1' })
+    # 只该有**第二次**那一条（改对之后的）；坏的那条一次都不许发
+    $toTerm.Count -eq 1 -and $toTerm[0].payload.args.purpose -eq '读了手册之后改对的'
+}
+Check '15. 它被**记成一次坏调用**，而不是一次工具调用（两种失败要分得开）' {
+    $rc.payload.trace.bad_calls -eq 1 -and $rc.payload.trace.tool_calls -eq 1
+}
+Check '16. **报错即手册**：回给模型的那条里有原话、有"这次没发生"、有**抄来的参数表**' {
+    $item = $C.log | Where-Object { $_.payload.kind -eq 'model_item' -and `
+        $_.payload.item.kind -eq 'tool_result' -and $_.payload.item.text -like '*参数不合法*' } | Select-Object -First 1
+    # ⚠️ 判据里**别在 `-like` 的模式里写反引号**：`-like` 走的是通配符引擎，
+    # 那里反引号是**转义符**（跟"单引号字符串里当字面量"不是一回事）——
+    # 于是 `*…`help`*` 里最后那个 `*` 会被吃成**字面星号**，模式就永远匹配不上。
+    # （这条和上一轮"`**接上**` 忘了算加粗标记"是同一个病：判据和被测文本，两边都得看。）
+    $item -and $item.payload.item.text -like '*没有发生*' -and `
+        $item.payload.item.text -like '*"path"*' -and `
+        $item.payload.item.text -like '*先调它的*help*'
+}
+Check '17. 而且它**能救回来**：读着那条手册改对之后，活干完了' {
+    $rc.payload.effect -eq 'confirmed' -and `
+        ($C.log | Where-Object { $_.type -eq 'result' -and $_.from -eq 'term:1' -and $_.payload.instance_id }) -ne $null
+}
+Write-Host ''
 Write-Host '== 场景 A 的消息流（截断）==' -ForegroundColor Cyan
 $A.msgs | ForEach-Object {
     $m = $_ | ConvertFrom-Json

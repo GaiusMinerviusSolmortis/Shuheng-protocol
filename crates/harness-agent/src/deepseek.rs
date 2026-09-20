@@ -229,16 +229,20 @@ impl Model for DeepSeekModel {
                         let (to, tool) = self.names.get(name).cloned().unwrap_or_else(|| {
                             (String::new(), name.to_string())
                         });
-                        // `arguments` 是**字符串**，得再解一次
-                        let args: Value = serde_json::from_str(args_raw).unwrap_or_else(|_| {
-                            json!({"_raw": args_raw, "_parse_error": true})
-                        });
-                        Some(ToolCall {
-                            id: Some(id.to_string()),
+                        // `arguments` 是**字符串**，得再解一次。
+                        //
+                        // ⚠️ 解不开的时候**不许编一个对象**给它：在 2026-09-20 之前，
+                        // 这里会塞 `{"_raw":…,"_parse_error":true}`，然后那条调用
+                        // **照样发给了工具** —— 等于替模型编了它没说的话，
+                        // 而工具会回一句"缺少参数"，模型看到的错还指不到真正的原因。
+                        // 现在解不开就记在 `parse_error` 上：**这条调用不发生**，
+                        // 由智能体回一条"报错即手册"（原话 + 正确格式）给它。
+                        Some(ToolCall::from_raw_args(
+                            Some(id.to_string()),
                             to,
                             tool,
-                            args,
-                        })
+                            args_raw,
+                        ))
                     })
                     .collect()
             })
