@@ -34,6 +34,13 @@ pub fn lexical_normalize(path: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FenceError {
+    /// **这是哪一种错**（§11.5 那张表里的码）。
+    ///
+    /// 为什么它必须在这里、而不是让调用方拍一个：`FenceError` 有两种完全不同的错 ——
+    /// **参数不对**（`path` 是空的、父目录不存在）和**被围栏拒绝**（越界）。
+    /// 前者模型改一改就能过（`invalid`），后者**别试了**（`refused`，要用户去托管）。
+    /// 调用方原来一律硬编码成 `refused` —— 于是"你没填 path"被说成"你没资格"。
+    pub code: &'static str,
     pub why: String,
     pub remedy: String,
 }
@@ -51,11 +58,14 @@ impl Fence {
         for r in raw {
             let p = Path::new(r);
             let canon = std::fs::canonicalize(p).map_err(|e| FenceError {
+                // 起服务时给的托管路径不对 —— 那是**部署**的事，不是模型能改的
+                code: "refused",
                 why: format!("托管路径 `{}` 用不了：{e}", p.display()),
                 remedy: "托管路径必须是一个已经存在的目录".to_string(),
             })?;
             if !canon.is_dir() {
                 return Err(FenceError {
+                    code: "refused",
                     why: format!("托管路径 `{}` 不是一个目录", canon.display()),
                     remedy: "目前只支持托管目录".to_string(),
                 });
@@ -92,14 +102,19 @@ impl Fence {
     pub fn resolve_from(&self, base: &Path, raw: &str) -> Result<PathBuf, FenceError> {
         if self.roots.is_empty() {
             return Err(FenceError {
+                code: "refused",
                 why: "这个实例没有托管路径，所以它不能碰任何文件".into(),
                 remedy: "中控拉起它时要给出托管目录（会话里托管的那条路径）".to_string(),
             });
         }
         if raw.trim().is_empty() {
             return Err(FenceError {
+                // **这是"你没填"，不是"你没资格"**
+                code: "invalid",
                 why: "path 是空的".into(),
-                remedy: "填一个文件路径；相对路径按第一个托管根解析".to_string(),
+                remedy: "填一个文件路径，例如 `src/main.rs`（相对路径按**主路径**解析）\
+                         或者一条绝对路径；`status` 能看到主路径是什么"
+                    .to_string(),
             });
         }
 
@@ -121,14 +136,17 @@ impl Fence {
             Ok(p) => p,
             Err(_) => {
                 let parent = joined.parent().ok_or_else(|| FenceError {
+                    code: "invalid",
                     why: format!("`{raw}` 没有父目录"),
                     remedy: "给一个完整的文件路径".to_string(),
                 })?;
                 let name = joined.file_name().ok_or_else(|| FenceError {
+                    code: "invalid",
                     why: format!("`{raw}` 不是一个文件路径"),
                     remedy: "路径要以文件名结尾，不能是 `..` 或目录本身".to_string(),
                 })?;
                 let canon_parent = std::fs::canonicalize(parent).map_err(|e| FenceError {
+                    code: "invalid",
                     why: format!("`{}` 的父目录解析不了：{e}", joined.display()),
                     remedy: "路径要在托管范围内，而且父目录要真实存在".to_string(),
                 })?;
@@ -145,6 +163,8 @@ impl Fence {
 
     fn outside(&self, p: &Path) -> FenceError {
         FenceError {
+            // **越界是"别试了"**：改参数没用，得让用户去托管那条路径
+            code: "refused",
             why: format!("`{}` 不在托管路径内", p.display()),
             remedy: format!(
                 "托管根是：{}；要改别处，先在会话里托管那条路径",

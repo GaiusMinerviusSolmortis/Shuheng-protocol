@@ -35,6 +35,7 @@ use harness_service::contract::ToolDecl;
 use harness_service::domain_lock;
 use harness_service::fence::Fence;
 use harness_service::grant::{self, Grant};
+use harness_service::reply;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{self, BufReader};
@@ -298,6 +299,10 @@ fn required_caps(tool: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+
+/// **本服务的工具名**：一份，不是两份（`没有名为 X 的工具` 那条消息要靠它教对的名字）。
+/// 手写的那份原来漏了 `help`。有一条测试把它和 manifest 里真报的名字钉在一起。
+const TOOL_NAMES: [&str; 7] = ["help", "open", "run", "read", "close", "status", "ping"];
 
 fn manifest(args: &Args, fence: &Fence) -> Value {
     json!({
@@ -774,13 +779,7 @@ impl Term {
                            见 02-工具 §5.18。现在用 run 跑单条命令"
             }),
             other => {
-                let shown = if other.is_empty() { "(空)" } else { other };
-                json!({
-                    "route": null, "effect": "refused", "code": "invalid",
-                    "why": format!("没有名为 `{shown}` 的工具"),
-                    "expect": {"tool": "open | run | read | close | status | ping"},
-                    "remedy": "presence 里的 manifest.help_sections 有章节清单；先从 open 开始"
-                })
+                reply::unknown_tool(other, &TOOL_NAMES)
             }
         };
         let reply = self.mint(MessageType::Result, &req.from.clone(), req.corr.clone(), payload);
@@ -796,7 +795,8 @@ impl Term {
         let dir = match self.fence.resolve(raw) {
             Ok(p) => p,
             Err(e) => {
-                return json!({"route": null, "effect": "refused", "code": "refused",
+                // 码跟着围栏自己的判断走（`path` 空了是参数错，越界才是被拒）
+                return json!({"route": null, "effect": "refused", "code": e.code,
                               "why": e.why, "remedy": e.remedy})
             }
         };
@@ -870,14 +870,14 @@ impl Term {
             .map(Duration::from_millis);
         let mut out = io::stdout();
 
-        if cmd.trim().is_empty() {
+        // **实例先于 cmd**（顺序有讲究，同编辑器 `revert` 那条）：
+        // 没有终端就谈不上"往哪个终端里敲命令"，而两次抱怨会拖成两次往返。
+        if id.is_empty() {
             let reply = self.mint(
                 MessageType::Result,
                 &req.from.clone(),
                 req.corr.clone(),
-                json!({"route": null, "effect": "refused", "code": "invalid",
-                       "why": "cmd 是空的",
-                       "remedy": "一次给一条命令，例如 {\"cmd\": \"dir /b\"}"}),
+                reply::missing_instance_id("run"),
             );
             emit(&mut out, &reply);
             return;
@@ -887,13 +887,21 @@ impl Term {
                 MessageType::Result,
                 &req.from.clone(),
                 req.corr.clone(),
-                json!({"route": null, "effect": "refused", "code": "instance_gone",
-                       "why": format!("没有实例 `{id}`"),
-                       "remedy": "先 open 拿一个实例；status 能看到现在开着哪些"}),
+                reply::no_such_instance("run", id),
             );
             emit(&mut out, &reply);
             return;
         };
+        if cmd.trim().is_empty() {
+            let reply = self.mint(
+                MessageType::Result,
+                &req.from.clone(),
+                req.corr.clone(),
+                reply::empty_argument("run", "cmd", "{\"cmd\": \"dir /b\"}（**一次一条**，别用 && 串）"),
+            );
+            emit(&mut out, &reply);
+            return;
+        }
         // **实例独属**：别人开的终端，你连往里敲命令都不行
         if let Some(v) = not_mine(req, t) {
             let reply = self.mint(MessageType::Result, &req.from.clone(), req.corr.clone(), v);
@@ -1146,10 +1154,11 @@ impl Term {
 
     fn tool_read(&mut self, req: &Envelope, args: &Value) -> Value {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("read");
+        }
         let Some(t) = self.terms.get_mut(id) else {
-            return json!({"route": null, "effect": "refused", "code": "instance_gone",
-                          "why": format!("没有实例 `{id}`"),
-                          "remedy": "先 open"});
+            return reply::no_such_instance("read", id);
         };
         if let Some(v) = not_mine(req, t) {
             return v;
@@ -1189,14 +1198,16 @@ impl Term {
 
     fn tool_close(&mut self, req: &Envelope, args: &Value) -> Value {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("close");
+        }
         if let Some(t) = self.terms.get(id) {
             if let Some(v) = not_mine(req, t) {
                 return v;
             }
         }
         let Some(mut t) = self.terms.remove(id) else {
-            return json!({"route": null, "effect": "refused", "code": "instance_gone",
-                          "why": format!("没有实例 `{id}`"), "remedy": "status 能看到现在开着哪些"});
+            return reply::no_such_instance("close", id);
         };
         let was_running = t.running.is_some();
         let path = t.cwd.display().to_string();
@@ -1411,6 +1422,18 @@ mod tests {
                 "`{name}` 的声明和执行对不上：{declared:?} vs {enforced:?}"
             );
         }
+    }
+
+    /// **报错里教的名字 == manifest 里报的名字**（同编辑器那条）：
+    /// 手写的那份原来漏了 `help`。
+    #[test]
+    fn the_error_message_lists_exactly_the_tools_we_declare() {
+        let declared: Vec<String> = tools()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let taught: Vec<String> = TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(declared, taught, "报错里教的名字和 manifest 对不上");
     }
 
     fn req_from(who: &str, caller_kind: &str) -> Envelope {

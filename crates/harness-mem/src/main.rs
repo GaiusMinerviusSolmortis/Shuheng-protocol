@@ -489,7 +489,17 @@ fn manifest(args: &Args) -> Value {
     })
 }
 
+/// **本服务的工具名**：一份，不是两份。
+///
+/// `没有名为 X 的工具` 那条消息要靠它教模型"对的名字"；
+/// 而 `tools()` 报进 manifest 的名字也是这几个 —— 两者有一条测试钉着。
+/// （`shutdown` 在里面：它是**宿主专属**的，被拒的时候那句判词会解释为什么。）
+const TOOL_NAMES: [&str; 9] = [
+    "help", "ping", "status", "deposit", "recall", "list", "pin", "forget", "shutdown",
+];
+
 fn tools(args: &Args) -> Vec<Value> {
+    // （名字表在下面 `TOOL_NAMES`；`tools()` 报出去的名字和它有一条测试钉着）
     // **常驻的服务，工具也报 `resident`** —— 闸门要求一个服务里的工具
     // 对 lifecycle 的说法一致（同一个进程不可能有两种寿命）。
     let lc: &'static str = if args.resident.is_some() {
@@ -882,9 +892,9 @@ fn handle_request(
                        "text": help_text(section, args)
                    }})
         }
-        other => json!({"route": null, "effect": "refused", "code": "invalid",
-                        "why": format!("没有名为 `{other}` 的工具"),
-                        "remedy": "调 `help` 看有哪些 —— 别猜名字"}),
+        // **未知工具名：把真有的列出来**（说法统一在 `harness_service::reply`，
+        // 名字从 `TOOL_NAMES` 来 —— `tools()` 里那几个和它有一条测试钉着）
+        other => harness_service::reply::unknown_tool(other, &TOOL_NAMES),
     };
     reply_to(out, ids, args, req, payload);
     After::Keep
@@ -963,6 +973,18 @@ mod tests {
             default_ttl_ms: 0,
             resident: None,
         }
+    }
+
+    /// **报错里教的名字 == `tools()` 报出去的名字**（同编辑器 / 终端那两条）：
+    /// 手写一份名单就是又一张会漂的表。
+    #[test]
+    fn the_error_message_lists_exactly_the_tools_we_declare() {
+        let declared: Vec<String> = tools(&a_args())
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let taught: Vec<String> = TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(declared, taught, "报错里教的名字和 tools() 对不上");
     }
 
     /// **声明的能力和强制的必须逐条对得上**（2026-09-20）。

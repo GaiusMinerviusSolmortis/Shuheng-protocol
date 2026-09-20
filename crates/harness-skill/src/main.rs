@@ -19,6 +19,7 @@ use harness_core::id::IdGen;
 use harness_core::now_ms;
 use harness_service::contract::ToolDecl;
 use harness_service::grant::{self, Grant};
+use harness_service::reply;
 use harness_skill::loader::{page, scan, Catalog};
 use serde_json::{json, Value};
 use std::io::{self, BufReader};
@@ -213,7 +214,11 @@ fn manifest(args: &Args, cat: &Catalog) -> Value {
     })
 }
 
+/// **本服务的工具名**：一份，不是两份（`没有名为 X 的工具` 那条消息要靠它教对的名字）。
+const TOOL_NAMES: [&str; 6] = ["help", "ping", "status", "list", "open", "search"];
+
 fn tools() -> Vec<Value> {
+    // 名字表在 `TOOL_NAMES`；这里报出去的名字和它有一条测试钉着
     vec![
         ToolDecl::new(
             "help",
@@ -473,9 +478,7 @@ fn handle_request(
                        "text": help_text(section, args)
                    }})
         }
-        other => json!({"route": null, "effect": "refused", "code": "invalid",
-                        "why": format!("没有名为 `{other}` 的工具"),
-                        "remedy": "调 `help` 看有哪些 —— 别猜名字"}),
+        other => reply::unknown_tool(other, &TOOL_NAMES),
     };
     reply_to(out, ids, args, req, payload);
 }
@@ -524,6 +527,17 @@ fn help_text(section: &str, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **报错里教的名字 == `tools()` 报出去的名字**（同编辑器 / 终端 / 记忆那三条）。
+    #[test]
+    fn the_error_message_lists_exactly_the_tools_we_declare() {
+        let declared: Vec<String> = tools()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let taught: Vec<String> = TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(declared, taught, "报错里教的名字和 tools() 对不上");
+    }
 
     /// **声明的能力和强制的必须逐条对得上**（2026-09-20）。
     ///

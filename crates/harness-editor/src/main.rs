@@ -24,6 +24,7 @@ use harness_service::domain_lock;
 use harness_service::contract::ToolDecl;
 use harness_service::fence::Fence;
 use harness_service::grant::{self, Grant};
+use harness_service::reply;
 use locks::{Acquire, Holder, LockTable};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -228,6 +229,16 @@ fn required_caps(tool: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+
+/// **本服务的工具名**：一份，不是两份。
+///
+/// 为什么要有这张表：`没有名为 X 的工具` 那条消息**要教模型对的名字** ——
+/// 原来那份名单是手写的（`open | read | edit | revert | close | status | ping`），
+/// 而它**已经漂了**：少了 `help` 和 `verify`（实际九个）。
+/// 现在名单从这张表来，并且有一条测试把它和 manifest 里**真正报出去的名字**钉在一起。
+const TOOL_NAMES: [&str; 9] = [
+    "help", "verify", "open", "read", "edit", "revert", "close", "status", "ping",
+];
 
 fn manifest(args: &Args, fence: &Fence) -> Value {
     json!({
@@ -464,12 +475,11 @@ impl Editor {
     /// **`unknown` 永远不能被当成成功。**
     fn tool_verify(&mut self, args: &Value) -> Value {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("verify");
+        }
         let Some(doc) = self.docs.get(id) else {
-            return json!({
-                "route": null, "effect": "refused", "code": "instance_gone",
-                "why": format!("没有实例 `{id}`"),
-                "remedy": "先 open"
-            });
+            return reply::no_such_instance("verify", id);
         };
         let expect = args.get("expect").cloned().unwrap_or(json!({}));
         let path = doc.path.clone();
@@ -641,16 +651,7 @@ impl Editor {
             "close" => self.tool_close(out, &holder, &args),
             "status" => self.tool_status(),
             other => {
-                let shown = if other.is_empty() { "(空)" } else { other };
-                json!({
-                    "route": null, "effect": "refused",
-                    "code": "invalid",
-                    "why": format!("没有名为 `{shown}` 的工具"),
-                    "expect": {"tool": "open | read | edit | revert | close | status | ping",
-                               "args": {"path": "给 open", "instance_id": "给其余",
-                                        "old": "给 edit", "new": "给 edit", "revision": "给 revert"}},
-                    "remedy": "presence 里的 manifest.help_sections 有章节清单；先从 open 开始"
-                })
+                reply::unknown_tool(other, &TOOL_NAMES)
             }
         };
 
@@ -674,7 +675,9 @@ impl Editor {
             Ok(p) => p,
             Err(e) => {
                 return json!({
-                    "route": null, "effect": "refused", "code": "refused",
+                    // **码跟着错误走**（围栏自己说的）：`path` 空了是 `invalid`，
+                    // 越界才是 `refused` —— 模型按码决定"改参数"还是"别试了"
+                    "route": null, "effect": "refused", "code": e.code,
                     "why": e.why, "remedy": e.remedy
                 })
             }
@@ -805,7 +808,7 @@ impl Editor {
 
     fn tool_read(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
-        if let Err(v) = self.doc_for(id, holder) {
+        if let Err(v) = self.doc_for("read", id, holder) {
             return v;
         }
         let synced = self.sync_if_changed(out, id, holder);
@@ -868,8 +871,8 @@ impl Editor {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
         let old = args.get("old").and_then(Value::as_str).unwrap_or("");
         let new = args.get("new").and_then(Value::as_str).unwrap_or("");
-        if self.doc_for(id, holder).is_err() {
-            return self.doc_for(id, holder).unwrap_err();
+        if self.doc_for("edit", id, holder).is_err() {
+            return self.doc_for("edit", id, holder).unwrap_err();
         }
         // **先跟着磁盘走**：用户改过就把它拉进来（成为一条 revision），
         // 然后照常做替换 —— 安全性来自**内容**（`old` 必须唯一命中），不来自时间戳。
@@ -917,6 +920,19 @@ impl Editor {
 
     fn tool_revert(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        // **先抱怨第一个缺的东西**（顺序有讲究）：`instance_id` 排在前，
+        // 因为**没有实例就谈不上 revision**。原来这里先查 `revision`，
+        // 于是 `revert {}` 回的是"revision 缺失" —— 模型照着补一个 revision 再来一次，
+        // 又撞上"没给 instance_id"：**一次能说清的事拖成两次往返**。
+        if id.is_empty() {
+            return reply::missing_instance_id("revert");
+        }
+        // **实例先于 revision**：实例不在（或者不是你持有的），`revision` 根本无从谈起。
+        // 顺序反了的代价是实打实的：`revert {instance_id:"x-99"}` 会先抱怨
+        // "revision 缺失"，模型补一个 revision 再来 —— 又是两次往返。
+        if let Err(v) = self.doc_for("revert", id, holder) {
+            return v;
+        }
         let to = match args.get("revision").and_then(Value::as_u64) {
             Some(r) => r,
             None => {
@@ -927,9 +943,6 @@ impl Editor {
                 })
             }
         };
-        if let Err(v) = self.doc_for(id, holder) {
-            return v;
-        }
         // 先跟盘（用户的改动成为历史里的一条 revision），再守 `revert` 那条规矩：
         // **不许跨过用户的改动** —— 它是整份覆盖，跨过去就是悄悄把那次改动丢掉。
         self.sync_if_changed(out, id, holder);
@@ -974,14 +987,13 @@ impl Editor {
 
     fn tool_close(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("close");
+        }
         let doc = match self.docs.get(id) {
             Some(d) => d,
             None => {
-                return json!({
-                    "route": null, "effect": "refused", "code": "instance_gone",
-                    "why": format!("没有实例 `{id}`"),
-                    "remedy": "它可能已经被关掉了；重新 open 即可"
-                })
+                return reply::no_such_instance("close", id);
             }
         };
         let path = doc.path.clone();
@@ -1039,14 +1051,19 @@ impl Editor {
     }
 
     /// 拿到文档，并断言**调用方就是持有者**。
-    fn doc_for(&self, id: &str, holder: &Holder) -> Result<&Document, Value> {
-        let doc = self.docs.get(id).ok_or_else(|| {
-            json!({
-                "route": null, "effect": "refused", "code": "instance_gone",
-                "why": format!("没有实例 `{id}`"),
-                "remedy": "先 open，拿到 instance_id 再操作；status 能看到现在开着哪些"
-            })
-        })?;
+    ///
+    /// `tool` 只是用来把话说准（"`read` 没给 `instance_id`"比"这个工具没给"有用）。
+    fn doc_for(&self, tool: &str, id: &str, holder: &Holder) -> Result<&Document, Value> {
+        // **"你没填"和"它没了"是两种错**（§11.5 的码表要模型做不同的事）——
+        // 空的 `instance_id` 原来会渲染成"没有实例 ``"，看起来像坏了。
+        // 说法统一放在 `harness_service::reply` 里，终端那边是同一份。
+        if id.is_empty() {
+            return Err(reply::missing_instance_id(tool));
+        }
+        let doc = self
+            .docs
+            .get(id)
+            .ok_or_else(|| reply::no_such_instance(tool, id))?;
         match self.locks.get(&doc.path) {
             Some(entry) if &entry.holder == holder => Ok(doc),
             Some(entry) => Err(json!({
@@ -1187,6 +1204,34 @@ mod tests {
         let report = harness_service::contract::check_manifest(&manifest(&args, &fence));
         assert!(report.is_ok(), "{:?}", report.errors);
         assert!(report.missing_optional.is_empty(), "{:?}", report.missing_optional);
+    }
+
+    /// **"没有名为 X 的工具"那句话里教的名字，必须就是真报出去的那些**（2026-09-20）。
+    ///
+    /// 这条抓到过真的：手写的那份名单是
+    /// `open | read | edit | revert | close | status | ping` —— 少了 `help` 和 `verify`。
+    /// 换句话说：**模型照着这句"别猜了"的话去学，也学不全**。
+    #[test]
+    fn the_error_message_lists_exactly_the_tools_we_declare() {
+        let fence = Fence::new(&[]).expect("空围栏是合法的");
+        let args = Args {
+            instance: "editor:test".into(),
+            sid: "s-test".into(),
+            kind: "editor".into(),
+            fences: Vec::new(),
+            inline_limit: 50_000,
+        };
+        let declared: Vec<String> = manifest(&args, &fence)["tools"]
+            .as_array()
+            .expect("manifest 里要有 tools")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let taught: Vec<String> = TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            declared, taught,
+            "报错里教的名字和 manifest 对不上：{declared:?} vs {taught:?}"
+        );
     }
 
     #[test]
