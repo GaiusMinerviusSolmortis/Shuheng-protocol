@@ -245,9 +245,20 @@ dependencies = [
 name = "harness-ipc"
 version = "0.1.0"
 dependencies = [
+ "harness-core",
  "serde",
  "serde_json",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "harness-mcp"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "harness-service",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

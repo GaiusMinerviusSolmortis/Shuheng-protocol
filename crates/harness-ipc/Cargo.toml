@@ -13,3 +13,9 @@ windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_System_Console",
 ] }
+
+[dev-dependencies]
+# ⚠️ **只在测试里**依赖 core —— 目的是把"§6.2 第一条：承载全部 7 种消息"
+# 变成一条真的跑得起来的判据（用**真的信封**、真的编解码器、真的套接字）。
+# 产品代码里 ipc 不认识 core，core 也不认识 ipc —— 那条不变量没动。
+harness-core = { path = "../harness-core" }
