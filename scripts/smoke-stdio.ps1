@@ -51,6 +51,20 @@ $inputPath = Join-Path $work 'in.ndjson'
 {"id":"m-c10","ts":0,"type":"result","from":"console","to":"ctrl","corr":"c-999","sid":"s-demo","authority":"user","payload":{"effect":"confirmed","code":null}}
 
 '@ | Set-Content -LiteralPath $inputPath -Encoding utf8
+# **敌意输入**（2026-09-20 加）：结构解不开的、以及深到能炸栈的。
+# 这两条不是"协议要怎么处理"，是**中控不许死** —— 它一死，整场会话没了。
+# 判据在下面第 10–12 条。
+@'
+{"id":"m-c11","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-11","sid":"s-demo","authority":"user","payload":{"op":"list"
+'@ | Add-Content -LiteralPath $inputPath -Encoding utf8
+# 400 层嵌套：serde 默认的递归上限（128）会挡住它 —— 但**得真的验一遍**，
+# 因为"上限存在"和"上限在我们要用的那条路径上生效"是两件事。
+$deep = '{"id":"m-c12","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-12","sid":"s-demo","authority":"user","payload":{"op":"list","deep":' +
+    ('[' * 400) + (']' * 400) + '}}'
+$deep | Add-Content -LiteralPath $inputPath -Encoding utf8
+@'
+{"id":"m-c13","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-13","sid":"s-demo","authority":"user","payload":{"op":"ping"}}
+'@ | Add-Content -LiteralPath $inputPath -Encoding utf8
 
 $outPath = Join-Path $work 'out.ndjson'
 $errPath = Join-Path $work 'err.log'
@@ -123,11 +137,13 @@ Check '7b. 每条投递过的消息都在日志里（模型可见即已记录）
     $records.Count -ge $msgs.Count
 }
 
-Check '7c. 日志里 console 的输入也在（除了解码就失败的那一条）' {
-    # 10 条输入里 m-c7（多一个 oops 字段）在信封层就被挡下，**没有进日志** ——
-    # 它从来没成为"模型可见的东西"，不该污染重放。但它引发的那条 fault 进了日志。
-    # 其余 9 条必须都在，否则重放不出完整对话。
-    ($records | Where-Object { $_.from -eq 'console' }).Count -eq 9
+Check '7c. 日志里 console 的输入也在（除了解码就失败的那三条）' {
+    # 一共 13 行 console 输入，其中三条**不该**进日志：
+    #   m-c7（多一个 `oops` 字段）—— 在信封层被挡下；
+    #   m-c11（半截 JSON）/ m-c12（400 层嵌套）—— 解都解不开。
+    # 它们从来没成为"模型可见的东西"，不该污染重放；但**它们引发的那条 fault 进了日志**。
+    # 其余 10 条必须都在，否则重放不出完整对话。
+    ($records | Where-Object { $_.from -eq 'console' }).Count -eq 10
 }
 
 Check '8. 中控只在自己被请求时回话' {
@@ -174,6 +190,27 @@ Write-Host "== 会话日志 $logPath（$($records.Count) 条）==" -ForegroundCo
 $records | ForEach-Object { Write-Host ("{0,3}  {1,-8} {2} → {3}  {4}" -f $_.seq, $_.type, $_.from, $_.to, $_.payload.code) }
 
 Write-Host ''
+Write-Host '== 敌意输入：中控不许死 ==' -ForegroundColor Cyan
+# 这三条是 2026-09-20 加的。**它们要钉的不是"协议怎么处理脏输入"，是中控别死** ——
+# 它一死，那一场会话连同里面所有实例一起没了（而 GUI/智能体那边只会看到管子断了）。
+#
+# ⚠️ 我第一次验这件事时**只看 stderr，然后得出"它什么都没说"的结论** ——
+# 而中控的交代是走 **stdout 的事件**（`fault` 那条路，设计如此：
+# 解不开的行等于"没人问过的话"，所以是 event 不是 result）。
+# 教训记在这儿：**结论要建立在看对了流上**。
+Check '10. 一行解不开的 JSON：**报出来**（invalid 事件 + 原因），不是静默丢' {
+    $m = $msgs | Where-Object { $_.type -eq 'event' -and $_.payload.code -eq 'invalid' -and $_.payload.why -like '*JSON*' }
+    $m -and $m.payload.remedy
+}
+Check '11. 400 层嵌套：**不许把中控炸掉** —— 它得是 invalid（serde 的递归上限替我们挡了）' {
+    $m = $msgs | Where-Object { $_.type -eq 'event' -and $_.payload.why -like '*recursion*' }
+    $m -and $m.payload.code -eq 'invalid'
+}
+Check '12. 喂完这些脏东西之后**通道还在**：后面那条 ping 照样有回复' {
+    $m = $msgs | Where-Object { $_.type -eq 'result' -and $_.corr -eq 'c-13' }
+    $m -and $m.payload.effect -eq 'confirmed' -and $m.payload.data.pong -eq $true
+}
+
 if ($failures.Count -gt 0) {
     Write-Host "失败 $($failures.Count) 条：" -ForegroundColor Red
     $failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }

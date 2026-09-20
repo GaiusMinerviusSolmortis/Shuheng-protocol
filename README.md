@@ -169,7 +169,7 @@
 crates/harness-core    信封 / NDJSON 编解码 / 会话日志 / 三条不变量
 crates/harness-ctrl    中控：注册表、路由、裁决、落盘屏障
 crates/harness-echo    mock 工具服务（上线自报 manifest）
-scripts/smoke-stdio.ps1   验收脚本，11 条判据
+scripts/smoke-stdio.ps1   验收脚本 + 敌意输入，14 条判据
 ```
 
 跑法：`pwsh -File scripts/smoke-stdio.ps1`（会自己 build，再拿手写的 NDJSON
@@ -1237,7 +1237,7 @@ scripts/smoke-editor.ps1          验收：第 17/18 条（edit 落了、read �
    报到后照序放行；超宽限（`--startup-grace-ms`，默认 2s）逐个拒掉。
 
 **两条实现纪律都是踩出来的**：① 队列里放**要投的那一行**、不放信封 —— 放信封、放行时重跑路由，
-会让**同一条请求记两遍日志**（`smoke-stdio` 的"console 输入 9 条"当场变成 13 条）；
+会让**同一条请求记两遍日志**（`smoke-stdio` 的"console 输入 10 条"当场变成 14 条）；
 ② **"要不要先落盘"必须在投递那一刻算** —— 排队时算必然是"读不到声明"，于是连 `read` 都保守落盘。
 
 #### ✅ 2026-09-20：**背压** —— 输出比消费快得多的时候谁去扛
@@ -1524,7 +1524,7 @@ pub fn assert_transport_agnostic() -> Result<(), String> {
 
 ```powershell
 cargo test                                       # 238 个测试（单元 + doc-test，由 check-docs 对账）
-pwsh -File scripts/smoke-stdio.ps1               # 阶段 1 验收（11 条判据）
+pwsh -File scripts/smoke-stdio.ps1               # 阶段 1 验收 + 敌意输入（14 条判据）
 pwsh -File scripts/smoke-editor.ps1              # 阶段 2 验收（18 条判据）
 pwsh -File scripts/smoke-term.ps1                # 阶段 2 验收（21 条判据）
 pwsh -File scripts/smoke-memory.ps1              # 阶段 3 验收（14 条判据）
