@@ -104,6 +104,7 @@ Check '4. **声明跟着事实走**：报 `filesystem: fence-args` 的，围栏�
 Check '5. **`not_implemented` 必须真的有那个字段**（说过要写就得写），而且里面不许有空话' {
     # `harness-mem` 曾经漏了它 —— 而 README 里写着"这一层没做的，也写在 not_implemented 里"
     $need = @{
+        'editor:1' = @('project_rollback')
         'term:1'   = @('send', 'screen')
         'mem:1'    = @('recall', 'anchors')
         'mcp:1'    = @('reconnect', 'cancel', 'rename')
@@ -132,6 +133,25 @@ $gen = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'gen-manifest-example.ps
 $genOk = $LASTEXITCODE -eq 0
 Check '7. 规范 §11.6 那份示例 == 活着的编辑器自报的那一份（逐字节）' { $genOk }
 if (-not $genOk) { $gen | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray } }
+# **8. "拉不拉子进程"这件事也要跟着事实走**（2026-09-20）。
+#
+# 为什么这条能机器判：`executables: none` 说的就是"它（和它拉起的进程）
+# 看不见可执行文件"。而"它拉不拉进程"在源码里是**数得出来**的：
+# `std::process::Command`。两句一对，漂了就是假话 ——
+# 而这一面原来谁都没查（第 4 条只查了 `filesystem`）。
+#
+# 起因：给编辑器加 L2 回滚时它开始跑 `git`，而它的沙箱声明还写着 `none`。
+$spawners = @()
+foreach ($svc in $manifests.Keys) {
+    if ($manifests[$svc].sandbox.executables -ne 'none') { continue }
+    $crate = 'harness-' + ($svc -replace ':.*$', '')
+    $src = Join-Path $root "crates/$crate/src"
+    if (-not (Test-Path $src)) { $spawners += "$svc（找不到源码目录 $src）"; continue }
+    $hits = @(Get-ChildItem $src -Recurse -Filter *.rs | Select-String -Pattern 'Command::new' -SimpleMatch)
+    if ($hits.Count -gt 0) { $spawners += "$svc：报了 executables:none，而 $crate 里有 $($hits.Count) 处 Command::new" }
+}
+Check '8. 报 `executables: none` 的服务，源码里**不许有 `Command::new`**' { $spawners.Count -eq 0 }
+foreach ($s in $spawners) { Write-Host "  $s" -ForegroundColor Yellow }
 
 Write-Host ''
 Write-Host '== 六个服务自报的沙箱五面（这张表是从活服务里读出来的）==' -ForegroundColor Cyan

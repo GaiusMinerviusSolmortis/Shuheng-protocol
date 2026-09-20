@@ -12,6 +12,7 @@
 //! 也就是 §7 说的那个 capability 由 `令牌 + scope` 两个数据合起来表达。
 
 mod doc;
+mod git;
 mod locks;
 
 use doc::{Document, EditError};
@@ -85,6 +86,9 @@ struct Editor {
     locks: LockTable,
     docs: BTreeMap<String, Document>,
     next_doc: u64,
+    /// 本会话建了几个 checkpoint —— 只用来给 ref 起名字（`refs/agent/<sid>/<n>`）。
+    /// **不落盘**：ref 本身在 git 里，重启之后从 ref 名字上就能数出来。
+    cp_seq: u32,
 }
 
 fn main() {
@@ -97,6 +101,7 @@ fn main() {
         locks: LockTable::default(),
         docs: BTreeMap::new(),
         next_doc: 0,
+        cp_seq: 0,
         args,
     };
     if ed.fence.is_empty() {
@@ -217,13 +222,36 @@ const HELP: &[(&str, &str, &str)] = &[
          · `refused` + \"需要的能力你没有\" —— 中控没给你这个能力，找它要，别重试。\n\
          · `refused` + \"文件不存在\" —— open 不会凭空造文件，要新建就传 `create: true`。",
     ),
+    (
+        "git",
+        "两层回滚：L1 与 git（L2）",
+        "**两层，用途不同**（§5.24）：\n\
+         · **L1（不用 git、永远可用）**：`edit` 返回的 `revision` + `revert`。\n\
+           它管的是**一次编辑**，粒度到那一份文件，靠的是实例自己的历史。\n\
+         · **L2（要 git 仓库）**：`checkpoint` 给**整条托管路径**存一个点，\n\
+           `restore` 把**手里这个文件**退回那个点。\n\
+         \n\
+         `checkpoint` 是**只读工作区和索引**的：它跑 `git stash create`，\n\
+         然后把那个提交挂到一个**私有 ref**（`refs/agent/<会话>/<n>`）上 ——\n\
+         不写你的 stash 列表、不动你的索引、不碰你的工作区。\n\
+         `checkpoints` 列出本会话存过的那几个点。\n\
+         \n\
+         ⚠️ **`restore` 是整份覆盖**，所以它和 `revert` 守**同一条规矩**：\n\
+         这个文件在你存点之后被**用户**改过 ⇒ 拒绝（跨过去就等于把用户那次改动丢了）。\n\
+         真要退，得让用户来定。\n\
+         \n\
+         ⚠️ **`refused` + 不是 git 仓库 / 没有第一个提交** —— 那不是故障：\n\
+         L2 需要 git，而 L1 不需要。这两种时候就用 L1。\n\
+         ⚠️ 这一版**不做**「把整个项目退回某个点」：那一步会覆盖用户在同一个仓库里的\n\
+         全部改动，而写锁**挡不住用户的 IDE**（不可行的那一半写在规范里）。",
+    ),
 ];
 
 /// 每个工具需要什么能力 —— **工具自己的接口的一部分**，所以写在这儿。
 fn required_caps(tool: &str) -> &'static [&'static str] {
     match tool {
-        "open" | "edit" | "revert" => &["fs.write"],
-        "read" => &["fs.read"],
+        "open" | "edit" | "revert" | "checkpoint" | "restore" => &["fs.write"],
+        "read" | "checkpoints" => &["fs.read"],
         "close" | "status" | "ping" | "help" => &[],
         "verify" => &["fs.read"],
         _ => &[],
@@ -236,8 +264,9 @@ fn required_caps(tool: &str) -> &'static [&'static str] {
 /// 原来那份名单是手写的（`open | read | edit | revert | close | status | ping`），
 /// 而它**已经漂了**：少了 `help` 和 `verify`（实际九个）。
 /// 现在名单从这张表来，并且有一条测试把它和 manifest 里**真正报出去的名字**钉在一起。
-const TOOL_NAMES: [&str; 9] = [
-    "help", "verify", "open", "read", "edit", "revert", "close", "status", "ping",
+const TOOL_NAMES: [&str; 12] = [
+    "help", "verify", "open", "read", "edit", "revert", "checkpoint", "checkpoints", "restore",
+    "close", "status", "ping",
 ];
 
 fn manifest(args: &Args, fence: &Fence) -> Value {
@@ -266,7 +295,8 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
             {"id": "overview", "title": "概览"},
             {"id": "lock",     "title": "锁与写互斥"},
             {"id": "edit",     "title": "edit 的参数与回滚"},
-            {"id": "errors",   "title": "错误码与补救"}
+            {"id": "errors",   "title": "错误码与补救"},
+            {"id": "git",      "title": "两层回滚：L1 与 git（L2）"}
         ],
         // 同上：报规范化之后的围栏
         "fence": if fence.is_empty() {
@@ -288,16 +318,27 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
             "filesystem": if fence.is_empty() { "none" } else { "fence-args" },
             "network": "none",
             "identity": "same-user",
-            "executables": "none",
+            // ⚠️ **2026-09-20 改过**：加了 L2 之后它会跑 `git`，
+            // 于是再报 `none` 就是假话（"它和它拉起的进程看不见可执行文件"）。
+            // 这一面有判据钉着：报 `none` 的，源码里不许有 `Command::new`。
+            "executables": "inherit",
             "resources": "none"
         },
         "sandbox_note": if fence.is_empty() {
             "**这次它没有托管任何路径**：`filesystem: none` 说的是「没有可围的东西」——\
              不是「没管住」。真有路径要读写时，会话必须先托管一条。"
         } else {
-            "**围栏是真的，但它只围「这个服务自己」**：它不拉子进程，\
-             所以「看得见的只有托管那条路径」成立。⚠️ 这不是内核级隔离\
+            "**围栏是真的，但它只围「这个服务自己」**：它**只拉一个 `git`**\
+             （L2 那三个工具用），所以 `executables: inherit` —— 环境里的可执行它看得见，\
+             但它**不接任何命令参数**，不会去跑别的程序。⚠️ 这不是内核级隔离\
              （那是 `filesystem: os`，没人做到）——它靠的是**每次读写都自己检查一遍**。"
+        },
+        // **没做的那一半要说出来**（别让人以为"项目级回滚"有了）
+        "not_implemented": {
+            "project_rollback": "**把整个项目退回某个点**这一半没做：那一步会覆盖用户在\
+                                 同一个仓库里的全部改动，而写锁挡不住用户的 IDE 和命令行\
+                                 （§5.24）。现在能做的：`checkpoint` 存点、`restore` 退\
+                                 **手里这一个文件**，而且跨过用户改动就拒。"
         },
         // **参数表与结果形状都是服务自己的义务**（规范 §11.1 的 C 组）。
         // 信封那一半（effect / code / route / why / remedy …）由
@@ -425,6 +466,53 @@ fn tools() -> Vec<Value> {
         .returns(json!({
             "revision": {"type": "integer"},
             "restored_from": {"type": "integer"},
+        }))
+        .requires_on(&["confirmed"], &["revision"])
+        .lifecycle("per_session")
+        .to_json(),
+        ToolDecl::new(
+            "checkpoint",
+            "在 git 里给**整条托管路径**存一个点（§5.24 的 L2）。\
+             只读工作区与索引，改的只是一个私有 ref —— 不碰你的活。",
+            json!({"type": "object", "additionalProperties": false,
+                   "properties": {"label": {"type": "string",
+                                            "description": "一句话说明这个点是什么（可选）"}}}),
+        )
+        .caps(&["fs.write"])
+        .idempotent()
+        .returns(json!({
+            "checkpoint": {"type": "string"},
+            "hash": {"type": "string"},
+        }))
+        .requires_on(&["confirmed"], &["checkpoint"])
+        .lifecycle("per_session")
+        .to_json(),
+        ToolDecl::new(
+            "checkpoints",
+            "列**本会话**在 git 里存过的那些点。",
+            json!({"type": "object", "additionalProperties": false, "properties": {}}),
+        )
+        .read_only()
+        .caps(&["fs.read"])
+        .idempotent()
+        .returns(json!({"checkpoints": {"type": "array"}}))
+        .requires_on(&["confirmed"], &["checkpoints"])
+        .lifecycle("per_session")
+        .to_json(),
+        ToolDecl::new(
+            "restore",
+            "把**手里这个文件**退回某个 checkpoint 时的内容。\
+             ⚠️ 跨过用户的改动就拒绝（和 revert 同一条守卫）。",
+            json!({"type": "object", "required": ["instance_id", "checkpoint"], "additionalProperties": false,
+                   "properties": {"instance_id": {"type": "string"},
+                                  "checkpoint": {"type": "string",
+                                                 "description": "checkpoints 报的那个 ref 名"}}}),
+        )
+        .caps(&["fs.write"])
+        .destructive()
+        .returns(json!({
+            "revision": {"type": "integer"},
+            "restored_from": {"type": "string"},
         }))
         .requires_on(&["confirmed"], &["revision"])
         .lifecycle("per_session")
@@ -648,6 +736,9 @@ impl Editor {
             "read" => self.tool_read(out, &holder, &args),
             "edit" => self.tool_edit(out, &holder, &args),
             "revert" => self.tool_revert(out, &holder, &args),
+            "checkpoint" => self.tool_checkpoint(&args),
+            "checkpoints" => self.tool_checkpoints(),
+            "restore" => self.tool_restore(out, &holder, &args),
             "close" => self.tool_close(out, &holder, &args),
             "status" => self.tool_status(),
             other => {
@@ -919,6 +1010,7 @@ impl Editor {
     }
 
     fn tool_revert(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {
+        // （L2 那三个工具在下面：`checkpoint` / `checkpoints` / `restore`）
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
         // **先抱怨第一个缺的东西**（顺序有讲究）：`instance_id` 排在前，
         // 因为**没有实例就谈不上 revision**。原来这里先查 `revision`，
@@ -983,6 +1075,168 @@ impl Editor {
         );
         emit(out, &ev);
         json!({"route": null, "effect": "confirmed", "code": null, "revision": revision, "restored_from": was})
+    }
+
+    // ---- L2：git 那一半（§5.24）-----------------------------------------
+    //
+    // 三条纪律都写在 `git.rs` 的文件头里，这里只重复最要紧的那一条：
+    // **建 checkpoint 一个字都不碰工作区和索引**（`git stash create` + 私有 ref）。
+    // 而**恢复**是唯一会写工作区的一步 —— 它走的是和 `revert` 同一条守卫。
+
+    /// 托管路径所在的那个 git 仓库根（不是仓库就返回 `NotARepo`）。
+    fn repo_root(&self) -> Result<PathBuf, git::GitError> {
+        let primary = self
+            .fence
+            .roots()
+            .first()
+            .cloned()
+            .ok_or(git::GitError::NotARepo)?;
+        git::toplevel(&primary)
+    }
+
+    /// **把 git 的错误翻译成一次拒绝或一次失败**（说法只有这一处 —— 三个工具共用）。
+    fn git_refuse(tool: &str, e: &git::GitError) -> Value {
+        let (why, remedy) = match e {
+            git::GitError::NotARepo => (
+                "这条托管路径**不在 git 仓库里** —— L2 是用 git 存点的".to_string(),
+                "要么把托管路径指到一个 git 仓库（或它里面），要么就用 L1：\
+                 `edit` 返回的 `revision` + `revert`，它不需要 git、也不需要仓库".to_string(),
+            ),
+            git::GitError::NoGit(msg) => (
+                format!("这台机器上跑不了 `git`：{msg}"),
+                "装一个 git（或者把它放进 PATH），再试；在那之前 L1 照常可用".to_string(),
+            ),
+            git::GitError::NoCommitYet => (
+                "这个仓库**还没有第一个提交** —— `git stash create` 这时候存不了".to_string(),
+                "先做一次提交（哪怕是空提交：`git commit --allow-empty -m init`），\
+                 然后 `checkpoint` 就能用了；在那之前 L1 照常可用".to_string(),
+            ),
+            git::GitError::NoChanges => (
+                "工作区**没有改动** —— 没有东西可存".to_string(),
+                "先改点什么再存；或者你本来就想存『现在这样』，那它已经在版本库里了".to_string(),
+            ),
+            git::GitError::Failed { what, stderr } => (
+                format!("`{what}` 失败了：{stderr}"),
+                "这条是 git 的原话，照着它改；**别原样重试**——它多半不会变".to_string(),
+            ),
+        };
+        json!({
+            "route": null, "effect": "refused", "code": e.code(),
+            "why": why, "remedy": remedy,
+            "tool": tool
+        })
+    }
+
+    fn tool_checkpoint(&mut self, args: &Value) -> Value {
+        let root = match self.repo_root() {
+            Ok(r) => r,
+            Err(e) => return Self::git_refuse("checkpoint", &e),
+        };
+        self.cp_seq += 1;
+        match git::checkpoint(&root, &self.args.sid, self.cp_seq) {
+            Ok(cp) => json!({
+                "route": null, "effect": "confirmed", "code": null,
+                "checkpoint": cp.name,
+                "hash": cp.hash,
+                "label": args.get("label").and_then(Value::as_str).unwrap_or(""),
+                "repo": root.display().to_string(),
+                "note": "工作区和索引**一个字都没动** —— 它只往 refs/agent/<会话>/ 里\
+                         写了一个私有 ref（§5.24）"
+            }),
+            Err(e) => Self::git_refuse("checkpoint", &e),
+        }
+    }
+
+    fn tool_checkpoints(&self) -> Value {
+        let root = match self.repo_root() {
+            Ok(r) => r,
+            Err(e) => return Self::git_refuse("checkpoints", &e),
+        };
+        match git::list(&root, &self.args.sid) {
+            Ok(list) => json!({
+                "route": null, "effect": "confirmed", "code": null,
+                "checkpoints": list
+                    .iter()
+                    .map(|c| json!({"checkpoint": c.name, "hash": c.hash}))
+                    .collect::<Vec<_>>(),
+                "repo": root.display().to_string()
+            }),
+            Err(e) => Self::git_refuse("checkpoints", &e),
+        }
+    }
+
+    fn tool_restore(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {
+        let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("restore");
+        }
+        if let Err(v) = self.doc_for("restore", id, holder) {
+            return v;
+        }
+        let rev = args.get("checkpoint").and_then(Value::as_str).unwrap_or("");
+        if rev.is_empty() {
+            return reply::empty_argument("restore", "checkpoint", "`checkpoints` 报的那个 ref 名");
+        }
+        let root = match self.repo_root() {
+            Ok(r) => r,
+            Err(e) => return Self::git_refuse("restore", &e),
+        };
+        // **同一条守卫，和 `revert` 共用**：用户改过就拒 —— `restore` 也是整份覆盖。
+        let synced = self.sync_if_changed(out, id, holder);
+        if let Some((_, why)) = synced {
+            return json!({
+                "route": null, "effect": "refused", "code": "refused",
+                "why": format!("这个文件在你保存那个点之后**被用户改过**：{why}"),
+                "remedy": "先 `read` 看一眼用户改了什么。要保留它，就别退到那个点；\
+                           一定要退，就让用户来定（这条和 `revert` 是同一条规矩）"
+            });
+        }
+        let path = self.docs.get(id).expect("刚查过").path.clone();
+        let rel = match path.strip_prefix(&root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => {
+                return json!({
+                    "route": null, "effect": "refused", "code": "refused",
+                    "why": format!("`{}` 不在仓库 `{}` 里面 —— 那个 checkpoint 里没有它",
+                                   path.display(), root.display()),
+                    "remedy": "只有仓库里的文件能从这个点恢复；这个文件在仓库外面"
+                })
+            }
+        };
+        let text = match git::read_at(&root, rev, &rel) {
+            Ok(t) => t,
+            Err(e) => return Self::git_refuse("restore", &e),
+        };
+        let doc = self.docs.get_mut(id).expect("刚查过");
+        let was = doc.adopt(text);
+        let content = doc.content().to_string();
+        let revision = doc.revision();
+        if let Err(e) = write_atomic(&path, &content) {
+            let _ = self.docs.get_mut(id).expect("刚查过").revert(was);
+            return json!({
+                "route": null, "effect": "refused", "code": "invalid",
+                "why": format!("写 `{}` 失败：{e}", path.display()),
+                "remedy": "磁盘没变，检查文件是不是被独占"
+            });
+        }
+        self.docs.get_mut(id).expect("刚查过").note_disk();
+        let ev = self.mint(
+            MessageType::Event,
+            "ctrl",
+            None,
+            Authority::Observe,
+            InstanceEvent::state(id, "held")
+                .with_path(path.display().to_string())
+                .with_detail(json!({"last_op": "restore", "revision": revision, "from": rev}))
+                .to_payload(),
+        );
+        emit(out, &ev);
+        json!({
+            "route": null, "effect": "confirmed", "code": null,
+            "revision": revision,
+            "restored_from": rev,
+            "bytes": content.len()
+        })
     }
 
     fn tool_close(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {

@@ -32,6 +32,10 @@
     {
       "id": "errors",
       "title": "错误码与补救"
+    },
+    {
+      "id": "git",
+      "title": "两层回滚：L1 与 git（L2）"
     }
   ],
   "id": "editor",
@@ -45,6 +49,9 @@
     "force_close"
   ],
   "node_kind": "editor",
+  "not_implemented": {
+    "project_rollback": "**把整个项目退回某个点**这一半没做：那一步会覆盖用户在同一个仓库里的全部改动，而写锁挡不住用户的 IDE 和命令行（§5.24）。现在能做的：`checkpoint` 存点、`restore` 退**手里这一个文件**，而且跨过用户改动就拒。"
+  },
   "owns": {
     "domain": "fs",
     "exclusive_per": "fence"
@@ -55,13 +62,13 @@
     "macos"
   ],
   "sandbox": {
-    "executables": "none",
+    "executables": "inherit",
     "filesystem": "fence-args",
     "identity": "same-user",
     "network": "none",
     "resources": "none"
   },
-  "sandbox_note": "**围栏是真的，但它只围「这个服务自己」**：它不拉子进程，所以「看得见的只有托管那条路径」成立。⚠️ 这不是内核级隔离（那是 `filesystem: os`，没人做到）——它靠的是**每次读写都自己检查一遍**。",
+  "sandbox_note": "**围栏是真的，但它只围「这个服务自己」**：它**只拉一个 `git`**（L2 那三个工具用），所以 `executables: inherit` —— 环境里的可执行它看得见，但它**不接任何命令参数**，不会去跑别的程序。⚠️ 这不是内核级隔离（那是 `filesystem: os`，没人做到）——它靠的是**每次读写都自己检查一遍**。",
   "state_vocabulary": [
     "idle",
     "held",
@@ -892,6 +899,383 @@
           },
           "restored_from": {
             "type": "integer"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "capabilities": [
+        "fs.write"
+      ],
+      "description": "在 git 里给**整条托管路径**存一个点（§5.24 的 L2）。只读工作区与索引，改的只是一个私有 ref —— 不碰你的活。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "description": "一句话说明这个点是什么（可选）",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "checkpoint",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "checkpoint"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "hash": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "capabilities": [
+        "fs.read"
+      ],
+      "description": "列**本会话**在 git 里存过的那些点。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "checkpoints",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "checkpoints"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "checkpoints": {
+            "type": "array"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "route": {
+            "enum": [
+              null,
+              "accessibility",
+              "synthetic_events",
+              "global_input",
+              "dom",
+              "trusted_input",
+              "process"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect",
+          "code",
+          "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "capabilities": [
+        "fs.write"
+      ],
+      "description": "把**手里这个文件**退回某个 checkpoint 时的内容。⚠️ 跨过用户的改动就拒绝（和 revert 同一条守卫）。",
+      "health": "ping",
+      "idle_timeout": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint": {
+            "description": "checkpoints 报的那个 ref 名",
+            "type": "string"
+          },
+          "instance_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "instance_id",
+          "checkpoint"
+        ],
+        "type": "object"
+      },
+      "lifecycle": "per_session",
+      "name": "restore",
+      "output_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "effect": {
+                  "enum": [
+                    "confirmed"
+                  ]
+                }
+              },
+              "required": [
+                "effect"
+              ]
+            },
+            "then": {
+              "required": [
+                "revision"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "caller_kind": {
+            "type": "string"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "object"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "degraded_reason": {
+            "type": "string"
+          },
+          "effect": {
+            "enum": [
+              "confirmed",
+              "partial",
+              "unverifiable",
+              "suspected_noop",
+              "refused"
+            ]
+          },
+          "expect": {
+            "type": [
+              "object",
+              "string"
+            ]
+          },
+          "granted": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "output": {
+            "type": "string"
+          },
+          "remedy": {
+            "type": "string"
+          },
+          "restored_from": {
+            "type": "string"
           },
           "revision": {
             "type": "integer"

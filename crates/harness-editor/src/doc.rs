@@ -238,6 +238,23 @@ impl Document {
         Ok(())
     }
 
+    /// **整份换成外面给的这一份**（不是替换某一段）。
+    ///
+    /// 和 `edit` 的区别正是安全性来源的区别：`edit` 靠**内容命中**（`old` 恰好一次）
+    /// 保证不误伤；这条**没有那个判据**，所以它要窄得多 ——
+    /// 现在只有一个调用者：L2 的 `restore`，而它进门之前走的是
+    /// `sync_if_changed` + "跨过用户的改动就拒"那道守卫。
+    ///
+    /// 返回**换成这份之前**的 revision（就是 `revert` 的钥匙）。
+    pub fn adopt(&mut self, text: String) -> u64 {
+        let before = self.revision();
+        self.snapshots.push(Snap {
+            text,
+            external: false,
+        });
+        before
+    }
+
     pub fn bytes(&self) -> usize {
         self.content().len()
     }
