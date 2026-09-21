@@ -101,6 +101,32 @@ foreach ($s in $proseStale) { Say $s }
 
 Write-Host ''
 Write-Host '== 测试总数（跑出来的）==' -ForegroundColor Cyan
+# **判据脚本自己的坑：`-like` 里的通配符**（2026-09-20 加，因为我自己踩了三次）。
+#
+# PowerShell 的 `-like` 用的是**通配符**：`[abc]` 是**字符类**、反引号是转义符。
+# 于是 `-like '*[调用]*'` 并不是在找"`[调用]` 这四个字符"，
+# 而是在找**含 调 或 用 的字** —— 判据因此**假红**（代码明明是对的），
+# 而且它红得毫无规律（取决于模型那句话里有没有那几个字）。
+# 规则：`-like` 的模式里不许出现 `[` 或反引号；要精确匹配就用 `.Contains`/`.StartsWith`。
+$wildcardTraps = @()
+foreach ($f in (Get-ChildItem (Join-Path $root 'scripts') -Filter '*.ps1')) {
+    if ($f.Name -eq 'check-docs.ps1' -or $f.Name -eq 'check-clippy.ps1') { continue }
+    foreach ($hit in (Select-String -Path $f.FullName -Pattern '-like')) {
+        $line = $hit.Line
+        # 注释行跳过：里面常常**引用**那个错误写法当反面教材
+        # （这条检查自己第一版就因此报了假红）。
+        if ($line.TrimStart().StartsWith('#')) { continue }
+        # 只看 `-like` 右边那个模式里有没有方括号/反引号（下标访问 `$x[0]` 不算）
+        if ($line -match "-like\s+['""][^'""]*[\[``]") {
+            $wildcardTraps += "$($f.Name):$($hit.LineNumber)：$($line.Trim())"
+        }
+    }
+}
+Check '所有脚本里 `-like` 的模式都不带通配符陷阱（`[` / 反引号）' { $wildcardTraps.Count -eq 0 }
+foreach ($t in $wildcardTraps) { Say $t }
+
+Write-Host ''
+Write-Host '== 测试总数（跑出来的）==' -ForegroundColor Cyan
 Write-Host '  正在跑 cargo test ...' -ForegroundColor DarkGray
 $out = & cargo test --manifest-path (Join-Path $root 'Cargo.toml') --no-fail-fast 2>&1
 if ($LASTEXITCODE -ne 0) { $failures.Add('cargo test 自己没过') | Out-Null }

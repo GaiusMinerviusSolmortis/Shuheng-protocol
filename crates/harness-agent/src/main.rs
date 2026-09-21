@@ -463,6 +463,15 @@ struct Agent {
     hooks: TraceHooks,
     model: Box<dyn Model>,
     pending: HashMap<String, Pending>,
+    /// **扣着的敕令**：手上有未决调用时收到的那些。
+    ///
+    /// 为什么必须扣着（2026-09-20，整机"服务被杀"那条验收抓到）：
+    /// provider 的硬要求是 **assistant 的 `tool_calls` 之后必须紧跟它的 `tool` 消息**。
+    /// 而敕令是**别人主动塞进来的**（中控发现服务下线时就会来一条），
+    /// 它一到就往历史里追，正好插在"调用"和"结果"中间 —— 下一个请求直接被拒：
+    /// `insufficient tool messages following tool_calls message`。
+    /// **一条敕令能让整条会话报废**，而它看起来只是"多了一句话"。
+    held_injects: Vec<String>,
     /// 上一次工具结果的 payload —— 让 mock 脚本能像真模型那样
     /// **看着结果决定下一步**（`"$last.instance_id"` 这种模板就靠它）
     last_payload: Option<Value>,
@@ -504,6 +513,7 @@ fn main() {
         hooks: TraceHooks::default(),
         model: build_model(&args),
         pending: HashMap::new(),
+        held_injects: Vec::new(),
         last_payload: None,
         busy: false,
         inbox: std::collections::VecDeque::new(),
@@ -868,6 +878,16 @@ impl Agent {
         }
     }
 
+    /// **未决调用清空之后，把扣着的敕令按原顺序追进历史**（见 `held_injects`）。
+    fn flush_held_injects(&mut self, out: &mut impl Write) {
+        if !self.pending.is_empty() || self.held_injects.is_empty() {
+            return;
+        }
+        for text in std::mem::take(&mut self.held_injects) {
+            self.note_item(out, Item::new(ItemKind::Injected, text));
+        }
+    }
+
     /// 启动时同步地问一次中控："我上次看到过什么？"
     ///
     /// 这是**主循环之前**的一段小循环：发出去、然后等那条配对的结果回来
@@ -959,6 +979,7 @@ impl Agent {
                         let item = Item::tool_result_with(&p.call.tool, text, &p.call_id);
                         self.note_item(out, item);
                         self.last_payload = Some(env.payload.clone());
+                        self.flush_held_injects(out);
                     } else {
                         // 孤儿结果 —— 记进上下文会污染它，但不说是更糟
                         eprintln!("[agent] 收到一个对不上的结果（corr={corr}）");
@@ -974,9 +995,18 @@ impl Agent {
                     .map(str::to_string)
                     .unwrap_or_else(|| env.payload.to_string());
                 eprintln!("[agent] 收到敕令：{text}");
-                let item = Item::new(ItemKind::Injected, text);
-                self.note_item(out, item);
                 self.trace.injects += 1;
+                if self.pending.is_empty() {
+                    let item = Item::new(ItemKind::Injected, text);
+                    self.note_item(out, item);
+                } else {
+                    // **手上有未决调用 ⇒ 先扣着**：此刻追进去会插在"调用"和"结果"中间，
+                    // 而 provider 要求那两条紧挨着（见 `held_injects` 那段）。
+                    // 等这一批结果都落地，`flush_held_injects` 再按原顺序追。
+                    eprintln!("[agent] 手上还有 {} 个未决调用 —— 这条敕令先扣着，等结果落地再追",
+                              self.pending.len());
+                    self.held_injects.push(text);
+                }
             }
             // **兜底：带 corr 的 `event`**。
             //
@@ -996,6 +1026,7 @@ impl Agent {
                 let item = Item::tool_result_with(&p.call.tool, text, &p.call_id);
                 self.note_item(out, item);
                 self.last_payload = Some(env.payload.clone());
+                self.flush_held_injects(out);
             }
             _ => {}
         }

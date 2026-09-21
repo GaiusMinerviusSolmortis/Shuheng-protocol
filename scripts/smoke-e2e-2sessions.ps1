@@ -151,9 +151,12 @@ Check '3b. 会话一的历史里**没有我们自己拼的记号**（模型看�
     # 这条钉的是一个**把自己教坏**的 bug（2026-09-20）：智能体原来会给每次调用
     # 额外记一条 assistant 文本 `[调用] name(args)`，那条文本会被回放给模型当上文 ——
     # 于是模型学到"动手的方式是写这行文本"，第三轮就真的只写了文本、没发出调用。
+    # ⚠️ **别写 `-like '*[调用]*'`** —— PowerShell 的通配符里 `[...]` 是**字符类**，
+    # 那句其实在找"含 调 或 用 的字"，于是任何提到"用编辑器"的结论都会被误判成红
+    # （这条判据因此假红过一次，而代码早就修好了）。要用 `.Contains`。
     $mine = @($one.records |
         Where-Object { $_.payload.kind -eq 'model_item' -and $_.payload.item.kind -eq 'assistant' } |
-        Where-Object { $_.payload.item.text -like '*[调用]*' })
+        Where-Object { ([string]$_.payload.item.text).Contains('[调用]') })
     $mine.Count -eq 0
 }
 
