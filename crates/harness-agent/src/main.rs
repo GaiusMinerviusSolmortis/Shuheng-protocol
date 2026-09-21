@@ -1091,16 +1091,15 @@ impl Agent {
                 return;
             }
 
-            // 助手说"我要调这些" —— 进历史（下一轮模型才看得见自己调过什么）
-            let rendered = reply
-                .calls
-                .iter()
-                .map(|c| format!("{}({})", c.tool, c.args))
-                .collect::<Vec<_>>()
-                .join("; ");
-            self.note_item(out, Item::assistant(format!("[调用] {rendered}")));
-
             for call in reply.calls {
+                // ⚠️ **这里原来先写了一条 `assistant("[调用] name(args)")`** —— 理由是
+                // "下一轮模型才看得见自己调过什么"。那是**多余的**（模型从下面那些
+                // `tool_call` 条目里就能看见自己的调用，适配器会把它们渲染成
+                // 带 `tool_calls` 的 assistant 消息），而且**有害**：
+                // 那条文本会被**回放给模型当上文**，于是模型学到"动手的方式是写
+                // `[调用] name(args)` 这行文本" —— 实跑里它第三轮就真的只写了文本、
+                // 没有发出调用（记忆那条组合验收抓到的）。
+                // **教训**：拼给模型看的字，模型会照着学。
                 let corr = self.ids.next_corr();
                 // provider 给了 id 就用它（真模型必须原样带回去）；
                 // mock 不给，就用我们的 corr 当 id —— 两者都能配对。

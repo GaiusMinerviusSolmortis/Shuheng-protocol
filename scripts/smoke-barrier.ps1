@@ -139,9 +139,20 @@ Check '3. 每一条 barrier 都有结果收尾（不许挂在那儿没人回）'
 }
 Check '4. **顺序对**：每一次模型开口之前，都先落了盘' {
     $bseq = @($barriers | ForEach-Object { $_.seq })
-    $aseq = @($assistantItems | ForEach-Object { $_.seq })
-    ($bseq.Count -eq 2) -and ($aseq.Count -eq 2) -and `
-        ($bseq[0] -lt $aseq[0]) -and ($bseq[1] -lt $aseq[1])
+    # ⚠️ **这里原来数的是"assistant 条目 == 2"** —— 而那个 2 里有一条是
+    # 智能体**自己拼的** `[调用] name(args)` 文本（2026-09-20 删掉了：
+    # 那段文本会被回放给模型，模型会学着只写文本、不发调用）。
+    # 删掉之后"模型开口"的证据只剩工具轮里的 `tool_call` 条目 + 最后一轮的
+    # 纯文本 —— 所以判据改成按**任一模型开口的证据**（assistant 或 tool_call）配对，
+    # 它钉的是**顺序**（屏障在前），不是"某一类条目有几个"。
+    $opened = @($records | Where-Object {
+        $_.payload.kind -eq 'model_item' -and
+        ($_.payload.item.kind -eq 'assistant' -or $_.payload.item.kind -eq 'tool_call')
+    } | ForEach-Object { $_.seq })
+    if ($bseq.Count -ne 2 -or $opened.Count -lt 2) { return $false }
+    $after1 = @($opened | Where-Object { $_ -gt $bseq[0] })
+    $after2 = @($opened | Where-Object { $_ -gt $bseq[1] })
+    ($after1.Count -ge 1) -and ($after2.Count -ge 1)
 }
 Check '5. **至少有一次是真的 fsync**（`synced: true`）—— 不是空转' {
     @($barrierResults | Where-Object { $_.payload.data.synced -eq $true }).Count -ge 1

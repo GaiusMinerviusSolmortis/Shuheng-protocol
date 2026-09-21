@@ -211,7 +211,9 @@ const HELP: &[(&str, &str, &str)] = &[
          · `revert {revision}` 把文件写回那个版本，**并丢掉它之后的历史**（不做 redo）。\n\
          0 = 刚打开时的内容。\n\
          · **空文件怎么写入**：`old` 传空串，但只在文件本身是空的时候合法。\n\
-         · 想确认自己没搞错就先 `read` —— 你手上的内容可能已经过期了。",
+         · 想确认自己没搞错就先 `read` —— 你手上的内容可能已经过期了。\n\
+         · **只想看一眼、不打算改**：`read {path}` —— 那条路**不拿写锁**，\n\
+           所以只要 `fs.read` 就能用（`open` 要写权，因为它拿的是**写锁**）。",
     ),
     (
         "errors",
@@ -414,9 +416,12 @@ fn tools() -> Vec<Value> {
         .to_json(),
         ToolDecl::new(
             "read",
-            "读实例当前持有的内容，可带字节偏移与上限。",
-            json!({"type": "object", "required": ["instance_id"], "additionalProperties": false,
-                   "properties": {"instance_id": {"type": "string"},
+            "读一份内容。两种给法：**`instance_id`** 读你持有的那份（会跟着磁盘同步）；\
+             **`path`** 直接读托管路径里的文件 —— **这条不拿写权，只要 `fs.read`**。",
+            json!({"type": "object", "additionalProperties": false,
+                   "properties": {"instance_id": {"type": "string", "description": "读你持有中的那份"},
+                                  "path": {"type": "string",
+                                           "description": "直接读磁盘上的文件（不拿写锁、只要 fs.read）"},
                                   "offset": {"type": "integer"}, "limit": {"type": "integer"}}}),
         )
         .caps(&["fs.read"])
@@ -430,6 +435,11 @@ fn tools() -> Vec<Value> {
             "bytes": {"type": "integer"},
             // **别人在磁盘上动过这个文件吗**（见 `Document::changed_on_disk`）
             "disk_changed": {"type": "boolean"},
+            // 只有 `read {path}` 那条路（不拿写权的那种）会带上这两格 ——
+            // ⚠️ **忘了声明它们的代价是当场可见的**：投递关（§11.8）会贴一张
+            // `schema_violation`（"多了一个没声明过的字段"），整机那条验收第 7 条就红。
+            "path": {"type": ["string", "null"]},
+            "read_only": {"type": ["boolean", "null"]},
         }))
         .requires_on(&["confirmed"], &["text"])
         .lifecycle("per_session")
@@ -897,7 +907,63 @@ impl Editor {
         Some(synced)
     }
 
+    /// **不拿写权的那条读路**：直接读托管路径里的文件。
+    ///
+    /// 它和 `read {instance_id}` 的区别是**要不要一把锁**：持有中的那份要先 `open`
+    /// （拿写锁），而这里只是"看一眼"。围栏照查、`fs.read` 照要 —— 少的只有那把锁。
+    fn read_path(&mut self, raw: &str, args: &Value) -> Value {
+        let path = match self.fence.resolve(raw) {
+            Ok(p) => p,
+            Err(e) => {
+                return json!({
+                    "route": null, "effect": "refused", "code": e.code,
+                    "why": e.why, "remedy": e.remedy
+                })
+            }
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                return json!({
+                    "route": null, "effect": "refused", "code": "invalid",
+                    "why": format!("`{}` 读不了：{e}", path.display()),
+                    "remedy": "文件得存在、而且是 UTF-8 文本；新建文件要先 `open {create: true}`\
+                               （那一步要写权）"
+                })
+            }
+        };
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(self.args.inline_limit);
+        let (piece, next) = slice_bytes(&text, offset, Some(limit));
+        json!({
+            "route": null, "effect": "confirmed", "code": null,
+            "text": piece,
+            "next_offset": next,
+            "spilled_to": null,
+            "bytes": text.len(),
+            // **这一条没拿写锁** —— 说清楚，免得模型以为它现在能改了
+            "read_only": true,
+            "path": path.display().to_string()
+        })
+    }
+
     fn tool_read(&mut self, out: &mut impl io::Write, holder: &Holder, args: &Value) -> Value {
+        // **只读的那条路**（2026-09-20 补）：带 `path` 就直接读磁盘 ——
+        // 不拿写锁、不开文档、不要 `instance_id`。
+        //
+        // 为什么必须有它：`open` 是要 `fs.write` 的（它拿的是**写锁**），
+        // 于是"只签 `fs.read`"这条绑定**在编辑器上什么都读不了** ——
+        // 一个签发得出来、却永远用不上的能力，就是一句假话。
+        // 而"只是看一眼不必用它 —— 直接读文件"本来就是这本手册里写着的话。
+        if args.get("instance_id").and_then(Value::as_str).unwrap_or("").is_empty() {
+            if let Some(raw) = args.get("path").and_then(Value::as_str) {
+                return self.read_path(raw, args);
+            }
+        }
         let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
         if let Err(v) = self.doc_for("read", id, holder) {
             return v;

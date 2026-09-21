@@ -510,13 +510,14 @@
       "capabilities": [
         "fs.read"
       ],
-      "description": "读实例当前持有的内容，可带字节偏移与上限。",
+      "description": "读一份内容。两种给法：**`instance_id`** 读你持有的那份（会跟着磁盘同步）；**`path`** 直接读托管路径里的文件 —— **这条不拿写权，只要 `fs.read`**。",
       "health": "ping",
       "idle_timeout": null,
       "input_schema": {
         "additionalProperties": false,
         "properties": {
           "instance_id": {
+            "description": "读你持有中的那份",
             "type": "string"
           },
           "limit": {
@@ -524,11 +525,12 @@
           },
           "offset": {
             "type": "integer"
+          },
+          "path": {
+            "description": "直接读磁盘上的文件（不拿写锁、只要 fs.read）",
+            "type": "string"
           }
         },
-        "required": [
-          "instance_id"
-        ],
         "type": "object"
       },
       "lifecycle": "per_session",
@@ -610,6 +612,18 @@
           },
           "output": {
             "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "remedy": {
             "type": "string"
