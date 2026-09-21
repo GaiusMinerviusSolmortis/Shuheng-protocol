@@ -72,8 +72,18 @@ function StopAll() {
 function KillOne($p) {
     try { $p.StandardInput.Close() } catch { }
     if (-not $p.WaitForExit(1500)) { try { $p.Kill() } catch { } }
+    # ⚠️ **强杀之后要等它真的没了**（2026-09-20 修，这条判据偶发红过）：
+    # `Process.Kill()` 返回**不等于进程已经退干净** —— 它还在拆的时候，
+    # 那把命名互斥体还攥在手里，于是下一个编辑器会撞上"域锁被占"，
+    # 而那是**被测对象完全正确**、夹具没等够。
+    $null = $p.WaitForExit(5000)
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 50
+    }
     $script:started.Remove($p) | Out-Null
-    Start-Sleep -Milliseconds 300
+    Start-Sleep -Milliseconds 200
 }
 $ok = '*域锁拿到*'
 $no = '*域冲突*'
