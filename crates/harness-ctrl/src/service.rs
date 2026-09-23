@@ -43,6 +43,20 @@ pub struct ServiceHandle {
     pub resident: bool,
     /// **这个会话是不是它的宿主**。不是宿主的话，"杀它"这件事就不该由这个会话决定。
     pub owner: bool,
+    /// **它的那棵进程树**（2026-09-20 补的边界回收）。
+    ///
+    /// 为什么中控也得管这一层：服务**自己**可能不建 job（编辑器拉 `git` 曾经就没有），
+    /// 或者干脆卡住不配合 —— 那时候"只杀它一层"会留下孙子：
+    /// 一个攥着 `.git/index.lock` 的 git、或者别的什么长命进程。
+    ///
+    /// ⚠️ **常驻服务不给 job**（`None`）：它存在的意义就是**活着跨过这个会话**，
+    /// 而 job 带的是 `KILL_ON_JOB_CLOSE` —— 中控一收摊它就被带走了，
+    /// 那正好把 `smoke-orphan` 第 4/5 条要的东西弄坏。
+    /// **"谁该跟着死、谁不该"在这里是两句话，不能一刀切。**
+    ///
+    /// ⚠️ 也**不带限额**：多严算合理是沙箱 profile 的事（待定 #3）。
+    /// 这一格只补"收得掉"，不碰"限得住"。
+    job: Option<harness_service::job::Job>,
     channel: Channel,
 }
 
@@ -79,6 +93,8 @@ impl ServiceHandle {
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("拿不到服务的 stdout"))?;
+        // **把它整棵管起来**（限额不开，只要 `KILL_ON_JOB_CLOSE`）
+        let job = harness_service::job::Job::assign(&child, harness_service::job::Limits::default());
 
         let instance = id.clone();
         std::thread::spawn(move || {
@@ -115,6 +131,7 @@ impl ServiceHandle {
             cmd,
             resident: false,
             owner: true,
+            job,
             channel: Channel::Stdio {
                 stdin,
                 child,
@@ -140,6 +157,8 @@ impl ServiceHandle {
             cmd,
             resident: true,
             owner: false,
+            // 接上来的：**没有句柄，也不该有 job** —— 它不是这个会话起的
+            job: None,
             channel: Channel::Ipc {
                 conn,
                 pid: rv.pid,
@@ -209,6 +228,8 @@ impl ServiceHandle {
                     cmd,
                     resident: true,
                     owner: true,
+                    // **常驻的不给 job**：中控收摊时它必须活着（见字段上那段）
+                    job: None,
                     // **句柄留着** —— 用户真要 `stop` 的时候，只有它能让这个进程死
                     channel: Channel::Ipc {
                         conn,
@@ -271,6 +292,10 @@ impl ServiceHandle {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
+                // **关它整棵**（不只是它一个）：服务自己拉起的孙子也要走
+                if let Some(j) = &self.job {
+                    j.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -298,6 +323,10 @@ impl ServiceHandle {
                         return StopReport::Killed;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // 先整棵收（job 里有它拉起的那些），再兜底杀它一个
+                if let Some(j) = &self.job {
+                    j.terminate();
                 }
                 let _ = child.kill();
                 let _ = child.wait();

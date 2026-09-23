@@ -93,7 +93,7 @@
 | [07-界面](07-界面.md) | **§9、§12** GUI 作为消息流的投影、表示层、点击策略、桌宠不在框架内。 |
 | [08-记忆](08-记忆.md) | **§16** 锚点、分层、沉淀，以及**大眼记忆实现的评估**。 |
 | [09-模型](09-模型.md) | **§8、§15** 提示词编译与模型拼装。 |
-| [10-决策](10-决策.md) | 已定 **299** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
+| [10-决策](10-决策.md) | 已定 **300** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
 | [**规范-消息协议**](规范-消息协议.md) | **规范性文件**：信封、消息种类、配对、会话日志、stdio 传输。 |
 | [规范-工具服务](规范-工具服务.md) | **规范性文件**，与其余探索性文档性质不同。 |
 | [附录-参考](附录-参考.md) | **§10、§17** 与已有工作的对照，以及和 MCP 的定位比较。 |
@@ -1559,8 +1559,8 @@ pwsh -File scripts/smoke-limits.ps1              # 终端那棵树的硬限额�
 pwsh -File scripts/smoke-domainlock.ps1          # 域锁的形状：多围栏要全占、去重、排序、失败不留残锁（10 条判据）
 pwsh -File scripts/smoke-args.ps1                # 服务回给你的话：未知工具教对的名字 / 没填 vs 不存在 / 抱怨的顺序 / 手册别漂（21 条判据）
 pwsh -File scripts/smoke-parallel.ps1            # 交错：一次发 24 条不等回包 —— 一条不落、一条不多、不许串台（10 条判据）
- pwsh -File scripts/smoke-orphan.ps1              # 硬杀中控：stdio 服务不许变孤儿、域锁要跟着放、常驻服务反过来必须活着（5 条判据）
-pwsh -File scripts/smoke-gitcheckpoint.ps1         # L2 回滚：存点不碰你的活、恢复跨过用户改动就拒（12 条判据）
+ pwsh -File scripts/smoke-orphan.ps1              # 硬杀中控：stdio 服务不许变孤儿、**服务漏的孙子也要走**、域锁跟着放、常驻服务反过来必须活着（6 条判据）
+pwsh -File scripts/smoke-gitcheckpoint.ps1         # L2 回滚：存点不碰你的活、恢复跨过用户改动就拒、**编辑器被收掉时 git 也要走**（14 条判据）
 pwsh -File scripts/smoke-e2e-agent.ps1            # **整机**：一个带编辑器+终端的智能体，自己把一件真活干完（7 条判据；没 key 就跳过）
 pwsh -File scripts/smoke-e2e-2sessions.ps1       # **整机**：两个会话靠记忆接续（沉淀 → 换会话召回）（8 条判据；没 key 就跳过）
 pwsh -File scripts/smoke-e2e-readonly.ps1         # **整机**：能力只签一半（读通、写被拒、而且它得老实说）（8 条判据；没 key 就跳过）

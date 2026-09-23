@@ -181,11 +181,15 @@ fn manifest(args: &Args) -> Value {
             "filesystem": "none",
             "network": "none",
             "identity": "same-user",
-            "executables": "none",
+            // ⚠️ **2026-09-20 改过**：加了 `leak` 之后它会拉一个子进程，
+            // 于是再报 `none` 就是假话（"它和它拉起的进程看不见可执行文件"）。
+            // 抓到这一条的是体检第 8 条：**报 `none` 的，源码里不许有 `Command::new`**。
+            "executables": "inherit",
             "resources": "none"
         },
-        "sandbox_note": "它是个 mock：不碰文件、不联网、不拉子进程 —— \
-                          五个面全是「没有东西可管」，不是「没管住」。",
+        "sandbox_note": "它是个 mock：不碰文件、不联网。`executables: inherit` 是因为 \
+                          `leak` 那个工具**故意**要拉一个子进程（用来试「中控收摊时整棵收掉」）—— \
+                          除此之外它不跑任何别的东西。其余几个面是「没有东西可管」，不是「没管住」。",
         "error_codes": ["invalid", "canceled"]
     });
     if args.manifest_holes {
@@ -263,6 +267,16 @@ fn tools() -> Vec<Value> {
         )
         .destructive()
         .lifecycle("per_call")
+        .to_json(),
+        ToolDecl::new(
+            "leak",
+            "**故意漏一个孙子进程**（不在任何 job 里）—— 用来试「中控收摊时整棵收掉」。",
+            json!({"type": "object", "additionalProperties": false, "properties": {}}),
+        )
+        .destructive()
+        .lifecycle("per_call")
+        .returns(json!({"data": {"type": "object"}}))
+        .requires_on(&["confirmed"], &["data"])
         .to_json(),
     ]
 }
@@ -354,6 +368,30 @@ fn handle_request(out: &mut impl io::Write, ids: &mut IdGen, args: &Args, req: &
                 emit(out, &ev);
             }
             json!({"route": null, "effect": "confirmed", "code": null, "data": {"pong": true}})
+        }
+        "leak" => {
+            // **故意漏一个孙子**（2026-09-20 加）：起一个长命进程，**不放进任何 job** ——
+            // 演的就是"服务自己不建 job"那种写法（编辑器的 `git` 曾经就是这样）。
+            // 中控那边现在给**非常驻**服务套了 job，所以这个孙子该跟着一起走；
+            // 判据在 `smoke-orphan.ps1`（收了中控之后，这个 pid 不许还在）。
+            let child = std::process::Command::new("cmd")
+                .args(["/c", "ping", "-n", "300", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match child {
+                Ok(c) => json!({
+                    "route": null, "effect": "confirmed", "code": null,
+                    "data": {"leaked_pid": c.id(), "note": "这个孙子**不在任何 job 里** —— \
+                             中控收摊时它该跟着走（那是中控那层 job 的活）"}
+                }),
+                Err(e) => json!({
+                    "route": null, "effect": "refused", "code": "invalid",
+                    "why": format!("起不了那个孙子：{e}"),
+                    "remedy": "这是环境问题"
+                }),
+            }
         }
         "help" => json!({
             "route": null, "effect": "confirmed", "code": null,

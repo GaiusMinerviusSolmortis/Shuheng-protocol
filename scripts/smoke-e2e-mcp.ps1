@@ -154,8 +154,11 @@ Check '4. 结论里的数字是**对端算的**（42，不是它自己口算的�
     ([string]$answer.payload.text) -like '*42*'
 }
 Check '5. **白名单在真模型面前也成立**：不在表里的工具一次都没被放行' {
-    # 模型可能试着调 `boom`/`sleep`（它看得见名字），但不该有一次真的过去
-    @($agentToBridge | Where-Object { $_.payload.tool -notin @('echo', 'add') }).Count -eq 0
+    # ⚠️ **桥自己的三个诊断入口不算 MCP 工具**（`help` / `ping` / `status`）——
+    # 它们不是白名单管的那些，模型问它们是**正常行为**（这次它先看了 help/status 再干活）。
+    # 第一版没排除它们，于是判据假红过一次。
+    $mcpCalls = @($agentToBridge | Where-Object { $_.payload.tool -notin @('help', 'ping', 'status') })
+    (@($mcpCalls | Where-Object { $_.payload.tool -notin @('echo', 'add') }).Count -eq 0) -and ($mcpCalls.Count -ge 1)
 }
 Check '6. 全程没有 `service_down` / `schema_violation`' {
     @($records | Where-Object { $_.payload.code -eq 'service_down' -or $_.payload.schema_violation }).Count -eq 0

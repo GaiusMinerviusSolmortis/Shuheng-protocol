@@ -26,7 +26,7 @@
 //! 不该互相踩；而"谁建的"这件事本身要能从 ref 名字上看出来（审计）。
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// 一个 checkpoint。
 ///
@@ -89,13 +89,34 @@ fn run_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     cmd.current_dir(dir).args(args);
     // 别让 git 停下来等人输入凭据 —— 它不该有"等人"的时候
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // **stdin 给它空管道**（同 `Command::output()` 的语义）：git 不该读我们的 stdin，
+    // 更不该碰到我们和 ctrl 之间那根协议管道。
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         // CREATE_NO_WINDOW：别闪一个黑框（这是个后台服务）
         cmd.creation_flags(0x0800_0000);
     }
-    let out = cmd.output().map_err(|e| GitError::NoGit(e.to_string()))?;
+    let child = cmd.spawn().map_err(|e| GitError::NoGit(e.to_string()))?;
+    // ⚠️ **把它放进一个 Job**（2026-09-20 补的边界回收）：
+    //
+    // 在这之前，git 是**谁的子树都不在**的一个进程 —— 编辑器被收掉（`stop` /
+    // 会话结束 / 硬杀）时我们只杀得掉编辑器自己，**那个 git 会留下来**：
+    // 它可能正攥着 `.git/index.lock`，或者还在哈希一大堆改动。
+    // 用户下一分钟在自己终端里 `git commit` 就会撞上"另一个 git 进程在运行"，
+    // 而那个进程的父进程早就没了 —— 查这种幽灵锁比查服务崩了难得多。
+    //
+    // Job 带 `KILL_ON_JOB_CLOSE`：**这个 `Job` 一 drop（或我们进程一死），
+    // 内核把整棵收掉**。限额不开 —— `Limits::default()`。
+    // （`assign` 返回 `None` 只说明环境不允许，那就退回"只能杀一层"，不该在这儿报错。）
+    let _job = harness_service::job::Job::assign(&child, harness_service::job::Limits::default());
+    let out = child.wait_with_output().map_err(|e| GitError::Failed {
+        what: format!("git {}", args.join(" ")),
+        stderr: e.to_string(),
+    })?;
     if !out.status.success() {
         return Err(GitError::Failed {
             what: format!("git {}", args.join(" ")),
@@ -186,13 +207,19 @@ pub fn read_at(root: &Path, rev: &str, rel: &str) -> Result<String, GitError> {
 /// 托管路径可能只是仓库里的一个**子目录**，而 git 命令要在**仓库根**上跑、
 /// 路径也要按**相对仓库根**给 —— 所以这两件事必须由同一个函数算出来。
 pub fn toplevel(dir: &Path) -> Result<std::path::PathBuf, GitError> {
-    // **先问"是不是仓库"**，别拿 `rev-parse` 的报错当答案 ——
-    // 那样"不是仓库"会掉进含糊的 `Failed`（第一版就是这样，
-    // 于是"这不是 git 仓库，L1 照常可用"那句补救根本不会出现）。
-    if !is_repo(dir) {
-        return Err(GitError::NotARepo);
-    }
-    let s = run(dir, &["rev-parse", "--show-toplevel"])?;
+    let s = match run(dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(s) => s,
+        // ⚠️ **"没装 git"和"这不是仓库"是两件事，别混成一个**（2026-09-20 修）：
+        // 原来这里先调 `is_repo()`，而它把**任何失败**都吞成 `false` ——
+        // 于是"这台机器上没有 git"会被报成"这条路径不在 git 仓库里"，
+        // 而这两句话给用户的下一步**完全不同**（装 git vs 换个仓库）。
+        // 这个是实测抓到的：PATH 里放一个 `git.cmd`（Rust 不认它）之后，
+        // 编辑器回的就是"不在 git 仓库里"。
+        Err(GitError::Failed { stderr, .. }) if stderr.contains("not a git repository") => {
+            return Err(GitError::NotARepo)
+        }
+        Err(e) => return Err(e),
+    };
     if s.is_empty() {
         return Err(GitError::NotARepo);
     }

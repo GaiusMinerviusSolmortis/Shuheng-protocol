@@ -67,6 +67,34 @@ $proc = [System.Diagnostics.Process]::Start($psi)
 $script:ctrlPid = $proc.Id
 Start-Sleep -Seconds 2
 
+# **先让 echo 漏一个孙子出来**（2026-09-20 加的边界回收判据）：
+# `leak` 这个工具会起一个长命进程，而且**故意不放进任何 job** ——
+# 演的就是"服务自己不建 job"那种写法（编辑器的 `git` 曾经就是这样）。
+# 中控现在给**非常驻**服务套了 job，所以这个孙子该跟着一起走。
+$script:seq = 0
+function Send([string]$to, [string]$corr, [hashtable]$payload) {
+    $script:seq++
+    $m = [ordered]@{ id = "m-$script:seq"; ts = 0; type = 'request'; from = 'console'
+                     to = $to; corr = $corr; sid = 's-orph'; authority = 'user'; payload = $payload }
+    $proc.StandardInput.WriteLine(($m | ConvertTo-Json -Compress -Depth 12))
+    $proc.StandardInput.Flush()
+}
+Send 'echo:1' 'leak1' @{ tool = 'leak'; args = @{} }
+$leakedPid = 0
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+while ([DateTime]::UtcNow -lt $deadline -and $leakedPid -eq 0) {
+    $t = $proc.StandardOutput.ReadLineAsync()
+    if (-not $t.Wait(2000)) { break }
+    $line = $t.Result
+    if ($null -eq $line) { break }
+    if ($line.Trim() -eq '') { continue }
+    $m = $line | ConvertFrom-Json
+    if ($m.type -eq 'result' -and $m.corr -eq 'leak1') {
+        $leakedPid = [int]$m.payload.data.leaked_pid
+    }
+}
+Write-Host ("  漏出来的孙子 pid = $leakedPid") -ForegroundColor DarkGray
+
 Write-Host '== 先看活着的时候 ==' -ForegroundColor Cyan
 $alive = @(MineAlive)
 Check '1. 三个服务都在（基线：这条判据得先证明"有东西可成为孤儿"）' {
@@ -81,6 +109,13 @@ $left = @(MineAlive)
 
 Check '2. 中控死了之后，那三个 stdio 服务**一个都不剩**（不许变成孤儿）' {
     $left.Count -eq 0
+}
+Check '2b. **服务自己漏的那个孙子也走了**（中控那层 job 该把它整棵收掉）' {
+    $leakedPid -gt 0 -and $null -eq (Get-Process -Id $leakedPid -ErrorAction SilentlyContinue)
+}
+if ($leakedPid -gt 0 -and $null -ne (Get-Process -Id $leakedPid -ErrorAction SilentlyContinue)) {
+    Write-Host "      孙子 $leakedPid 还在（它的父进程早没了）—— 这正是那个边界回收 bug" -ForegroundColor DarkGray
+    try { Stop-Process -Id $leakedPid -Force } catch { }
 }
 if ($left.Count -gt 0) {
     Write-Host "      还活着的是：$($left | ForEach-Object { $_.Name + '#' + $_.ProcessId } | Join-String -Separator ' / ')" -ForegroundColor DarkGray

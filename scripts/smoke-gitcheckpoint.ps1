@@ -164,6 +164,77 @@ Check '9. 拒绝了就**真的没写**（用户那份还在）' {
 Stop-Editor $ed
 
 Write-Host '== 不是仓库 / 还没有第一个提交：各自说清是哪一种 ==' -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+# **边界回收**（2026-09-20 补的一格）：编辑器被收掉时，**它当时跑着的 git 不许留下**。
+#
+# 这是用户报的那个 bug：git 原来是"谁的子树都不在"的一个进程 —— 编辑器被 `stop` /
+# 会话结束 / 硬杀时，我们只杀得掉编辑器自己，那个 git 会留下来（可能正攥着
+# `.git/index.lock`），用户后面自己跑 git 就会撞上"另一个 git 进程在运行"。
+#
+# ⚠️ **假 git 必须是真 exe**：Rust 起 `git` 时**不认 `.cmd`**（实测过 —— PATH 里
+# 只放 `git.cmd` 时它会当"跑不了 git"）。所以这里现造一个只会睡的 exe。
+Write-Host '== 边界回收：编辑器被收掉，它拉起的 git 要跟着走 ==' -ForegroundColor Cyan
+$sleepySrc = Join-Path $work 'sleepy'
+New-Item -ItemType Directory -Path (Join-Path $sleepySrc 'src') -Force | Out-Null
+@"
+[package]
+name = "sleepy"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+"@ | Set-Content -LiteralPath (Join-Path $sleepySrc 'Cargo.toml') -Encoding utf8
+@'
+fn main() {
+    // 一个"卡住的 git"：什么都不干，睡十分钟
+    std::thread::sleep(std::time::Duration::from_secs(600));
+}
+'@ | Set-Content -LiteralPath (Join-Path $sleepySrc 'src\main.rs') -Encoding utf8
+$null = & cargo build --release --offline --quiet --manifest-path (Join-Path $sleepySrc 'Cargo.toml') 2>&1
+$sleepyExe = Join-Path $sleepySrc 'target\release\sleepy.exe'
+if (-not (Test-Path $sleepyExe)) { throw "假 git 没造出来：$sleepyExe" }
+$fakeBin = Join-Path $work 'fakebin'
+New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+Copy-Item -LiteralPath $sleepyExe -Destination (Join-Path $fakeBin 'git.exe') -Force
+
+# 起一个编辑器，PATH 里把假 git 放在最前面
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $editor
+$psi.Arguments = "--instance editor:1 --sid s-gitjob --fence `"$repo`""
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.UseShellExecute = $false
+$psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+$psi.EnvironmentVariables['Path'] = $fakeBin + ';' + $psi.EnvironmentVariables['Path']
+$edJob = [System.Diagnostics.Process]::Start($psi)
+Start-Sleep -Milliseconds 800
+$edJob.StandardOutput.ReadLine() | Out-Null
+# 让它去 checkpoint —— 那个假 git 会卡住，编辑器就停在那儿等
+$req = '{"id":"m-job","ts":0,"type":"request","from":"ctrl","to":"editor:1","corr":"c-job","sid":"s-gitjob","authority":"user","payload":{"tool":"checkpoint","args":{},"granted":["*"],"caller_kind":"user"}}'
+$edJob.StandardInput.WriteLine($req)
+$edJob.StandardInput.Flush()
+Start-Sleep -Seconds 2   # 给它足够时间真的跑起来那个假 git
+# ⚠️ **按父进程认**（那个假 git 被复制成了 `git.exe`，名字不叫 sleepy；
+# 而按名字认还可能误抓机器上别人的 git）。第一版就是按 `sleepy.exe` 找的，扑空。
+$fakeRunning = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ParentProcessId -eq $edJob.Id -and $_.Name -eq 'git.exe' })
+$fakePids = @($fakeRunning | ForEach-Object { $_.ProcessId })
+Check '12. 前提：编辑器**真的把那个假 git 跑起来了**（它正卡在 `git` 上）' {
+    $fakeRunning.Count -ge 1
+}
+Write-Host '  → 现在把编辑器杀掉（模拟 stop / 会话结束 / 硬杀）' -ForegroundColor Yellow
+$edJob.Kill()
+$edJob.WaitForExit(5000) | Out-Null
+Start-Sleep -Seconds 2
+$fakeLeft = @($fakePids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+Check '13. **它拉起的 git 也跟着走了**（Job 带 KILL_ON_JOB_CLOSE；不留幽灵锁）' {
+    $fakeLeft.Count -eq 0
+}
+foreach ($x in $fakeLeft) {
+    Write-Host ("      git(pid " + $x + ") 还在 —— 它的父进程已经没了") -ForegroundColor DarkGray
+    try { Stop-Process -Id $x -Force } catch { }
+}
+
 $ed2 = Start-Editor $plain 's-plain'
 $noRepo = Call $ed2 'checkpoint' '{}'
 Stop-Editor $ed2
