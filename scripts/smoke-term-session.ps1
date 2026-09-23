@@ -12,7 +12,10 @@
 #   4. **两种模式分得开**：命令模式的实例上 `send`/`screen` 明确拒；
 #      会话模式的实例上 `run` 也明确拒（别让它以为是同一条会话）；
 #   5. **模式算实例身份的一部分**：同一个目录上，命令模式一个、会话模式一个，
-#      而同一个模式的重复 `open` 是幂等的（不会悄悄多起一条 PTY）。
+#      而同一个模式的重复 `open` 是幂等的（不会悄悄多起一条 PTY）；
+#   6. **会话是有状态的**（环境变量、cwd 是那条 shell 自己记着的）——
+#      这一条才是"实例是一条活着的进程"和"实例只是一条路径"的分界，
+#      所以这两条判据**在命令模式上必然失败**（那边每条命令都是新进程）。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Write-Host '== 构建 ==' -ForegroundColor Cyan
@@ -31,6 +34,8 @@ $project = Join-Path $work 'project'
 New-Item -ItemType Directory -Path $project -Force | Out-Null
 # 一个**只有那个目录里才有**的记号：用来证明 shell 的 cwd 是对的
 Set-Content -LiteralPath (Join-Path $project 'MARKER-HERE.txt') -Value 'x' -Encoding utf8
+# 一个子目录：用来证"cd 之后下一条命令还在那儿"（cwd 是 shell 自己记着的）
+New-Item -ItemType Directory -Path (Join-Path $project 'sub') -Force | Out-Null
 $sid = 's-sess'
 $dataDir = Join-Path $work 'data'
 $servicesPath = Join-Path $work 'services.json'
@@ -166,6 +171,27 @@ Check '13. 同目录再要一条会话：**拿回原来那条**（幂等），�
         -and [string]$o3.note -like '*100x30*'
 }
 
+Write-Host '== 会话是有状态的（这就是它存在的理由）==' -ForegroundColor Cyan
+# 第 14 条是**真分界线**：命令模式每条命令都是新起的进程 ⇒ 变量在那边必然展开不了
+# （实测：`cmd /C "set X=1"` 之后再 `cmd /C "echo got-%X%"` 打出来的就是 `got-%X%`）。
+# 会话模式过，是因为变量在**那条活着的 shell** 里。
+# ⚠️ 第 15 条**不是**分界线：命令模式下这条也过 —— 因为那里的 `cd` 是**我们自己拦下来
+# 改 `t.cwd`** 的（服务替 shell 记着）。它证的是"会话里 cwd 由 shell 自己记着"，
+# 而命令模式那份"记得住"其实是**模拟**出来的，只认 `cd` 这一种写法。
+$null = Call 'term:1' 'v1' @{ tool = 'send'; args = @{ instance_id = 't-1'; text = 'set LIFEPROOF=ABC42' } }
+$null = Call 'term:1' 'v2' @{ tool = 'send'; args = @{ instance_id = 't-1'; text = 'echo got-%LIFEPROOF%' } }
+$env1 = ScreenUntil 'v3' 'got-ABC42'
+Check '14. 上一条命令设的**环境变量，下一条命令展开得出来**（同一个 shell 活着）' {
+    # `got-ABC42` 只可能来自 shell 真的展开了那个变量（新起的进程会原样打出 `%LIFEPROOF%`）
+    [string]$env1.text -like '*got-ABC42*'
+}
+$null = Call 'term:1' 'v4' @{ tool = 'send'; args = @{ instance_id = 't-1'; text = 'cd sub' } }
+$null = Call 'term:1' 'v5' @{ tool = 'send'; args = @{ instance_id = 't-1'; text = 'cd' } }
+$cwd2 = ScreenUntil 'v6' 'project\sub'
+Check '15. `cd` 进子目录之后**下一条命令还在那儿**（cwd 攥在 shell 手里，不是我们记的）' {
+    [string]$cwd2.text -match 'project\\sub'
+}
+
 Write-Host '== 会话也会结束 ==' -ForegroundColor Cyan
 $null = Call 'term:1' 'e1' @{ tool = 'send'; args = @{ instance_id = 't-1'; text = 'exit' } }
 $dead = (Call 'term:1' 'e2' @{ tool = 'screen'; args = @{ instance_id = 't-1' } }).payload
@@ -174,7 +200,7 @@ while ([DateTime]::UtcNow -lt $deadline -and $dead.alive -eq $true) {
     Start-Sleep -Milliseconds 300
     $dead = (Call 'term:1' 'e3' @{ tool = 'screen'; args = @{ instance_id = 't-1' } }).payload
 }
-Check '14. `exit` 之后屏幕说 **shell 退了**，而且给出退出码（§5.20 的"进程退出"那条触发）' {
+Check '16. `exit` 之后屏幕说 **shell 退了**，而且给出退出码（§5.20 的"进程退出"那条触发）' {
     $dead.alive -eq $false -and $dead.exit_code -eq 0
 }
 

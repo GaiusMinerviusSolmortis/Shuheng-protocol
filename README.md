@@ -1527,7 +1527,7 @@ cargo test                                       # 253 个测试（单元 + doc-
 pwsh -File scripts/smoke-stdio.ps1               # 阶段 1 验收 + 敌意输入（14 条判据）
 pwsh -File scripts/smoke-editor.ps1              # 阶段 2 验收（18 条判据）
 pwsh -File scripts/smoke-term.ps1                # 阶段 2 验收（21 条判据）
-pwsh -File scripts/smoke-term-session.ps1    # 终端会话模式：真 PTY 的常驻 shell（send 敲 / screen 看网格，14 条判据）
+pwsh -File scripts/smoke-term-session.ps1    # 终端会话模式：真 PTY 的常驻 shell（send 敲 / screen 看网格 / 会话有状态，16 条判据）
 pwsh -File scripts/smoke-memory.ps1              # 阶段 3 验收（14 条判据）
 pwsh -File scripts/smoke-agent.ps1               # 智能体层验收（18 条判据）
 pwsh -File scripts/smoke-deepseek.ps1            # 真实模型验收（11 条判据；没 key 就跳过）
