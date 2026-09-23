@@ -542,6 +542,17 @@ struct App {
     /// **跨会话的身份账**（`data/index/instances.jsonl`）。
     /// 会话日志记的是消息，这份记的是"id 是什么 / 归谁 / 什么时候出现"。
     index: index::IndexLog,
+    /// **水位表**：每个 tag 已经铸到几号了（`m-<tag>-<n>` / `c-<tag>-<n>` 里的那个 n）。
+    ///
+    /// 为什么在中控手里：**它看得见每一条消息**（不变量二：都从它这儿过）。
+    /// 于是"重启之后接着铸"这件事不必新开一个计数器文件 ——
+    /// 那是**第二份真相**（丢了就没保证、还会跟日志漂），而水位是从日志**算得出来**的。
+    /// 它是**派生的读模型**，同身份索引：丢了能从会话日志重建。
+    ///
+    /// 发给谁、什么时候发：**拉起实例的时候塞进它的环境**（`HARNESS_ID_WATER`）——
+    /// 因为服务的第一个出站消息（`presence`）是它还没跟任何人说过话时铸的，
+    /// "先问再铸"来不及（`harness_core::id::water_from_env`）。
+    id_water: std::collections::BTreeMap<String, u64>,
     /// 数据目录（索引读回来时要用它拼路径 —— 别从句柄反推）
     data_dir: PathBuf,
     /// 周期 tick 的间隔（`--tick-ms`，0 = 关）
@@ -620,11 +631,16 @@ fn run() -> i32 {
 
     let (tx, rx): (Sender<Inbound>, Receiver<Inbound>) = mpsc::channel();
 
+    // **水位从会话日志重建。** 它是派生读模型（见 `App::id_water`），
+    // 而中控自己也要接着铸 —— 不然 `--resume` 之后它自己的 `m-ctrl-1` 会重号。
+    // 宽松读：一条坏行只让水位偏低一点（而那种日志本来也重建不出会话）。
+    let id_water = rebuild_id_water(&log);
+    let ctrl_water = id_water.get("ctrl").copied().unwrap_or(0);
     let mut app = App {
         sid: args.sid.clone(),
         log,
         reg: Registry::default(),
-        ids: IdGen::new("ctrl"),
+        ids: IdGen::with_floor("ctrl", ctrl_water),
         channel: Channel {
             id: args.channel.clone(),
             ceiling: args.channel_ceiling,
@@ -647,6 +663,7 @@ fn run() -> i32 {
         exit_requested: false,
         next_instance_seq: 0,
         index: index::IndexLog::open(&args.data_dir),
+        id_water,
         data_dir: args.data_dir.clone(),
         tick: args.tick,
         debug_barriers: args.debug_barriers,
@@ -953,6 +970,66 @@ fn load_specs(path: &PathBuf) -> Result<Vec<ServiceSpec>, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+/// **中控认识的全部 op**（规范-消息协议 §2.7 那张名册）：**20 个名字 / 19 条分支**
+/// （`grant` 和 `revoke` 共用一条分支，但它们是两个 op）。
+///
+/// 为什么要这一份：权限矩阵要能分清"认识的 op 但级别不够"和"根本不认识这个 op" ——
+/// 前者是**权限**问题（说要多少级），后者是**拼错了**（要教对的名字）。
+/// 把两件事混成一句，模型会拿"权限不够"去改自己的写法，然后在原地打转。
+const KNOWN_OPS: [&str; 20] = [
+    "ping", "barrier", "list", "index", "session", "prompts", "prompt", "grant", "revoke",
+    "my_tools", "replay", "host", "delegate", "unhost", "suspend", "resume", "end", "spawn",
+    "stop", "shutdown",
+];
+
+/// **哪个 op 至少要多高的权威。**
+///
+/// 分三档，判据只有一句：**它会不会改系统状态或寿命**。
+///
+/// | 档 | op | 谁能发 |
+/// |---|---|---|
+/// | `observe` | `ping` `list` `index` `session` `prompts` | 任何活着的实例（看一眼不改什么）|
+/// | `agent` | `my_tools` `barrier` `replay` | 智能体（恢复上下文、请中控落盘、问自己被授权用什么）|
+/// | `user` | 其余（`host` `unhost` `delegate` `suspend` `resume` `end` `spawn` `stop` `shutdown` `prompt` `grant` `revoke`）| **只有用户** |
+///
+/// ⚠️ `replay` 在 `agent` 档，但它能读到**整场会话的模型上下文**（含系统提示）。
+/// 所以它还有第二道门：**低于 `user` 的调用方只能查自己**（见那一支的注释）。
+fn op_min_authority(op: &str) -> Authority {
+    match op {
+        "ping" | "list" | "index" | "session" | "prompts" => Authority::Observe,
+        "my_tools" | "barrier" | "replay" => Authority::Agent,
+        _ => Authority::User,
+    }
+}
+
+/// **从会话日志重建水位表**（每个 tag 铸到几号了）。
+///
+/// 它是**派生读模型**（同身份索引）：丢了能从日志算回来，所以**不该另存一份**。
+/// 宽松读：读不出来的行直接跳过 —— 一条坏行只让水位**偏低一点**，
+/// 而那种日志本来也重建不出会话（`replay` 会明确拒）。
+fn rebuild_id_water(
+    log: &harness_core::session_log::SessionLog,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut map = std::collections::BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(log.log_path()) else {
+        return map;
+    };
+    for line in text.lines() {
+        let Ok(r) = serde_json::from_str::<harness_core::session_log::LogRecord>(line) else {
+            continue;
+        };
+        for name in [Some(r.envelope.id.as_str()), r.envelope.corr.as_deref()] {
+            if let Some((tag, n)) = name.and_then(harness_core::id::split_name) {
+                let e = map.entry(tag.to_string()).or_insert(0u64);
+                if n > *e {
+                    *e = n;
+                }
+            }
+        }
+    }
+    map
+}
+
 /// **从会话日志里重建一个智能体看到过的东西。**
 ///
 /// 只认三种记录，而且顺序不能变：
@@ -1091,7 +1168,7 @@ impl App {
         authority: Authority,
         payload: Value,
     ) -> Envelope {
-        Envelope {
+        let env = Envelope {
             id: self.ids.next_message(),
             ts: now_ms(),
             kind,
@@ -1101,11 +1178,46 @@ impl App {
             sid: self.sid.clone(),
             authority,
             payload,
+        };
+        // 自己铸的也要记进水表（不然重启后中控自己的名字会重号）
+        let id = env.id.clone();
+        let corr = env.corr.clone();
+        self.note_water(&id);
+        if let Some(c) = corr {
+            self.note_water(&c);
         }
+        env
+    }
+
+    /// 把一个名字记进水位表（取最大值）。
+    fn note_water(&mut self, name: &str) {
+        if let Some((tag, n)) = harness_core::id::split_name(name) {
+            let e = self.id_water.entry(tag.to_string()).or_insert(0);
+            if n > *e {
+                *e = n;
+            }
+        }
+    }
+
+    /// **这个实例该从几号开始铸名字**（拉起它的时候要用）。
+    ///
+    /// 查不到就是 0 = 从头铸 —— 这条边界是**故意的**：水位只覆盖"真的进过系统的号"。
+    /// 一个进程铸了号但没发出去（崩了 / 被拒了），那个号在系统里不存在，
+    /// 被重用无害。这正是"从日志算"天然的边界，不是需要额外小心的例外。
+    fn water_for(&self, instance: &str) -> u64 {
+        self.id_water
+            .get(&harness_core::id::tag_of(instance))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// **先记录，再投递。** 这是不变量二在代码里的唯一形态。
     fn record(&mut self, env: &Envelope) -> u64 {
+        // **每一条进日志的消息都过这里** —— 水位表就在这儿长（它是派生读模型）
+        self.note_water(&env.id);
+        if let Some(c) = env.corr.clone() {
+            self.note_water(&c);
+        }
         match self.log.append(env) {
             Ok(seq) => {
                 debug_assert!(invariant::assert_recorded_before_delivery(Some(seq), env).is_ok());
@@ -1856,15 +1968,14 @@ impl App {
             }
             let tool = self.probe_tool(&id);
             let corr = format!("probe-{}", self.ids.next_corr());
-            self.pending.insert(
-                corr.clone(),
-                PendingCall {
-                    target: id.clone(),
-                    caller: CTRL.into(),
-                    tool: Some(tool.clone()),
-                    started_ms: now,
-                },
-            );
+            // ⚠️ **别在这儿手动记账**（2026-09-23 修）。
+            //
+            // 这里原来自己 `pending.insert` 一条，然后再 `route` —— 而 `route` 里
+            // 那条"同一个 corr 不许重复"的检查**看到的正是它刚插进去的那条**，
+            // 于是**每一针探针都被自己挡下**：服务永远收不到探针 ⇒ 全被判成
+            // `unresponsive`（`smoke-lifecycle` 第 2 条当场红：三个服务全是 True）。
+            // 现在**记账只有 `route` 一个地方**（它按请求里的 `tool` 和 `from` 记）——
+            // 少一处插入，就少一处能跟它对不上的地方。
             let req = self.mint(
                 MessageType::Request,
                 CTRL,
@@ -2059,6 +2170,27 @@ impl App {
         if env.kind == MessageType::Request {
             match &env.corr {
                 Some(corr) => {
+                    // **同一个 `corr` 只能有一次在途调用。**
+                    //
+                    // 原来这里是 `pending.insert` —— 而 `BTreeMap::insert` 是**静默覆盖**：
+                    // 第二次同 `corr` 的请求会顶掉第一次的账（谁发的、发给谁、调哪个工具），
+                    // 于是第一次那条回包会被按**第二次的声明**去校验，还可能被投给错的人。
+                    // 今天撞上的概率很低（`corr` 由调用方自己铸），但**这条规则本来就是
+                    // 调用方的义务**：回包全靠 `corr` 认领，撞了就只能错认。
+                    // 所以宁可明确拒，也不装看不见（规范 §3 / §8 #9）。
+                    if let Some(prev) = self.pending.get(corr).cloned() {
+                        self.refuse_call(
+                            &env,
+                            "refused",
+                            format!(
+                                "`{corr}` 已经有一次在途调用（{} → {}）",
+                                prev.caller, prev.target
+                            ),
+                            "同一个 corr 只能有一次在途调用 —— 回包靠它认领，撞了就认错了。\
+                             要再发一次就换一个 corr；要等结果就 `list` 看它还挂着没有",
+                        );
+                        return;
+                    }
                     self.pending.insert(
                         corr.clone(),
                         PendingCall {
@@ -2421,6 +2553,43 @@ impl App {
 
     fn local_op(&mut self, req: &Envelope) {
         let op = req.payload.get("op").and_then(Value::as_str).unwrap_or("");
+        // **权限矩阵**（规范-消息协议 §2.7）。它管的是"这个 op 至少要多高的权威"。
+        //
+        // 为什么必须有这一关：原来 19 个 op 里**只有 2 个**查了 authority
+        // （`prompt` 和 `grant|revoke`），其余 17 个一律不查 ——
+        // 而"能往中控发 request 的实例"包括**工具服务**（它们的权威上限是 `observe`）。
+        // 于是任何一个服务都能 `spawn` 任意可执行文件、`stop` 别人的服务、
+        // `shutdown` 整个中控。今天七个服务一个 op 都没发过，所以收紧不伤任何人 ——
+        // **"没人用"就是定规矩最便宜的时候。**
+        if KNOWN_OPS.contains(&op) {
+            let need = op_min_authority(op);
+            if req.authority < need {
+                self.reply(
+                    req,
+                    json!({
+                        "effect": "refused", "code": "refused",
+                        "why": format!(
+                            "`{op}` 要 `{}` 级别，这条消息是 `{}` 级别",
+                            need.as_str(), req.authority.as_str()
+                        ),
+                        "remedy": format!(
+                            "这条 op 会改系统状态或寿命，只有 {} 能发。\
+                             你这边的级别由**中控签发的上限**决定（工具是 `observe`、智能体是 `agent`）——\
+                             不是你写多高就多高（§1.1 只准降不准升）。{}",
+                            need.as_str(),
+                            // 改授权那两条**格外**不能松：让智能体（或某个工具）给自己加权限，
+                            // 是这套模型里最不能开的口子 —— 一松，"默认拒绝的绑定"（§5.10）就成了空话。
+                            if matches!(op, "grant" | "revoke") {
+                                "**智能体给自己加权限是不允许的** —— 那不是它能决定的事"
+                            } else {
+                                ""
+                            }
+                        )
+                    }),
+                );
+                return;
+            }
+        }
         match op {
             "ping" => {
                 let payload = json!({
@@ -2754,24 +2923,10 @@ impl App {
             //   → 智能体下一回合开始前扫一遍、换名册（function 定义数组）
             //   → 前缀一个字都不动（§15.2：拼装冻结，变化走 append-only）
             "grant" | "revoke" => {
-                // **只有用户能改授权。** 别的级别一律拒。
-                // 这条不能松：让智能体（或某个工具）给自己加权限，是这套模型里
-                // 最不能开的口子 —— 那时候"默认拒绝的绑定"（§5.10）就成了空话。
-                if req.authority < Authority::User {
-                    self.reply(
-                        req,
-                        json!({
-                            "effect": "refused", "code": "refused",
-                            "why": format!(
-                                "改授权要 `user` 级别，这条消息是 `{}` 级别",
-                                req.authority.as_str()
-                            ),
-                            "remedy": "让用户直接发这条 op（或换一条权威上限是 user 的通道）。\
-                                       智能体给自己加权限是不允许的 —— 那不是它能决定的事"
-                        }),
-                    );
-                    return;
-                }
+                // **只有用户能改授权** —— 这一关现在归 `op_min_authority`（`user` 档），
+                // 这里的自查 2026-09-23 删掉了：矩阵先跑，它永远轮不到，
+                // 而"一条规则两个执行者、其中一个永远不执行"正是这个仓库最讨厌的形状。
+                // 那句"智能体给自己加权限是不允许的"没丢，搬进了矩阵的判词里。
                 let agent = req.payload.get("agent").and_then(Value::as_str).unwrap_or("").to_string();
                 let instance = req.payload.get("instance").and_then(Value::as_str).unwrap_or("").to_string();
                 if agent.is_empty() || instance.is_empty() {
@@ -2939,6 +3094,26 @@ impl App {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                // **低于 user 的调用方只能查自己**（2026-09-23）。
+                // 不带 `agent` 时 `who` 是空串，而空串在 `reconstruct` 里是
+                // **"谁都算"** —— 也就是说这条 op 默认会**把整场会话的模型上下文
+                // （系统提示 + 全部用户消息）交出去**。智能体自己恢复上下文是它该干的，
+                // 但"顺手读别人的"不是。
+                if req.authority < Authority::User && who != req.from {
+                    self.reply(
+                        req,
+                        json!({
+                            "effect": "refused", "code": "refused",
+                            "why": format!(
+                                "只能查自己的上下文：你是 `{}`，要查的是 `{}`",
+                                req.from,
+                                if who.is_empty() { "（空 = 所有人）" } else { who.as_str() }
+                            ),
+                            "remedy": "填你自己的实例 id；要看别人的上下文得让用户来问"
+                        }),
+                    );
+                    return;
+                }
                 match self.log.read_all() {
                     Err(e) => self.reply(
                         req,
@@ -3433,10 +3608,12 @@ impl App {
         let svc = match &launcher {
             Launcher::Stdio => {
                 let svc = service::ServiceHandle::spawn(
-                    id.clone(),
-                    kind.clone(),
-                    cmd.clone(),
-                    &self.sid,
+                    service::Launch {
+                        id: id.clone(),
+                        cmd: cmd.clone(),
+                        sid: self.sid.clone(),
+                        id_water: self.water_for(&id),
+                    },
                     generation,
                     tx,
                 )?;
@@ -3482,9 +3659,12 @@ impl App {
                             );
                         }
                         let svc = service::ServiceHandle::spawn_resident(
-                            id.clone(),
-                            cmd.clone(),
-                            &self.sid,
+                            service::Launch {
+                                id: id.clone(),
+                                cmd: cmd.clone(),
+                                sid: self.sid.clone(),
+                                id_water: self.water_for(&id),
+                            },
                             dir,
                             *grace_ms,
                             generation,

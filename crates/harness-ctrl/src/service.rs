@@ -60,19 +60,33 @@ pub struct ServiceHandle {
     channel: Channel,
 }
 
+/// **拉起一个服务要的那几样**（`spawn` / `spawn_resident` 共用）。
+///
+/// 为什么成组：这两条路要的本来就是**同一组**东西（谁、怎么起、在哪条会话、
+/// 从几号开始铸名字），一个个列下来会到 8 个 —— 那是"这一组概念还没起名字"的信号。
+pub struct Launch {
+    /// 这个实例叫什么（服务表里的 id）
+    pub id: String,
+    /// 怎么起它（第一个是可执行文件，后面是它的参数）
+    pub cmd: Vec<String>,
+    /// 会话 id
+    pub sid: String,
+    /// **水位**：这个实例该从几号开始铸名字（见 `App::id_water`）。
+    /// 走环境变量而不是命令行参数 —— 理由写在 `harness_core::id::water_from_env`。
+    pub id_water: u64,
+}
+
 impl ServiceHandle {
     /// 起一个服务进程，并为它的 stdout 开一条读线程。
     ///
     /// 约定：中控总是追加 `--instance <id> --sid <sid>` ——
     /// 服务自己知道"我是谁"是它自报家门（presence + manifest）的前提。
     pub fn spawn(
-        id: String,
-        _kind: String,
-        cmd: Vec<String>,
-        sid: &str,
+        launch: Launch,
         generation: u64,
         tx: Sender<Inbound>,
     ) -> std::io::Result<Self> {
+        let Launch { id, cmd, sid, id_water } = launch;
         let (program, rest) = cmd
             .split_first()
             .ok_or_else(|| std::io::Error::other("服务命令为空"))?;
@@ -82,6 +96,7 @@ impl ServiceHandle {
             .arg(&id)
             .arg("--sid")
             .arg(sid)
+            .env(harness_core::id::WATER_ENV, id_water.to_string())
             // stdout 是**协议通道**，stderr 留给日志（规范 §6.1 规矩三）
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -173,14 +188,13 @@ impl ServiceHandle {
     /// `grace_ms` 是等它把会合文件写出来的上限 —— 到了还没等到就**如实报错**
     /// （不假装成功，也不无限等）。
     pub fn spawn_resident(
-        id: String,
-        cmd: Vec<String>,
-        sid: &str,
+        launch: Launch,
         rendezvous: &std::path::Path,
         grace_ms: u64,
         generation: u64,
         tx: Sender<Inbound>,
     ) -> std::io::Result<Self> {
+        let Launch { id, cmd, sid, id_water } = launch;
         let (program, rest) = cmd
             .split_first()
             .ok_or_else(|| std::io::Error::other("服务命令为空"))?;
@@ -213,6 +227,7 @@ impl ServiceHandle {
             .arg(sid)
             .arg("--resident")
             .arg(rendezvous)
+            .env(harness_core::id::WATER_ENV, id_water.to_string())
             // 常驻服务**不用这两条管子**：协议走套接字，日志走**文件**
             .stdin(Stdio::null())
             .stdout(Stdio::null())

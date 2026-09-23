@@ -7,7 +7,7 @@
 
 use harness_core::codec::{self, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
-use harness_core::id::IdGen;
+use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::now_ms;
 use harness_service::contract::ToolDecl;
 use serde_json::{json, Value};
@@ -94,7 +94,7 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
-    let mut ids = IdGen::new(args.instance.replace([':', '.'], "-"));
+    let mut ids = IdGen::with_floor(tag_of(&args.instance), water_from_env());
     let mut out = io::stdout();
 
     // 上线自报家门：**静态的是"我能干什么"**（§5.10）

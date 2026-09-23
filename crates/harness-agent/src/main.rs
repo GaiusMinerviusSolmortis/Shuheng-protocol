@@ -20,7 +20,7 @@ use harness_agent::prompt::{self, Persona, ToolCard};
 use harness_agent::script::parse_script;
 use harness_core::codec::{self, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
-use harness_core::id::IdGen;
+use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::now_ms;
 use harness_memory::{
     compact::{CompactionRecord, Hooks, Reason, When},
@@ -492,7 +492,7 @@ fn main() {
         brief: args.persona_brief.clone(),
     };
     let mut a = Agent {
-        ids: IdGen::new(args.instance.replace([':', '.'], "-")),
+        ids: IdGen::with_floor(tag_of(&args.instance), water_from_env()),
         // 提示词要等**问完中控"我被授权用什么"**才能编译 ——
         // 所以这两个字段先空着，拿到工具之后再填（见下）
         system: String::new(),

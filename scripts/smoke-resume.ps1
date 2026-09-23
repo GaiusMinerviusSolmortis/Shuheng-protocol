@@ -203,6 +203,31 @@ $r4 = Pump $p4 'c-replay2'
 Check '11. **中间有洞就不干**：明确拒，并说清是哪一段断了' {
     $r4.payload.effect -eq 'refused' -and $r4.payload.why -like '*洞*'
 }
+# 12. **名字不许重号**：整份日志里没有一个重复的 `id` / `corr`。
+#
+# 这条是实测抓出来的：修之前，第二轮（重启之后）把 13 个 `m-agent-dada-*`
+# **重新铸了一遍** —— 因为计数器是**进程内的**，进程一重启就从 1 重来，
+# 而 `id` 的语义是"消息自身唯一"。`corr` 更糟：它撞上"还没收到结果"的那条时，
+# 中控那张 `pending` 表是**静默覆盖**的。
+# 现在：中控手里有一张水位表（它看得见每一条消息，见 `App::id_water`），
+# 拉起实例时把水位塞进它的环境（`HARNESS_ID_WATER`）。
+Check '12. **重启之后名字不重号**：`id` 一条不重，`corr` 也没被发起第二次' {
+    # ⚠️ **两条不同的规则，别混**（第一版判据就把它们混了，于是自己红了一回）：
+    #   · `id` 是"消息自身唯一" —— 整份日志里**一条都不许重**；
+    #   · `corr` 是**一次调用的那条链**：同一条 corr 出现在「请求 / chunk / 结果」上
+    #     是**配对本身**（§3），所以只查它有没有被**发起两次**（两条 `request` 共用它）。
+    $ids = @($after | ForEach-Object { $_.id })
+    $reqCorrs = @($after | Where-Object { $_.type -eq 'request' } |
+        ForEach-Object { $_.corr } | Where-Object { $_ })
+    $dupIds = @($ids | Group-Object | Where-Object { $_.Count -gt 1 })
+    $dupCorrs = @($reqCorrs | Group-Object | Where-Object { $_.Count -gt 1 })
+    if ($dupIds.Count -gt 0 -or $dupCorrs.Count -gt 0) {
+        Write-Host ("      重的 id：{0}；被发起两次的 corr：{1}" -f `
+            (($dupIds | Select-Object -First 4 | ForEach-Object { $_.Name }) -join ', '), `
+            (($dupCorrs | Select-Object -First 4 | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor DarkGray
+    }
+    ($dupIds.Count -eq 0) -and ($dupCorrs.Count -eq 0)
+}
 $p4.StandardInput.Close()
 $p4.WaitForExit(8000) | Out-Null
 Write-Host ''

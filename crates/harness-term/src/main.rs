@@ -30,7 +30,7 @@ mod term;
 
 use harness_core::codec::{self, CodecError, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
-use harness_core::id::IdGen;
+use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::instance_event::InstanceEvent;
 use harness_core::now_ms;
 use harness_service::contract::ToolDecl;
@@ -158,7 +158,7 @@ fn main() {
     let args = parse_args();
     let (tx, rx): (Sender<Inbound>, Receiver<Inbound>) = mpsc::channel();
     let mut svc = Term {
-        ids: IdGen::new(args.instance.replace([':', '.'], "-")),
+        ids: IdGen::with_floor(tag_of(&args.instance), water_from_env()),
         fence: Fence::new(&args.fences).unwrap_or_default(),
         degraded: None,
         terms: BTreeMap::new(),

@@ -43,8 +43,17 @@ $servicesPath = Join-Path $work 'services.json'
 "@ | Set-Content -LiteralPath $servicesPath -Encoding utf8
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $ctrl
-# **通道是配置出来的**：这条口子叫「微信」，权威上限只有 agent（转发来的消息）
-$psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 6000 --channel 微信:agent"
+# **通道是配置出来的**：这条口子叫「微信」，上限是 **user**（它是**用户的**入口）。
+#
+# ⚠️ 2026-09-23 改：原来这里配的是 `微信:agent`，靠它同时验"入口带着上限"和"只准降"。
+# 而权限矩阵落地之后**这两件事打架了** —— `host` / `delegate` / `suspend` / `end`
+# 全是 `user` 档，而 agent 上限的通道**正确地**发不出它们。
+# 上限是**进程级配置**，一个中控只能有一个入口，所以一个进程里做不到
+# "既当 user 走完会话流程、又当 agent 验降级"。于是：
+#   · 这一份**只用 user 入口**，专心验"会话是一等对象"；
+#   · "入口带着上限 + 只准降 + 上限与矩阵是一对" 搬到 `smoke-ctrl-ops.ps1`
+#     （那边起第二个中控，专门配一条 agent 通道）。
+$psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 6000 --channel 微信:user"
 $psi.RedirectStandardInput = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
@@ -97,8 +106,8 @@ Write-Host '== 判据 ==' -ForegroundColor Cyan
 Start-Sleep -Milliseconds 800
 $g0 = Graph 'g-0'
 $ch = $g0.instances | Where-Object { $_.kind -eq 'channel' }
-Check '1. **入口是个实例**：图上有通道节点，而且带着它的权威上限（agent，不是 user）' {
-    $ch -and $ch.id -eq '微信' -and $ch.ceiling -eq 'agent' -and $ch.state -eq 'connected'
+Check '1. **入口是个实例**：图上有通道节点，而且带着它的权威上限（**配置出来的那个**，这里 user）' {
+    $ch -and $ch.id -eq '微信' -and $ch.ceiling -eq 'user' -and $ch.state -eq 'connected'
 }
 $s0 = Session 's-0'
 Check '2. 会话是一等对象：有状态、有参与者' {
@@ -148,10 +157,10 @@ Check '11. 挂起时那几条敕令**进了日志**（"敕令是写给日志的"
     $inj = @($records | Where-Object { $_.type -eq 'inject' -and $_.payload.reason -eq 'session_recycle' })
     $inj.Count -ge 1
 }
-Check '12. **§1.1 第一次真的被触发**：自称 user 的消息从 agent 上限的通道进来，被降级' {
-    $fromCh = @($records | Where-Object { $_.from -eq '微信' -and $_.type -eq 'request' })
-    ($fromCh.Count -ge 1) -and (($fromCh | Where-Object { $_.authority -ne 'agent' }).Count -eq 0)
-}
+# 12. **原来在这里的是"§1.1 只准降"那条判据**（自称 user 的消息从 agent 上限的通道进来被降级）。
+# 它 2026-09-23 搬到了 `smoke-ctrl-ops.ps1` —— 因为一条通道的上限是**进程级配置**，
+# 而"降级"这件事只能在 `上限 < 声称的级别` 时发生；那种通道**发不出**本脚本要用的
+# `host` / `delegate` / `suspend` / `end`（它们都是 user 档）。两件事在一个进程里放不下。
 Check '13. 会话结束后 meta 里记的是 ended（归档留痕）' {
     $meta2 = Get-Content -LiteralPath (Join-Path (Join-Path $dataDir 'sessions') (Join-Path $sid 'meta.json')) -Raw | ConvertFrom-Json
     $meta2.state -eq 'ended'

@@ -18,7 +18,7 @@ mod locks;
 use doc::{Document, EditError};
 use harness_core::codec::{self, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
-use harness_core::id::IdGen;
+use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::instance_event::InstanceEvent;
 use harness_core::now_ms;
 use harness_service::domain_lock;
@@ -95,7 +95,7 @@ fn main() {
     let args = parse_args();
     let mut out = io::stdout();
     let mut ed = Editor {
-        ids: IdGen::new(args.instance.replace([':', '.'], "-")),
+        ids: IdGen::with_floor(tag_of(&args.instance), water_from_env()),
         fence: Fence::new(&args.fences).unwrap_or_default(),
         degraded: None,
         locks: LockTable::default(),

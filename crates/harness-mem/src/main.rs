@@ -17,7 +17,7 @@
 
 use harness_core::codec::{self, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
-use harness_core::id::IdGen;
+use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::now_ms;
 use harness_ipc::{Listener, Rendezvous};
 use harness_mem::store::{NewFrag, Query, Store, EPISTEMIC, MAX_TEXT_BYTES};
@@ -132,7 +132,7 @@ fn main() {
         }
     };
 
-    let mut ids = IdGen::new(args.instance.replace([':', '.'], "-"));
+    let mut ids = IdGen::with_floor(tag_of(&args.instance), water_from_env());
     let mut out = io::stdout();
     eprintln!(
         "[mem] 碎片库：{}（默认寿命 {}）",
@@ -199,7 +199,7 @@ fn main() {
 
 /// 撞了域锁之后的样子：**在线、但只回答诊断**。
 fn degraded_loop(args: &Args) {
-    let mut ids = IdGen::new(args.instance.replace([':', '.'], "-"));
+    let mut ids = IdGen::with_floor(tag_of(&args.instance), water_from_env());
     let mut out = io::stdout();
     emit(
         &mut out,

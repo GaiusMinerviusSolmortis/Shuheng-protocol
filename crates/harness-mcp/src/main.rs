@@ -17,7 +17,7 @@
 
 use harness_core::codec::{self, NdjsonReader, NextLine};
 use harness_core::envelope::{Authority, Envelope, MessageType};
-use harness_core::id::IdGen;
+use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::now_ms;
 use harness_mcp::client::{content_to_text, McpClient};
 use harness_service::contract::ToolDecl;
@@ -176,7 +176,7 @@ fn main() {
     }
 
     let manifest = manifest(&args, &client, &tools);
-    let mut ids = IdGen::new(args.instance.replace([':', '.'], "-"));
+    let mut ids = IdGen::with_floor(tag_of(&args.instance), water_from_env());
     let mut out = io::stdout();
     emit(
         &mut out,
