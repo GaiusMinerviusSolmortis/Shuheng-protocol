@@ -160,6 +160,51 @@ Check '7. **恢复回来的东西里有上一轮的工具结果**（不是个空
             $_.payload.item.text -like '*FIRST-RUN*' })
     $hits.Count -ge 1
 }
+
+Write-Host ''
+Write-Host '== 第三轮：日志坏了怎么办（崩溃语义：尾部可以半残、中间不许有洞）==' -ForegroundColor Cyan
+# **这一轮只问中控**：回放是协议层的事（不变量二的另一半），跟智能体无关 ——
+# 所以这里不起智能体，console 直接发 `{"op":"replay"}`。
+$servicesEmpty = Join-Path $work 'services-empty.json'
+Set-Content -LiteralPath $servicesEmpty -Value '[]' -Encoding utf8
+$servicesPath = $servicesEmpty
+# 模拟"崩在写日志的那一下"：文件尾部多出半行 JSON（没收尾，也没换行）
+Add-Content -LiteralPath $logPath -Value '{"seq":9999,"recorded_at":1,"id":"m-broken","ts":0,"type":"resu' -NoNewline -Encoding utf8
+$p3 = Start-Ctrl @()
+Start-Sleep -Milliseconds 1500
+$replayMsg = '{"id":"m-replay","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-replay","sid":"' + $sid + '","authority":"user","payload":{"op":"replay","agent":"agent:dada"}}'
+Write-Line $p3 $replayMsg
+$r3 = Pump $p3 'c-replay'
+Check '8. **尾部半残的日志照样重建得出来**（崩在写日志那一下，不该把整份日志判死）' {
+    # 注意：`replay` 回的 `items` 是**那一串上下文项本身**（条数是 `records_seen`）
+    $r3.payload.effect -eq 'confirmed' -and @($r3.payload.data.items).Count -ge 4
+}
+Check '9. 而且它**如实说**跳过了一行半残的尾巴（不是偷偷跳过）' {
+    $r3.payload.data.broken_tail -eq 1
+}
+Check '10. 那半行**没有冒充成一条记录**（重建停在最后一条完整记录上）' {
+    $r3.payload.data.to_seq -ge 1 -and $r3.payload.data.to_seq -lt 9999
+}
+$p3.StandardInput.Close()
+$p3.WaitForExit(8000) | Out-Null
+$et3 = $p3.StandardError.ReadToEndAsync(); $et3.Wait(4000) | Out-Null
+# 再把**中间**挖掉一行：那是"中间有洞"，跟尾部半残**不是一回事**，不许默默放过去
+# （要**先停掉中控** —— 它开着追加句柄，别的进程改不了这个文件）
+$keep = @([System.IO.File]::ReadAllLines($logPath) | Where-Object { $_.Trim() -ne '' })
+$holed = New-Object System.Collections.Generic.List[string]
+$holed.AddRange([string[]]$keep[0..1])
+$holed.AddRange([string[]]$keep[3..($keep.Count - 1)])
+[System.IO.File]::WriteAllLines($logPath, $holed)
+$p4 = Start-Ctrl @()
+Start-Sleep -Milliseconds 1500
+$replay2 = '{"id":"m-replay2","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-replay2","sid":"' + $sid + '","authority":"user","payload":{"op":"replay","agent":"agent:dada"}}'
+Write-Line $p4 $replay2
+$r4 = Pump $p4 'c-replay2'
+Check '11. **中间有洞就不干**：明确拒，并说清是哪一段断了' {
+    $r4.payload.effect -eq 'refused' -and $r4.payload.why -like '*洞*'
+}
+$p4.StandardInput.Close()
+$p4.WaitForExit(8000) | Out-Null
 Write-Host ''
 Write-Host '== 第二轮（恢复）的 stderr ==' -ForegroundColor Cyan
 if ($et2.IsCompleted) { foreach ($l in ($et2.Result -split "`n")) { if ($l.Trim() -ne '') { Write-Host "  $l" } } }

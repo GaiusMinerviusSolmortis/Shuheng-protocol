@@ -26,6 +26,12 @@ pub struct LogRecord {
 pub enum LogError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    /// **日志中间有洞**（不是什么 IO 故障，是这份日志本身不完整了）。
+    ///
+    /// 它和"尾部半残"是两件事（§5.5 的崩溃语义）：尾部可以半残 —— 崩在写那一下
+    /// 本来就长这样；**中间不许有洞** —— 那意味着有记录不见了，而"可重放"这条
+    /// 不变量就建立在"一条都不少"上。**少一条就不许装作能重建。**
+    Corrupt(String),
 }
 
 impl std::fmt::Display for LogError {
@@ -33,6 +39,7 @@ impl std::fmt::Display for LogError {
         match self {
             LogError::Io(e) => write!(f, "会话日志 IO 失败：{e}"),
             LogError::Json(e) => write!(f, "会话日志序列化失败：{e}"),
+            LogError::Corrupt(why) => write!(f, "{why}"),
         }
     }
 }
@@ -57,6 +64,18 @@ pub struct SessionLog {
     seq: u64,
     /// 距上次屏障以来有没有新写入 —— barrier 用它做短路
     dirty: bool,
+}
+
+/// 读回来的日志 + **尾部跳过了几行**。
+///
+/// 为什么要那个数：崩溃语义允许尾部半残，**但"我跳过了一行"这件事本身是事实**，
+/// 得能报出去（同 §11.5 那条"诚实报告"）—— 静默跳过等于让调用方以为
+/// 它看到的是全部记录。顺带它也是判据的抓手：`smoke-resume` 第 9 条就盯这一格。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogRead {
+    pub records: Vec<LogRecord>,
+    /// 文件末尾那几行**读不完的**（崩在写日志那一下会长这样）
+    pub broken_tail: usize,
 }
 
 impl SessionLog {
@@ -94,21 +113,66 @@ impl SessionLog {
 
     /// 把整份日志读回来。**重放要用它** —— 不变量二说"能从日志重建"，
     /// 那得有个人真的去读。
-    pub fn read_all(&self) -> Result<Vec<LogRecord>, LogError> {
+    ///
+    /// **两条规则，方向相反**（§5.5 的崩溃语义）：
+    ///
+    /// | 情形 | 怎么办 |
+    /// |---|---|
+    /// | **尾部**几行读不完（崩在写那一下）| 跳过它们，**如实数出来**（`LogRead::broken_tail`）|
+    /// | **中间**有洞（`seq` 不连续 / 中间一行读不出来）| **拒** —— 这也是原来那条 remedy 说的"中间有洞不行" |
+    ///
+    /// ⚠️ **2026-09-23 修的**：原来这里对**任何**一行读不出来都直接 `Err` —— 包括尾行。
+    /// 于是"崩在写日志那一下"这个**规范明确允许**的情形，会让整份日志判死、
+    /// 会话重建不出来：**规范和代码在同一件事上说的是反话**，而
+    /// `last_seq`（重开时续 `seq` 用的那个）那一条路**已经**容尾部半残了 ——
+    /// 同一个文件里的两个函数，两种脾气。（`smoke-resume` 第 8/9/10 条当场红。）
+    pub fn read_all(&self) -> Result<LogRead, LogError> {
         let text = fs::read_to_string(self.log_path())?;
-        let mut out = Vec::new();
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
+        // 带**行号**收集（报洞的时候要指得出是哪一行）
+        let mut lines: Vec<(usize, &str)> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+            .map(|(i, l)| (i + 1, l))
+            .collect();
+
+        // 一、**从尾巴往前**吃掉读不完的行 —— 那是半残的尾部，不是洞
+        let mut broken_tail = 0usize;
+        while let Some((_, line)) = lines.last() {
+            if serde_json::from_str::<LogRecord>(line).is_ok() {
+                break;
             }
-            match serde_json::from_str::<LogRecord>(line) {
-                Ok(r) => out.push(r),
-                // 尾行半残是允许的（崩溃语义：尾部可以半残、中间不许有洞）——
-                // 但中间有洞要停下来说话
-                Err(e) => return Err(LogError::Json(e)),
-            }
+            lines.pop();
+            broken_tail += 1;
         }
-        Ok(out)
+        // 二、剩下的**一条都不许少**：读不出来是洞，`seq` 跳号也是洞
+        let mut out: Vec<LogRecord> = Vec::with_capacity(lines.len());
+        for (no, line) in lines {
+            let r = match serde_json::from_str::<LogRecord>(line) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(LogError::Corrupt(format!(
+                        "第 {no} 行读不出来：{e} —— 崩溃语义只容**尾部**半残，中间少一行都算洞"
+                    )))
+                }
+            };
+            if let Some(prev) = out.last() {
+                if r.seq != prev.seq + 1 {
+                    return Err(LogError::Corrupt(format!(
+                        "第 {no} 行的 seq 是 {}，可上一条是 {} —— 中间少了 {} 条，这是个洞。\
+                         尾部半残可以，**中间有洞不行**：少一条就不许装作能重建",
+                        r.seq,
+                        prev.seq,
+                        r.seq.saturating_sub(prev.seq + 1)
+                    )));
+                }
+            }
+            out.push(r);
+        }
+        Ok(LogRead {
+            records: out,
+            broken_tail,
+        })
     }
 
     /// 写一条记录，返回分配到的 `seq`。
@@ -249,5 +313,65 @@ mod tests {
         assert_eq!(escape_segment("s-1"), "s-1");
         assert!(!escape_segment("../../evil").contains('/'));
         assert!(!escape_segment("..\\..\\evil").contains('\\'));
+    }
+
+    /// **尾部半残 = 跳过 + 如实数出来**（§5.5 的崩溃语义）。
+    ///
+    /// 崩在写日志那一下，文件尾部就是半行 JSON。规范说这**允许** ——
+    /// 而 2026-09-23 之前 `read_all` 会对它整份拒（同一个文件里的 `last_seq`
+    /// 却容它）：**规范和代码说了反话**。这条测试把那件事钉住。
+    #[test]
+    fn a_half_written_tail_is_skipped_and_counted() {
+        let dir = std::env::temp_dir().join(format!("harness-log-tail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let mut log = SessionLog::open(&dir, "s-1").expect("open");
+            log.append(&env("m-1")).unwrap();
+            log.append(&env("m-2")).unwrap();
+            log.barrier().expect("barrier");
+        }
+        // 模拟崩在写第 3 条的那一下：尾部多出半行，既没换行也不是合法 JSON
+        let path = dir.join("sessions").join("s-1").join("log.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("{\"seq\":3,\"recorded_at\":1,\"id\":\"m-3\",\"ts\":0,\"type\":\"resu");
+        fs::write(&path, &text).unwrap();
+
+        let log = SessionLog::open(&dir, "s-1").expect("reopen");
+        let read = log.read_all().expect("尾部半残不该把整份日志判死");
+        assert_eq!(read.records.len(), 2, "两整条都在");
+        assert_eq!(read.broken_tail, 1, "而且**如实数出**跳过了几行");
+        // 重开时续的 seq 也不该把那半行当记录（同一条规则的另一半）
+        assert_eq!(log.last_seq(), 2);
+    }
+
+    /// **中间有洞 = 拒**，而且说得出是哪一段断了。
+    ///
+    /// 它和尾部半残**不是一回事**：那是"最后一条没写完"，这是"有记录不见了" ——
+    /// 而"可重放"这条不变量建立在**一条都不少**上。少一条就不许装作能重建。
+    #[test]
+    fn a_hole_in_the_middle_is_refused_with_its_seq() {
+        let dir = std::env::temp_dir().join(format!("harness-log-hole-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let mut log = SessionLog::open(&dir, "s-1").expect("open");
+            log.append(&env("m-1")).unwrap();
+            log.append(&env("m-2")).unwrap();
+            log.append(&env("m-3")).unwrap();
+            log.barrier().expect("barrier");
+        }
+        // 把中间那条整行删掉：三行都还是合法 JSON，**只有 seq 对不上**
+        let path = dir.join("sessions").join("s-1").join("log.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let keep: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        fs::write(&path, format!("{}\n{}\n", keep[0], keep[2])).unwrap();
+
+        let log = SessionLog::open(&dir, "s-1").expect("reopen");
+        let e = log.read_all().expect_err("中间有洞必须拒");
+        let msg = e.to_string();
+        assert!(msg.contains("洞"), "要说清这是个洞：{msg}");
+        assert!(msg.contains("3"), "要指得出断在哪个 seq：{msg}");
     }
 }

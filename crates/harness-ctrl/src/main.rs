@@ -2944,16 +2944,27 @@ impl App {
                         req,
                         json!({"effect": "refused", "code": "invalid",
                                "why": format!("读不出会话日志：{e}"),
-                               "remedy": "日志损坏的话没法重建；尾部半残可以，中间有洞不行"}),
+                               "remedy": "日志中间有洞就没法重建（少一条也不许装作能重建）；\
+                                          尾部半残是允许的 —— 那种情况照常重建，只是会报出 broken_tail"}),
                     ),
-                    Ok(records) => {
-                        let (system, items, seen) = reconstruct(&records, &who);
-                        let to_seq = records.last().map(|r| r.seq).unwrap_or(0);
+                    Ok(read) => {
+                        let (system, items, seen) = reconstruct(&read.records, &who);
+                        let to_seq = read.records.last().map(|r| r.seq).unwrap_or(0);
+                        // **跳过尾部半残这件事要说出来**（§11.5 那条"诚实报告"）：
+                        // 不说的话，调用方会以为它看到的就是全部记录。
+                        if read.broken_tail > 0 {
+                            eprintln!(
+                                "[ctrl] 回放：尾部跳过 {} 行半残（崩在写日志那一下就是长这样；\
+                                 崩溃语义：尾部可以半残、中间不许有洞）",
+                                read.broken_tail
+                            );
+                        }
                         self.reply(
                             req,
                             json!({"effect": "confirmed", "code": null,
                                    "data": {"system": system, "items": items,
-                                            "records_seen": seen, "to_seq": to_seq}}),
+                                            "records_seen": seen, "to_seq": to_seq,
+                                            "broken_tail": read.broken_tail}}),
                         );
                     }
                 }
