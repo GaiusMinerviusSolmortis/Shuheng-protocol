@@ -24,6 +24,8 @@
 //! 所以 manifest 里**没有 `send`，也没有 `screen`**：
 //! 声明一个做不到的工具比不声明更糟。
 
+mod pty;
+mod screen;
 mod term;
 
 use harness_core::codec::{self, CodecError, NdjsonReader, NextLine};
@@ -37,6 +39,7 @@ use harness_service::fence::Fence;
 use harness_service::grant::{self, Grant};
 use harness_service::reply;
 use serde_json::{json, Value};
+use term::Session;
 use std::collections::BTreeMap;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
@@ -256,13 +259,26 @@ const HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "two-modes",
-        "命令模式与会话模式（第一版只有前者）",
+        "命令模式与会话模式",
         "§5.18 定了两种形态：\n\
-         · **命令模式**（run）：敲一条、等它结束、把输出给你。绝大多数场景用这个。\n\
-         · **会话模式**（send + read / screen）：给长驻服务、REPL、进度条那种东西。\n\
-         **第一版只做了命令模式。** `send` / `screen` 会明确告诉你\"还没做\"，\
-         而不是假装成功 —— 因为它们要真 PTY 和屏幕仿真。\n\
-         所以别指望能跟一个交互式程序对话；run 一条就得等它退出。",
+         · **命令模式**（`open` 不带 `session`，用 `run`）：敲一条、等它结束、把输出给你。\n\
+           每条命令都是**新起一个 `cmd /C`** —— 绝大多数场景用这个。\n\
+         · **会话模式**（`open {session: true}`，用 `send` + `read`/`screen`）：\n\
+           一条**常驻的 shell**（真的伪控制台），可以往里敲、可以看屏幕 ——\
+           给长驻服务、REPL、进度条那种东西。\n\
+         \n\
+         **两种形态分开开**：命令模式的实例上没有可敲的东西（`send` 会明确拒绝，\
+         并告诉你该怎么开）；会话模式的实例直接 `send` 就行。\n\
+         它们是**两种实例**：同一个目录上，命令模式一个、会话模式一个，各自算一个\
+         （`open` 的幂等键里带着模式）。所以别指望『我开过命令模式了，再 `open {session:true}`\
+         会给我同一个』 —— 它会给你**新的一条会话**。\n\
+         \n\
+         ⚠️ **会话模式里 `cd` 管不住**：命令模式下 `cd` 是我们拦下来判围栏的，\
+         会话模式里 `cd` 只是往 shell 敲的字，cwd 攥在**它**手里（没有它的 hook）。\
+         要『只在托管路径内活动』，用命令模式。\n\
+         \n\
+         ⚠️ **看屏幕用 `screen`，别用 `read`**：交互式程序是**重写屏幕**而不是追加，\
+         它们的输出流读出来是一堆光标移动转义序列，线性看毫无意义（§5.19）。",
     ),
     (
         "cursor",
@@ -291,10 +307,10 @@ const HELP: &[(&str, &str, &str)] = &[
 /// 于是改这里不需要动中控（§7 那句"工具只校验手里的凭证够不够干这件事"）。
 fn required_caps(tool: &str) -> &'static [&'static str] {
     match tool {
-        // 跑命令 = 在本机上执行东西，这是最需要资格的一件事
-        "run" | "open" => &["proc.exec"],
+        // 跑命令、以及往会话里敲字 = 在本机上执行东西，这是最需要资格的一件事
+        "run" | "open" | "send" => &["proc.exec"],
         // 只读的、以及管理这个实例自身的，不需要额外资格
-        "read" | "close" | "status" | "ping" | "help" => &[],
+        "read" | "screen" | "close" | "status" | "ping" | "help" => &[],
         // 不认识的工具走"未知工具"那条路，不在这里管
         _ => &[],
     }
@@ -302,7 +318,9 @@ fn required_caps(tool: &str) -> &'static [&'static str] {
 
 /// **本服务的工具名**：一份，不是两份（`没有名为 X 的工具` 那条消息要靠它教对的名字）。
 /// 手写的那份原来漏了 `help`。有一条测试把它和 manifest 里真报的名字钉在一起。
-const TOOL_NAMES: [&str; 7] = ["help", "open", "run", "read", "close", "status", "ping"];
+const TOOL_NAMES: [&str; 9] = [
+    "help", "open", "run", "read", "send", "screen", "close", "status", "ping",
+];
 
 fn manifest(args: &Args, fence: &Fence) -> Value {
     json!({
@@ -329,7 +347,7 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
         "injection_policy": "card",
         "help_sections": [
             {"id": "overview", "title": "概览"},
-            {"id": "two-modes", "title": "命令模式与会话模式（第一版只有前者）"},
+            {"id": "two-modes", "title": "命令模式与会话模式"},
             {"id": "cursor", "title": "输出与游标"},
             {"id": "errors", "title": "错误码与补救"}
         ],
@@ -374,8 +392,22 @@ fn manifest(args: &Args, fence: &Fence) -> Value {
         // 只报工具名不报参数，等于让人猜怎么调；不报结果形状，就没人能验它。
         "tools": tools(),
         "not_implemented": {
-            "send": "会话模式要真 PTY；第一版只做命令模式（§5.18）",
-            "screen": "屏幕网格要终端仿真；同上"
+            "resize": "会话开起来之后**改不了尺寸**（ResizePseudoConsole 没接）—— \
+                       开的时候把 `cols`/`rows` 给对",
+            "osc133_hook": "**我们不替用户往 shell 里装 hook**（§5.18 那条：要在托管时\
+                            显式启用，不能假设它已经在）。所以 `screen` 里的 `marks`\
+                            多半是空的 —— 那是事实，不是故障",
+            "screen_coverage": "屏幕仿真**只覆盖常用序列**（见 `screen` 的 `unknown_sequences`\
+                                和 `unknown_sample`）：宽字符按 1 格算、滚动区域/行内插入删除\
+                                没做。没做的那些**如实数出来**，不装作处理了",
+            "session_on_other_platforms": "会话模式要伪控制台（ConPTY）—— **只在 Windows 上\
+                                           实现**。别的平台上 `open {session: true}` 会\
+                                           明确拒绝，而不是悄悄退化成命令模式",
+            "session_cwd": "⚠️ **会话模式里的 `cd` 管不住。** 命令模式下 `cd` 是我们自己\
+                            拦下来判围栏的（所以『只能在路径内 cd』）；会话模式里 `cd` 就是\
+                            往 shell 敲的字，cwd 攥在**它**手里，我们没有它每一步的 hook\
+                            （那就是 `osc133_hook` 那条）。所以会话模式的围栏只管\
+                            **它从哪起**，不管它后来走到哪 —— 要『路径内不许出去』，用命令模式"
         },
         // `canceled` 也在这张表里 —— 它是**我们真的会用到的码**
         // （调用方取消之后那条 `partial` + `canceled` 的答复）。
@@ -411,7 +443,11 @@ fn tools() -> Vec<Value> {
             "给一个目录开一个终端实例，返回 instance_id。",
             json!({"type": "object", "required": ["path"], "additionalProperties": false,
                    "properties": {"path": {"type": "string", "description": "目录路径；相对路径按托管根解析"},
-                                  "purpose": {"type": "string", "description": "这个终端是干什么用的（开的时候自己写）"}}}),
+                                  "purpose": {"type": "string", "description": "这个终端是干什么用的（开的时候自己写）"},
+                                  "session": {"type": "boolean",
+                                              "description": "true = 开一条**常驻 shell**（会话模式，能用 send/screen）；默认 false = 命令模式"},
+                                  "cols": {"type": "integer", "description": "会话模式的宽，默认 120"},
+                                  "rows": {"type": "integer", "description": "会话模式的高，默认 30"}}}),
         )
         .caps(&["proc.exec"])
         .idempotent()
@@ -420,6 +456,9 @@ fn tools() -> Vec<Value> {
             "path": {"type": "string"},
             "purpose": {"type": ["string", "null"]},
             "idempotent": {"type": "boolean"},
+            "mode": {"type": "string"},
+            // 幂等地拿回旧实例时，**哪些要求没被满足**（现在只有一种：会话尺寸改不了）
+            "note": {"type": ["string", "null"]},
         }))
         .requires_on(&["confirmed"], &["instance_id"])
         .lifecycle("per_session")
@@ -479,6 +518,57 @@ fn tools() -> Vec<Value> {
             // 现在跑的是什么命令（空闲时是 null）—— 给模型和 GUI 各一份事实
             "running": {"type": ["string", "null"]},
             "spilled_to": {"type": ["string", "null"]},
+        }))
+        .requires_on(&["confirmed"], &["text"])
+        .lifecycle("per_session")
+        .to_json(),
+        ToolDecl::new(
+            "send",
+            "**往会话里敲字**（会话模式的实例）。默认补一个回车。",
+            json!({"type": "object", "required": ["instance_id"], "additionalProperties": false,
+                   "properties": {"instance_id": {"type": "string"},
+                                  "text": {"type": "string",
+                                           "description": "要敲的内容（默认空 = 只敲一个回车）"},
+                                  "enter": {"type": "boolean",
+                                            "description": "末尾补不补回车，默认 true"}}}),
+        )
+        .caps(&["proc.exec"])
+        // ⚠️ **`send` 不是幂等的**（2026-09-20 改）：它是**敲键盘**，重复一次就是
+        // 真的敲了两遍（`send {"text":"rm -rf build"}` 来两次 = 跑两遍）。
+        // 第一版跟着邻居写了 `.idempotent()`，而中控的 `retry_advice` 拿这一格
+        // 当"可以重试"的证据（§19.2：重试语义由声明决定，不由猜）—— 于是服务超时的
+        // 那一次，中控会**鼓励模型把同一行命令再敲一遍**。
+        // 声明错一格，代价是一条命令跑两遍。这条改成 destructive：不自动重试。
+        .destructive()
+        .returns(json!({
+            "sent_bytes": {"type": "integer"},
+            "enter": {"type": "boolean"},
+            // 敲完之后该往哪看 —— 这句话得声明，**闭合的 schema 不许夹带**
+            // （这一条是投递关当场抓出来的：我回了它却没报它）
+            "note": {"type": "string"},
+        }))
+        .requires_on(&["confirmed"], &["sent_bytes"])
+        .lifecycle("per_session")
+        .to_json(),
+        ToolDecl::new(
+            "screen",
+            "**看这块屏幕**（会话模式）：当前网格 + 光标 + shell 还在不在。\
+             交互式程序只能这样看 —— `read` 给的是转义序列流。",
+            json!({"type": "object", "required": ["instance_id"], "additionalProperties": false,
+                   "properties": {"instance_id": {"type": "string"}}}),
+        )
+        .read_only()
+        .idempotent()
+        .returns(json!({
+            "cols": {"type": "integer"},
+            "rows": {"type": "integer"},
+            "cursor": {"type": "object"},
+            "text": {"type": "string"},
+            "alive": {"type": "boolean"},
+            "exit_code": {"type": ["integer", "null"]},
+            "marks": {"type": "array"},
+            "unknown_sequences": {"type": "integer"},
+            "unknown_sample": {"type": ["string", "null"]},
         }))
         .requires_on(&["confirmed"], &["text"])
         .lifecycle("per_session")
@@ -772,12 +862,8 @@ impl Term {
             "read" => self.tool_read(&req, &args),
             "close" => self.tool_close(&req, &args),
             "status" => self.tool_status(&req),
-            "send" | "screen" => json!({
-                "route": null, "effect": "refused", "code": "invalid",
-                "why": format!("`{tool}` 属于**会话模式**，第一版还没做"),
-                "remedy": "会话模式要真 PTY（ConPTY + 屏幕仿真 + OSC 133 的 shell 集成）——\
-                           见 02-工具 §5.18。现在用 run 跑单条命令"
-            }),
+            "send" => self.tool_send(&req, &args),
+            "screen" => self.tool_screen(&req, &args),
             other => {
                 reply::unknown_tool(other, &TOOL_NAMES)
             }
@@ -808,17 +894,46 @@ impl Term {
             });
         }
 
-        // 同一个持有者在同一个目录上重复 open ⇒ 幂等（和编辑器同一条纪律）
+        // 同一个持有者在同一个目录上重复 open ⇒ 幂等（和编辑器同一条纪律）。
+        //
+        // ⚠️ **模式也算身份的一部分**（2026-09-20 实测抓出来的）：命令模式和会话模式
+        // 能用到的工具是**完全不相交的两套**（`run` vs `send`/`screen`）。第一版把
+        // 幂等键写成"谁 + 哪条路径"，于是**要会话的调用方会拿回一个命令模式的实例**
+        // （回执里 mode 写着 command）—— 它下一次调 `send` 就被拒，而它明明收到过
+        // 一个 `confirmed`。那是**答非所问**，比多开一个实例糟得多。
+        // 加上模式之后：同一条路径、同一个持有者，最多两个实例（一边一个）——
+        // 终端本来就不占跨实例锁，这不违反任何东西，反而给实例数**封了顶**。
         let holder = format!("{}@{}", req.from, req.sid);
+        let want_session = args.get("session").and_then(Value::as_bool).unwrap_or(false);
         if let Some(t) = self
             .terms
             .values()
-            .find(|t| t.cwd == dir && t.holder == holder)
+            .find(|t| same_instance(t, &dir, &holder, want_session))
         {
+            // **尺寸对不上要说一声。** 会话开起来之后改不了尺寸（ResizePseudoConsole
+            // 没接），所以这里不能装作"按你要的 200 列开了" —— 那是我们做不到的事。
+            let note = match t.session.as_ref() {
+                Some(s) => {
+                    let (cols, rows) = s.screen.size();
+                    let (want_cols, want_rows) = (
+                        args.get("cols").and_then(Value::as_u64).unwrap_or(120) as usize,
+                        args.get("rows").and_then(Value::as_u64).unwrap_or(30) as usize,
+                    );
+                    ((cols, rows) != (want_cols, want_rows)).then(|| {
+                        format!(
+                            "这条会话**已经开着**，尺寸是 {cols}x{rows}，改不了\
+                             （ResizePseudoConsole 没接）—— 不是你写的 {want_cols}x{want_rows}"
+                        )
+                    })
+                }
+                None => None,
+            };
             return json!({
                 "route": null, "effect": "confirmed", "code": null,
                 "instance_id": t.id, "path": dir.display().to_string(),
-                "purpose": t.purpose, "idempotent": true
+                "purpose": t.purpose, "idempotent": true, "note": note,
+                // **如实说这个实例是哪一种**：命令模式还是会话模式
+                "mode": if t.session.is_some() { "session" } else { "command" }
             });
         }
 
@@ -827,7 +942,7 @@ impl Term {
         // **实例自带一句用途说明**（开的时候自己写，§5.16）
         // 溢出文件按会话+实例分堆：它是**服务自己的状态**（不是用户的项目文件）
         let spill = self.args.spill_dir.join(&self.args.sid).join(format!("{id}.log"));
-        let t = Terminal::new(
+        let mut t = Terminal::new(
             id.clone(),
             dir.clone(),
             purpose.to_string(),
@@ -836,6 +951,25 @@ impl Term {
             self.args.memory_cap,
             self.args.limits,
         );
+        // **会话模式**（§5.18）：`session: true` 时要的是一条**常驻的 shell**，
+        // 而不是"每条命令新起一个 cmd /C"。默认不开 —— 命令模式是绝大多数场景，
+        // 而开一条 PTY 是有代价的（一个常驻进程 + 一块屏幕）。
+        if want_session {
+            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(120) as u16;
+            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
+            match Session::start(&dir, cols, rows, id.clone(), self.tx.clone()) {
+                Ok(s) => t.session = Some(s),
+                Err(e) => {
+                    // **开不起来就说开不起来**（别退化成一个"看起来是会话模式"的东西）
+                    return json!({
+                        "route": null, "effect": "refused", "code": "invalid",
+                        "why": format!("会话模式起不来：{e}"),
+                        "remedy": "会话模式要伪控制台（ConPTY），只在 Windows 上有；\
+                                   别的平台上用命令模式（`open` 不带 `session`）"
+                    });
+                }
+            }
+        }
         self.terms.insert(id.clone(), t);
 
         // **标准形状的实例事件** —— 中控靠它把节点画到图上（第三层）
@@ -856,7 +990,112 @@ impl Term {
             "route": null, "effect": "confirmed", "code": null,
             "instance_id": id,
             "path": dir.display().to_string(),
-            "purpose": purpose
+            "purpose": purpose,
+            // 开的哪一种，**回执里就说清**（后面 `send`/`screen` 只对会话模式有意义）
+            "mode": if want_session { "session" } else { "command" },
+            // 刚开的这一条没有"已经开着"这回事
+            "note": Value::Null
+        })
+    }
+
+    /// **会话模式的两个入口**（§5.18）：`send` 往里敲，`screen` 看那块网格。
+    ///
+    /// 为什么它们不能拿命令模式的实例凑合：命令模式每条命令新起一个 `cmd /C`，
+    /// **没有可以"往里敲"的东西** —— 只能如实拒绝，并说清怎么开一个会话实例。
+    fn tool_send(&mut self, req: &Envelope, args: &Value) -> Value {
+        let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("send");
+        }
+        let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+        // **回车默认加上**：对终端来说"敲一行"就是文本 + `\r`；
+        // 要按别的键（比如 Ctrl-C）就显式给 `text` 并且 `enter: false`。
+        let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(true);
+        let Some(t) = self.terms.get_mut(id) else {
+            return reply::no_such_instance("send", id);
+        };
+        if let Some(v) = not_mine(req, t) {
+            return v;
+        }
+        let Some(s) = t.session.as_mut() else {
+            return json!({
+                "route": null, "effect": "refused", "code": "invalid",
+                "why": format!("`{id}` 是**命令模式**的实例 —— 没有可以往里敲的东西"),
+                "remedy": "会话模式要开的时候就说明：`open {path, session: true}`。\
+                           命令模式的实例只能跑整条命令（`run`）"
+            });
+        };
+        let mut bytes = text.as_bytes().to_vec();
+        if enter {
+            bytes.push(b'\r');
+        }
+        match s.pty.send(&bytes) {
+            Ok(()) => json!({
+                "route": null, "effect": "confirmed", "code": null,
+                // ⚠️ **平铺，不套 `data`**（2026-09-20 被投递关抓出来的）：
+                // 声明里写的是 `sent_bytes` 这一格，结果我把它塞进了 `data` 里面 ——
+                // 闸门当场判"少了必填的 `sent_bytes`"（整整一轮都在报）。
+                // 这个服务里 `read`/`run`/`open` 都是平的，只有 `help`/`ping`/`status`
+                // 用 `data`（它们是"看东西"的诊断入口）—— 跟着邻居写。
+                "sent_bytes": bytes.len(), "enter": enter,
+                "note": "敲进去了。终端不会马上回话 —— 用 `screen` 看它现在长什么样，\
+                         或者用 `read` 看这之后的输出流"
+            }),
+            Err(e) => json!({
+                "route": null, "effect": "refused", "code": "invalid",
+                "why": format!("敲不进去：{e}"),
+                "remedy": "多半是那个 shell 已经退了 —— `status` 看得见它还在不在；\
+                           要接着用就重新 `open {session: true}`"
+            }),
+        }
+    }
+
+    fn tool_screen(&mut self, req: &Envelope, args: &Value) -> Value {
+        let id = args.get("instance_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return reply::missing_instance_id("screen");
+        }
+        let Some(t) = self.terms.get_mut(id) else {
+            return reply::no_such_instance("screen", id);
+        };
+        if let Some(v) = not_mine(req, t) {
+            return v;
+        }
+        let Some(s) = t.session.as_mut() else {
+            return json!({
+                "route": null, "effect": "refused", "code": "invalid",
+                "why": format!("`{id}` 是**命令模式**的实例 —— 它没有屏幕，只有输出流"),
+                "remedy": "命令模式读 `read`（那是流）；会话模式才有 `screen`（那是网格）。\
+                           要看屏幕就 `open {path, session: true}`"
+            });
+        };
+        let alive = s.pty.alive();
+        let (cols, rows) = s.screen.size();
+        let (row, col) = s.screen.cursor();
+        let marks: Vec<Value> = s
+            .screen
+            .marks
+            .iter()
+            .rev()
+            .take(8)
+            .map(|m| json!({"kind": m.kind.to_string(), "exit": m.exit}))
+            .collect();
+        json!({
+            "route": null, "effect": "confirmed", "code": null,
+            // 同上：**平铺**（声明里就是这么写的）
+            "cols": cols, "rows": rows,
+            // 光标是 **0 起**的（跟网格一致），调用方别自己 ±1
+            "cursor": {"row": row, "col": col},
+            "text": s.screen.text(),
+            // **shell 还在不在**：这是事实，不是推断（§5.20 的"进程退出"那条触发）
+            "alive": alive,
+            "exit_code": if alive { Value::Null } else { json!(s.pty.exit_code()) },
+            // OSC 133 的标记（对端没装 shell hook 就是空的 —— 那也是事实）
+            "marks": marks,
+            // **没认出来的转义序列有几条** —— 如实报，别让模型以为
+            // 它看到的就是全部（§5.19 那条"对交互式程序 read 基本没用"的同源）
+            "unknown_sequences": s.screen.unknown,
+            "unknown_sample": s.screen.unknown_sample,
         })
     }
 
@@ -892,6 +1131,24 @@ impl Term {
             emit(&mut out, &reply);
             return;
         };
+        // **会话模式的实例上不跑 `run`**：那会**在外面另起一个 shell**，
+        // 而模型会以为"我在这条会话里跑了一条命令" —— 两个 shell 两个 cwd，
+        // 这个混淆比直接拒掉糟得多。
+        if t.session.is_some() {
+            let reply = self.mint(
+                MessageType::Result,
+                &req.from.clone(),
+                req.corr.clone(),
+                json!({
+                    "route": null, "effect": "refused", "code": "invalid",
+                    "why": format!("`{id}` 是**会话模式**的实例 —— `run` 会在外面另起一个 shell"),
+                    "remedy": "往这条会话里敲：`send {instance_id, text}`；看它现在什么样：`screen`。\
+                               要跑整条命令就开一个命令模式的实例（`open` 不带 `session`）"
+                }),
+            );
+            emit(&mut out, &reply);
+            return;
+        }
         if cmd.trim().is_empty() {
             let reply = self.mint(
                 MessageType::Result,
@@ -969,6 +1226,11 @@ impl Term {
             return;
         };
         t.append(text);
+        // **会话模式还要喂屏幕**（§5.19）：`read` 看流、`screen` 看**网格** ——
+        // 交互式程序重写屏幕，线性读它的输出流毫无意义。
+        if let Some(s) = t.session.as_mut() {
+            s.screen.feed_text(text);
+        }
         // 拷出来就完事 —— 后面要用 &mut self 发消息，不能再借着 t
         let Some((corr, to)) = t
             .running
@@ -1260,6 +1522,11 @@ impl Term {
                     "cwd": t.cwd.display().to_string(),
                     "purpose": t.purpose,
                     "owner": t.holder,
+                    // **它是哪一种**：命令模式（`run`）还是会话模式（`send`/`screen`）。
+                    // 中控画图要按这个分节点（会话模式那个节点背后**真有一个活进程**）。
+                    "mode": if t.session.is_some() { "session" } else { "command" },
+                    // 会话模式才有：那条 shell 的 pid（命令模式没有常驻进程，如实 null）
+                    "pid": t.session.as_ref().map(|s| s.pty.pid()),
                     "can_operate": not_mine(req, t).is_none(),
                     "running": t.running.as_ref().map(|r| json!({"cmd": r.cmd, "by": r.by})),
                     "bytes": t.len(),
@@ -1389,6 +1656,17 @@ fn cd_target(cmd: &str) -> Option<Option<String>> {
     None
 }
 
+/// **这条实例是不是"这次 `open` 想要的那一个"？**
+///
+/// 三个都要对上：**持有者 + 目录 + 模式** —— `open` 的幂等键就是这个三元组。
+///
+/// 为什么模式也在键里（2026-09-20 实测）：两种模式的可调工具**完全不相交**
+/// （`run` vs `send`/`screen`）。把模式漏在键外，要会话的调用方就会拿回一个
+/// **命令模式**的实例 —— 回执是 `confirmed`，下一次调用却被拒。**答非所问。**
+fn same_instance(t: &Terminal, dir: &std::path::Path, holder: &str, session: bool) -> bool {
+    t.cwd == dir && t.holder == holder && t.session.is_some() == session
+}
+
 fn emit(out: &mut impl io::Write, env: &Envelope) {
     match codec::encode(env) {
         Ok(line) => {
@@ -1434,6 +1712,42 @@ mod tests {
             .collect();
         let taught: Vec<String> = TOOL_NAMES.iter().map(|s| s.to_string()).collect();
         assert_eq!(declared, taught, "报错里教的名字和 manifest 对不上");
+    }
+
+    /// **`open` 的幂等键里有"模式"这一格**（2026-09-20 实测）。
+    ///
+    /// 漏了它的后果不是"多开一个实例"，而是**要会话的调用方拿回一个命令模式的实例**：
+    /// 回执 `mode: command`、`effect: confirmed`，然后它调 `send` 被拒 ——
+    /// 而它没有任何理由怀疑自己拿到的不是会话。所以这条规则要用测试钉死：
+    /// **同一条路径、同一个持有者，模式不同就是两个实例。**
+    #[test]
+    fn the_open_key_includes_the_mode() {
+        let dir = std::env::temp_dir();
+        let holder = "agent:dada@s-1";
+        // 命令模式那个（`Terminal::new` 出来就是命令模式）
+        let cmd = a_terminal(holder);
+        assert_eq!(cmd.cwd, dir, "测试的前提：`a_terminal` 的 cwd 就是临时目录");
+        // 会话模式那个：真起一条 PTY（起不来就跳过 —— 同 `pty.rs` 那两条的纪律）
+        let (tx, _rx) = mpsc::channel();
+        let Ok(sess) = Session::start(&dir, 80, 24, "t-2".into(), tx) else {
+            eprintln!("PTY 起不来（环境问题，跳过）");
+            return;
+        };
+        let mut ses = a_terminal(holder);
+        ses.session = Some(sess);
+
+        // 模式对上，才是"已经开着"的那一个（幂等）
+        assert!(same_instance(&cmd, &dir, holder, false));
+        assert!(same_instance(&ses, &dir, holder, true));
+        // 模式不对上 ⇒ **不是同一个实例**（各自开各自的）
+        assert!(
+            !same_instance(&cmd, &dir, holder, true),
+            "要会话却认出命令模式那条 ⇒ 答非所问"
+        );
+        assert!(!same_instance(&ses, &dir, holder, false));
+        // 换个人、换条路径，都不是
+        assert!(!same_instance(&ses, &dir, "agent:bob@s-1", true));
+        assert!(!same_instance(&ses, &dir.join("nope"), holder, true));
     }
 
     fn req_from(who: &str, caller_kind: &str) -> Envelope {

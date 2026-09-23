@@ -74,12 +74,60 @@ pub struct Terminal {
     spill: Option<Spill>,
     /// 内存里最多留多少字节（超了就把前面的挪到磁盘）
     memory_cap: usize,
+    /// **会话模式**：一条常驻的 shell（PTY）+ 它那块屏幕（§5.18、§5.19）。
+    ///
+    /// `Some` = 会话模式，`None` = 命令模式（每条命令新起一个 `cmd /C`）。
+    /// **两者不是二选一的对立物**：命令模式是会话模式的一层封装
+    /// （发出、等它结束、把这期间的输出作为结果返回）—— 这一版两条并存，
+    /// 因为命令模式的"等结束"那半还没有 OSC 133 可用（见 `not_implemented`）。
+    pub session: Option<Session>,
     /// **这棵树的硬限额**（Job Object 上、由内核执行）。
     ///
     /// 默认全空 = 不限额：多严算"合理"是 profile 的事（待定 #3），
     /// 而"默认开一个我拍的数"会在正常需求上碰壁。开了才报 `resources: "limits"`。
     limits: Limits,
     pub read_cursor: usize,
+}
+
+/// **一条会话**：PTY 本体 + 它的屏幕。
+///
+/// 屏幕**不是**从输出流现算的 —— 它是**一块网格**，因为**终端不是打印机**：
+/// `vim` / 进度条这些东西重写屏幕，线性看它们的输出流毫无意义（§5.19）。
+pub struct Session {
+    pub pty: crate::pty::PtySession,
+    pub screen: crate::screen::Screen,
+}
+
+impl Session {
+    /// 起一条会话：PTY 的输出**回到主循环**（同命令模式那条纪律：
+    /// 所有状态变更只在主循环里发生，实例状态不需要锁），
+    /// 由主循环再喂给屏幕。
+    pub fn start(
+        dir: &std::path::Path,
+        cols: u16,
+        rows: u16,
+        term_id: String,
+        tx: Sender<Inbound>,
+    ) -> std::io::Result<Session> {
+        let pty = crate::pty::PtySession::spawn(dir, cols, rows, move |bytes| {
+            // **按 UTF-8 边界切**（同命令模式那两个读线程的做法）：切不动的
+            // 那几个字节留到下一块 —— 否则每块都会把一个汉字劈成两个替换字符。
+            thread_local! {
+                static CARRY: std::cell::RefCell<Utf8Carry> = std::cell::RefCell::new(Utf8Carry::default());
+            }
+            let text = CARRY.with(|c| c.borrow_mut().push(bytes));
+            if !text.is_empty() {
+                let _ = tx.send(Inbound::TermOutput {
+                    term_id: term_id.clone(),
+                    text,
+                });
+            }
+        })?;
+        Ok(Session {
+            pty,
+            screen: crate::screen::Screen::new(cols as usize, rows as usize),
+        })
+    }
 }
 
 /// 一段溢出到磁盘的输出：文件位置 + 已经落进去多少字节。
@@ -117,6 +165,8 @@ impl Terminal {
             purpose,
             holder,
             running: None,
+            // 默认是命令模式；要会话模式由 `open {session: true}` 事后装上
+            session: None,
             output: String::new(),
             spill: Some(Spill {
                 path: spill_path,

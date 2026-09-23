@@ -105,7 +105,9 @@ Check '5. **`not_implemented` 必须真的有那个字段**（说过要写就得
     # `harness-mem` 曾经漏了它 —— 而 README 里写着"这一层没做的，也写在 not_implemented 里"
     $need = @{
         'editor:1' = @('project_rollback')
-        'term:1'   = @('send', 'screen')
+        # 2026-09-20：`send`/`screen` 落地之后，终端那份"做不到"的清单换成现在真做不到的两条：
+        # **改不了会话尺寸**，以及**会话模式里的 `cd` 管不住**（围栏只管它从哪起）。
+        'term:1'   = @('resize', 'session_cwd')
         'mem:1'    = @('recall', 'anchors')
         'mcp:1'    = @('reconnect', 'cancel', 'rename')
         'skill:1'  = @('scope', 'search')

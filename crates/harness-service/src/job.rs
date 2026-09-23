@@ -110,6 +110,23 @@ mod imp {
         /// 不在这里报错是因为：装不进 job 是个环境限制（比如我们自己在某个
         /// 不允许 breakaway 的 job 里），不是这次调用的错。
         pub fn assign(child: &Child, limits: Limits) -> Option<Job> {
+            // 前置条件由我们在这里保证：句柄来自一个**活着的** `Child`。
+            unsafe { Self::assign_raw(child.as_raw_handle() as HANDLE, limits) }
+        }
+
+        /// 同上，但**拿一个裸句柄**。
+        ///
+        /// 为什么需要它（2026-09-20）：会话模式那条路是用 `CreateProcessW` 直接起的
+        /// （伪控制台必须通过属性表交给新进程），手里只有 `PROCESS_INFORMATION` 里那个
+        /// `hProcess`，**没有 `std::process::Child`**。少这一个入口的话，
+        /// 那条路就只能"只能杀一层"—— 而它偏偏是最需要整棵收的一类进程（一条 shell）。
+        ///
+        /// # Safety
+        ///
+        /// `raw` 必须是一个**有效的进程句柄**（真的进程，不是随便一个指针）。
+        /// `windows-sys` 把这个句柄建模成裸指针，于是"它是不是个真句柄"这件事
+        /// Rust 这一层**认不出来** —— 所以它是 `unsafe fn`，由调用方担这个前提。
+        pub unsafe fn assign_raw(raw: HANDLE, limits: Limits) -> Option<Job> {
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if handle.is_null() {
@@ -142,7 +159,7 @@ mod imp {
                 if ok == 0 {
                     return None;
                 }
-                if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                if AssignProcessToJobObject(handle, raw) == 0 {
                     return None;
                 }
                 Some(Job { handle })
@@ -225,6 +242,13 @@ pub struct Job;
 #[cfg(not(windows))]
 impl Job {
     pub fn assign(_child: &Child, _limits: Limits) -> Option<Job> {
+        None
+    }
+    /// 非 Windows：没有 Job 这回事，**如实返回 `None`**（调用方退回"只能杀一层"）
+    ///
+    /// 签名与 Windows 那份一致（`unsafe fn`）—— **同一个名字在两边形状必须一样**，
+    /// 否则调用方得按平台写两份代码，而"两份就会漂"。
+    pub unsafe fn assign_raw(_raw: *mut core::ffi::c_void, _limits: Limits) -> Option<Job> {
         None
     }
     pub fn terminate(&self) {}

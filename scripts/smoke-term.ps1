@@ -160,8 +160,10 @@ Check '10. 超时之后终端还能接着用' {
 Check '11. read 默认给「自上次以来」的增量，读完游标就空了' {
     ($r11.payload.text.Length -gt 0) -and ($r12.payload.text -eq '')
 }
-Check '12. 会话模式的 send 被明确拒绝（不假装支持）' {
-    $r13.payload.effect -eq 'refused' -and $r13.payload.code -eq 'invalid' -and $r13.payload.why -like '*会话模式*' -and $r13.payload.remedy -like '*PTY*'
+# 2026-09-20：`send` **已经不是没实现的工具了**（会话模式落地，见 smoke-term-session）。
+# 所以这条判据跟着事实走：现在是"命令模式的实例上敲字 ⇒ 明确拒，并指路怎么开会话"。
+Check '12. 命令模式的实例上 send 被明确拒绝（并指路去开会话）' {
+    $r13.payload.effect -eq 'refused' -and $r13.payload.code -eq 'invalid' -and $r13.payload.why -like '*命令模式*' -and $r13.payload.remedy -like '*session*'
 }
 Check '13. status 看得见终端、cwd、用途、持有者' {
     $t = $r14.payload.data.terms | Where-Object { $_.instance_id -eq 't-1' }
@@ -181,7 +183,9 @@ Check '16. close 之后的终端真的收掉了' {
 Check '17. 终端的 manifest 说清了"我占了什么"和"我做不到什么"' {
     $pres = $script:all | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.type -eq 'presence' -and $_.payload.manifest } | Select-Object -First 1
     $m = $pres.payload.manifest
-    ($m.owns.domain -eq 'shell') -and $m.not_implemented.send -and $m.not_implemented.screen
+    # 2026-09-20：`send`/`screen` 做出来了，这份"做不到"的清单里就得换成**现在真做不到的**：
+    # 改不了会话尺寸、会话里的 `cd` 管不住（围栏只管它从哪起）。
+    ($m.owns.domain -eq 'shell') -and $m.not_implemented.resize -and $m.not_implemented.session_cwd
 }
 Check '18. 中控照常记账：每一次 run 都有结果收尾' {
     $logPath = Join-Path (Join-Path (Join-Path $dataDir 'sessions') $sid) 'log.jsonl'

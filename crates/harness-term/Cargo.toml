@@ -18,5 +18,9 @@ serde_json.workspace = true
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # 会话模式（ConPTY）：伪控制台本身 + 建管道 + 起进程
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
     "Win32_System_JobObjects",
 ] }
