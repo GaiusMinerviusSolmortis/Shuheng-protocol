@@ -606,11 +606,15 @@ fn main() {
     );
     emit(&mut out, &prompt_ev);
 
-    // **恢复**：向中控要我上次的上下文。
+    // **恢复**：向中控要**记录**，自己把记录变成上下文。
     //
-    // 为什么不自己去读日志：**日志的格式归中控**。智能体提的是一个语义请求
-    // ——"给我我上次看到过的东西" —— 至于它是从 jsonl 拼出来还是别的方式，
-    // 那是中控的实现细节。这样也不需要把日志格式的两份知识放在两个地方。
+    // 2026-09-23 改了分工（L1）：中控**不再懂上下文的结构**，它只回答
+    // "有哪些记录"（`{"op":"log","instance":<我>}`）；至于哪条是系统提示、
+    // 哪条是模型消息、压缩当时是怎么切的 —— **那是这个智能体实现的私事**。
+    //
+    // 为什么这是对的：换一个框架、换一种记忆策略，上下文的结构就变了；
+    // 中控只要不认识它，就永远不必为它改一行。代价是**它的诚实性**变成了
+    // 不变量二的前提（中控记的是每一条消息，但"模型看到了什么"只有它自己知道）。
     if a.args.resume {
         // 统一走 `ask_ctrl` —— 它会把不是等它这条的消息**收进 inbox**，不丢。
         // （这里踩过一次：为了恢复专门写过一个只等自己那条回信的版本，
@@ -618,13 +622,15 @@ fn main() {
         if let Some(data) = a.ask_ctrl(
             &mut out,
             &rx,
-            json!({"op": "replay", "agent": a.args.instance}),
+            json!({"op": "log", "instance": a.args.instance}),
         ) {
-            let restored = data
-                .get("items")
+            let records = data
+                .get("records")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            // **记录 → 上下文**：这一步现在是智能体自己的（原来在中控里）。
+            let (system, restored, seen) = rebuild_from_records(&records, &a.args.instance);
             let n = restored.len();
             for item in restored {
                 let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -635,14 +641,11 @@ fn main() {
             }
             // 系统提示是**重新编译**出来的（它是冻住那段，同样的输入必须逐字节一样）；
             // 日志里那份应当与它一致 —— 不一致就说明编译不确定，那要立刻知道
-            let same_system = data
-                .get("system")
-                .and_then(Value::as_str)
-                .map(|s| s == a.system)
-                .unwrap_or(true);
+            let same_system = system.map(|s| s == a.system).unwrap_or(true);
             eprintln!(
-                "[agent] 恢复上下文：{} 项，系统提示{}一致，日志到 seq {}",
+                "[agent] 恢复上下文：{} 项（读了 {} 条记录），系统提示{}一致，日志到 seq {}",
                 n,
+                seen,
                 if same_system { "" } else { "**不**" },
                 data.get("to_seq").and_then(Value::as_u64).unwrap_or(0)
             );
@@ -1536,7 +1539,85 @@ fn render_result(payload: &Value) -> String {
     }
 }
 
-/// 把中控回放出来的一条（JSON）变回上下文里的一项。
+/// **记录 → 上下文**（2026-09-23 从中控整块搬过来）。
+///
+/// 中控现在只给**记录**（`{"op":"log"}` 回来的原样信封），
+/// "记录怎么变成我的上下文"是**这个智能体实现的私事** —— 所以重建在这儿，
+/// 压缩手术的重放也在这儿。**中控不再认识"上下文"长什么样**。
+///
+/// 认三种事件，**按记录顺序**（它们本来就是按时间发生的）：
+///
+/// | 记录 | 干什么 |
+/// |---|---|
+/// | `prompt_compiled` | 那段编译一次就冻住的系统提示 |
+/// | `model_item` | 往上下文里放一样东西（用户 / 助手 / 调用 / 结果 / 敕令……）|
+/// | `compaction` | **把同一刀切回去**：扔掉被压掉的那段、清掉旧摘要、插入新摘要 |
+///
+/// 返回 `(系统提示, 条目, 认了几条)`。**只用 JSON**：这一步在处理记录，
+/// 没必要碰 `Item` 的内部 —— 那一层是 `rebuild_item` 的活。
+fn rebuild_from_records(records: &[Value], me: &str) -> (Option<String>, Vec<Value>, usize) {
+    let mut system: Option<String> = None;
+    let mut items: Vec<Value> = Vec::new();
+    let mut seen = 0usize;
+    for r in records {
+        // 只认**我自己发的 `event`**：中控给的是"我的流量"（我发的 + 发给我的），
+        // 而"我往自己上下文里放了什么"只有我自己的事件算数。
+        if r.get("type").and_then(Value::as_str) != Some("event") {
+            continue;
+        }
+        if r.get("from").and_then(Value::as_str) != Some(me) {
+            continue;
+        }
+        let Some(payload) = r.get("payload") else { continue };
+        match payload.get("kind").and_then(Value::as_str) {
+            Some("prompt_compiled") => {
+                system = payload
+                    .get("system")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                seen += 1;
+            }
+            Some("model_item") => {
+                if let Some(item) = payload.get("item") {
+                    items.push(item.clone());
+                    seen += 1;
+                }
+            }
+            Some("compaction") if apply_compaction(&mut items, payload) => {
+                seen += 1;
+            }
+            _ => {}
+        }
+    }
+    (system, items, seen)
+}
+
+/// **把一刀压缩原样切回去**（§3 那一节；2026-09-23 从中控搬来）。
+///
+/// 它只动 `items`（系统前缀不在里面，单独留着）：扔掉被压掉的那一段、
+/// 清掉旧摘要、把新摘要插回**当时那个位置**（位置记在记录的 `summary_at` 里）——
+/// 不是"插到最前面"：回合内压缩的摘要会落在中间，插错地方就等于**换了一段历史**。
+fn apply_compaction(items: &mut Vec<Value>, payload: &Value) -> bool {
+    let (Some(cut), Some(at)) = (
+        payload.get("cut").and_then(Value::as_u64),
+        payload.get("summary_at").and_then(Value::as_u64),
+    ) else {
+        return false;
+    };
+    let summary = payload
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let cut = (cut as usize).min(items.len());
+    items.drain(0..cut);
+    items.retain(|i| i.get("kind").and_then(Value::as_str) != Some("summary"));
+    let at = (at as usize).min(items.len());
+    items.insert(at, json!({"kind": "summary", "text": summary}));
+    true
+}
+
+/// 把恢复回来的一条（JSON）变回上下文里的一项。
 ///
 /// 认不出来就**跳过并说话** —— 回放遇到不认识的东西时静默吞掉，
 /// 就等于"恢复了个寂寞"。
@@ -1639,6 +1720,84 @@ mod tests {
         fn reply(&mut self, _req: &ModelRequest) -> ModelReply {
             ModelReply::text("   ", 7)
         }
+    }
+
+    /// **记录 → 上下文**（2026-09-23 从中控整块搬过来的那两块，这是它们唯一的判据）。
+    ///
+    /// 认三种事件、按记录顺序、**只认我自己发的**：
+    /// 别人的事件、以及我自己发的非 `event`（比如一条请求）都不该变成上下文里的东西。
+    #[test]
+    fn records_rebuild_into_the_same_context() {
+        let me = "agent:dada";
+        let rec = |seq: u64, kind: &str, extra: Value| {
+            let mut p = json!({"kind": kind});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    p[k] = v.clone();
+                }
+            }
+            json!({"seq": seq, "recorded_at": 0, "id": format!("m-{seq}"), "ts": 0,
+                   "type": "event", "from": me, "to": "ctrl", "sid": "s-1",
+                   "authority": "agent", "payload": p})
+        };
+        let records = vec![
+            rec(1, "prompt_compiled", json!({"system": "你是达达"})),
+            rec(2, "model_item", json!({"item": {"kind": "user", "text": "第一件事"}})),
+            rec(3, "model_item", json!({"item": {"kind": "assistant", "text": "好"}})),
+            // 一刀压缩：扔掉前两条，摘要在**压完之后的位置 0**
+            rec(4, "compaction",
+                json!({"cut": 2, "summary_at": 0, "summary": "【摘要】第一件事做了"})),
+            rec(5, "model_item", json!({"item": {"kind": "user", "text": "第二件事"}})),
+            // 别人发的事件：混在里面，**不许进我的上下文**
+            json!({"seq": 6, "recorded_at": 0, "id": "m-6", "ts": 0, "type": "event",
+                   "from": "agent:bob", "to": "ctrl", "sid": "s-1", "authority": "agent",
+                   "payload": {"kind": "model_item", "item": {"kind": "user", "text": "别人的"}}}),
+            // 我自己发的**请求**：也是记录，但它不是"我往上下文里放了什么"
+            json!({"seq": 7, "recorded_at": 0, "id": "m-7", "ts": 0, "type": "request",
+                   "from": me, "to": "term:1", "corr": "c-1", "sid": "s-1",
+                   "authority": "agent", "payload": {"tool": "run"}}),
+        ];
+        let (system, items, seen) = rebuild_from_records(&records, me);
+        assert_eq!(system.as_deref(), Some("你是达达"));
+        assert_eq!(seen, 5, "系统提示 + 三条条目 + 一刀压缩");
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|i| i["kind"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(kinds, vec!["summary", "user"], "被压掉的两条不在了，摘要在原位");
+        assert_eq!(items[1]["text"], "第二件事");
+        assert_eq!(items.len(), 2, "别人的条目和那条请求都没进来");
+    }
+
+    /// **摘要插回它当时的位置** —— 不是"插到最前面"。
+    ///
+    /// 回合内压缩的摘要会落在**中间**；插错地方，重放出来的历史就和当时不是同一份，
+    /// 而那正是"可重放"要保的东西。
+    #[test]
+    fn a_summary_goes_back_where_it_was() {
+        let mut items: Vec<Value> = (0..4)
+            .map(|i| json!({"kind": "user", "text": format!("第 {i} 条")}))
+            .collect();
+        assert!(apply_compaction(
+            &mut items,
+            &json!({"cut": 2, "summary_at": 1, "summary": "S"})
+        ));
+        let pairs: Vec<(&str, &str)> = items
+            .iter()
+            .map(|i| {
+                (
+                    i["kind"].as_str().unwrap_or(""),
+                    i["text"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        // 扔掉前两条 ⇒ 剩 [2, 3]；摘要在**位置 1**（不是最前面）
+        assert_eq!(
+            pairs,
+            vec![("user", "第 2 条"), ("summary", "S"), ("user", "第 3 条")]
+        );
+        // 缺字段的记录**不算一刀**（返回 false，调用方才好如实报）
+        assert!(!apply_compaction(&mut items, &json!({"cut": 1})));
     }
 
     /// **摘要模型连不上时不把压缩整个取消，但也绝不装作那是它写的。**

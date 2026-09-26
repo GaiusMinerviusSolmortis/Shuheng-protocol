@@ -163,8 +163,14 @@ Check '7. **恢复回来的东西里有上一轮的工具结果**（不是个空
 
 Write-Host ''
 Write-Host '== 第三轮：日志坏了怎么办（崩溃语义：尾部可以半残、中间不许有洞）==' -ForegroundColor Cyan
-# **这一轮只问中控**：回放是协议层的事（不变量二的另一半），跟智能体无关 ——
-# 所以这里不起智能体，console 直接发 `{"op":"replay"}`。
+# **这一轮只问中控**：读日志是协议层的事 —— 所以这里不起智能体，
+# console 直接发 `{"op":"log","instance":...}`。
+#
+# ⚠️ 2026-09-23（L1）：这条 op 原来叫 `replay`，回的是**重建好的上下文**
+# （`system` + `items`）。现在中控只回**记录**（原样信封），重建是智能体自己的事 ——
+# 所以下面这几条判据盯的是"记录读得出来吗、跳过几行如实说了吗、有洞拒了吗"，
+# **而"这些记录能不能重建成上下文"由第 3～7 条那些跑真智能体的判据盯着**
+# （它读 `context_restored` 那条事件，走的就是新的那条路）。
 $servicesEmpty = Join-Path $work 'services-empty.json'
 Set-Content -LiteralPath $servicesEmpty -Value '[]' -Encoding utf8
 $servicesPath = $servicesEmpty
@@ -172,12 +178,12 @@ $servicesPath = $servicesEmpty
 Add-Content -LiteralPath $logPath -Value '{"seq":9999,"recorded_at":1,"id":"m-broken","ts":0,"type":"resu' -NoNewline -Encoding utf8
 $p3 = Start-Ctrl @()
 Start-Sleep -Milliseconds 1500
-$replayMsg = '{"id":"m-replay","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-replay","sid":"' + $sid + '","authority":"user","payload":{"op":"replay","agent":"agent:dada"}}'
+$replayMsg = '{"id":"m-replay","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-replay","sid":"' + $sid + '","authority":"user","payload":{"op":"log","instance":"agent:dada"}}'
 Write-Line $p3 $replayMsg
 $r3 = Pump $p3 'c-replay'
-Check '8. **尾部半残的日志照样重建得出来**（崩在写日志那一下，不该把整份日志判死）' {
-    # 注意：`replay` 回的 `items` 是**那一串上下文项本身**（条数是 `records_seen`）
-    $r3.payload.effect -eq 'confirmed' -and @($r3.payload.data.items).Count -ge 4
+Check '8. **尾部半残的日志照样读得出来**（崩在写日志那一下，不该把整份日志判死）' {
+    # 现在是**记录**（原样信封），不再是重建好的上下文项
+    $r3.payload.effect -eq 'confirmed' -and @($r3.payload.data.records).Count -ge 4
 }
 Check '9. 而且它**如实说**跳过了一行半残的尾巴（不是偷偷跳过）' {
     $r3.payload.data.broken_tail -eq 1
@@ -197,7 +203,7 @@ $holed.AddRange([string[]]$keep[3..($keep.Count - 1)])
 [System.IO.File]::WriteAllLines($logPath, $holed)
 $p4 = Start-Ctrl @()
 Start-Sleep -Milliseconds 1500
-$replay2 = '{"id":"m-replay2","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-replay2","sid":"' + $sid + '","authority":"user","payload":{"op":"replay","agent":"agent:dada"}}'
+$replay2 = '{"id":"m-replay2","ts":0,"type":"request","from":"console","to":"ctrl","corr":"c-replay2","sid":"' + $sid + '","authority":"user","payload":{"op":"log","instance":"agent:dada"}}'
 Write-Line $p4 $replay2
 $r4 = Pump $p4 'c-replay2'
 Check '11. **中间有洞就不干**：明确拒，并说清是哪一段断了' {

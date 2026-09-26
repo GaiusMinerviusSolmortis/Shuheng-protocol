@@ -693,7 +693,7 @@ fn run() -> i32 {
     //
     // 注意恢复得回来的是什么、不是什么：
     // * **回得来**：会话状态、托管、点名的智能体 —— 这些是**坐标**，写在 meta 里；
-    //   以及智能体看到过的上下文 —— 那在**日志**里（`replay` 那条路）。
+    //   以及智能体看到过的上下文 —— 那在**日志**里（`log` 那条路，由智能体自己解释）。
     // * **回不来**：工具实例。它们是进程内的东西，跟着服务一起死了 ——
     //   而 §12.7 说的"挂起 = 工具实例收掉、会话留着"本来就是这个意思，
     //   所以这不是缺陷，是定义。
@@ -978,7 +978,7 @@ fn load_specs(path: &PathBuf) -> Result<Vec<ServiceSpec>, String> {
 /// 把两件事混成一句，模型会拿"权限不够"去改自己的写法，然后在原地打转。
 const KNOWN_OPS: [&str; 20] = [
     "ping", "barrier", "list", "index", "session", "prompts", "prompt", "grant", "revoke",
-    "my_tools", "replay", "host", "delegate", "unhost", "suspend", "resume", "end", "spawn",
+    "my_tools", "log", "host", "delegate", "unhost", "suspend", "resume", "end", "spawn",
     "stop", "shutdown",
 ];
 
@@ -989,15 +989,15 @@ const KNOWN_OPS: [&str; 20] = [
 /// | 档 | op | 谁能发 |
 /// |---|---|---|
 /// | `observe` | `ping` `list` `index` `session` `prompts` | 任何活着的实例（看一眼不改什么）|
-/// | `agent` | `my_tools` `barrier` `replay` | 智能体（恢复上下文、请中控落盘、问自己被授权用什么）|
+/// | `agent` | `my_tools` `barrier` `log` | 智能体（读自己的记录、请中控落盘、问自己被授权用什么）|
 /// | `user` | 其余（`host` `unhost` `delegate` `suspend` `resume` `end` `spawn` `stop` `shutdown` `prompt` `grant` `revoke`）| **只有用户** |
 ///
-/// ⚠️ `replay` 在 `agent` 档，但它能读到**整场会话的模型上下文**（含系统提示）。
+/// ⚠️ `log` 在 `agent` 档，但一条"给我**全场**记录"的请求能读到**整场会话**。
 /// 所以它还有第二道门：**低于 `user` 的调用方只能查自己**（见那一支的注释）。
 fn op_min_authority(op: &str) -> Authority {
     match op {
         "ping" | "list" | "index" | "session" | "prompts" => Authority::Observe,
-        "my_tools" | "barrier" | "replay" => Authority::Agent,
+        "my_tools" | "barrier" | "log" => Authority::Agent,
         _ => Authority::User,
     }
 }
@@ -1006,7 +1006,7 @@ fn op_min_authority(op: &str) -> Authority {
 ///
 /// 它是**派生读模型**（同身份索引）：丢了能从日志算回来，所以**不该另存一份**。
 /// 宽松读：读不出来的行直接跳过 —— 一条坏行只让水位**偏低一点**，
-/// 而那种日志本来也重建不出会话（`replay` 会明确拒）。
+/// 而那种日志本来也重放不出会话（`log` 会明确拒）。
 fn rebuild_id_water(
     log: &harness_core::session_log::SessionLog,
 ) -> std::collections::BTreeMap<String, u64> {
@@ -1030,58 +1030,14 @@ fn rebuild_id_water(
     map
 }
 
-/// **从会话日志里重建一个智能体看到过的东西。**
-///
-/// 只认三种记录，而且顺序不能变：
-///
-/// | 记录 | 干什么 |
-/// |---|---|
-/// | `prompt_compiled` | 那段编译一次就冻住的系统提示 |
-/// | `model_item` | 往上下文里放一样东西（用户、助手、调用、结果、敕令……）|
-/// | `compaction` | **把同一刀切回去**：扔掉被压掉的那段、清掉旧摘要、插入新摘要 |
-///
-/// `who` 是智能体实例 id —— 一个会话里可能不止一个智能体，
-/// 各人的上下文不能串（现在虽然只有一个，但形状先按有的来）。
-fn reconstruct(
-    records: &[harness_core::session_log::LogRecord],
-    who: &str,
-) -> (Option<String>, Vec<serde_json::Value>, usize) {
-    let mut system: Option<String> = None;
-    // 这里**只用 JSON**：回放本来就是在处理记录，不该为了它去依赖记忆内核的类型
-    let mut items: Vec<Value> = Vec::new();
-    let mut seen = 0usize;
-    for r in records {
-        if r.envelope.kind != MessageType::Event {
-            continue;
-        }
-        let mine = who.is_empty() || r.envelope.from == who;
-        let kind = r.envelope.payload.get("kind").and_then(Value::as_str);
-        match kind {
-            Some("prompt_compiled") if mine => {
-                system = r
-                    .envelope
-                    .payload
-                    .get("system")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                seen += 1;
-            }
-            Some("model_item") if mine => {
-                if let Some(item) = r.envelope.payload.get("item") {
-                    items.push(item.clone());
-                    seen += 1;
-                }
-            }
-            // 摘报合并进这一臂的守卫里（clippy 的 `collapsible_match`）——
-            // `mine` 必须留在前面：它不是自己那份的历史就别解析（短路）
-            Some("compaction") if mine && apply_compaction(&mut items, &r.envelope.payload) => {
-                seen += 1;
-            }
-            _ => {}
-        }
-    }
-    (system, items, seen)
-}
+// ⚠️ **"把记录变成上下文"那两块不在这儿了**（2026-09-23 整块搬到 `harness-agent`）。
+//
+// 它们原来认三种事件（系统提示编译 / 模型条目 / 压缩手术），还替智能体重放压缩。
+// 那是**中控在懂上下文的结构**，而上下文的结构是某个智能体实现的私事 —— 换一个框架、
+// 换一种记忆策略它就变了，而中控不该为它改一行。
+//
+// 判据是"这份源码里不许再出现那三个标识符"，所以**这里故意不把它们写出来**
+// （写出来这条判据就查不出来了）。要核就 `git grep` 那三个词。
 
 /// **"这次调用到底能不能重试"** —— 中控替模型把它算出来（§19.2 偷来的那一条）。
 ///
@@ -1119,28 +1075,6 @@ fn retry_advice(tool: Option<&str>, hints: Option<registry::ToolHints>) -> Strin
              **先看状态，别自动重试**"
         ),
     }
-}
-
-/// 把一次压缩**原样**应用回去。切点、插入点、摘要都在记录里。
-fn apply_compaction(items: &mut Vec<Value>, payload: &Value) -> bool {
-    let (Some(cut), Some(at)) = (
-        payload.get("cut").and_then(Value::as_u64),
-        payload.get("summary_at").and_then(Value::as_u64),
-    ) else {
-        return false;
-    };
-    let summary = payload
-        .get("summary")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let cut = (cut as usize).min(items.len());
-    // 被压掉的是开头那一段（系统前缀不在 items 里，它单独留着）
-    items.drain(0..cut);
-    items.retain(|i| i.get("kind").and_then(Value::as_str) != Some("summary"));
-    let at = (at as usize).min(items.len());
-    items.insert(at, json!({"kind": "summary", "text": summary}));
-    true
 }
 
 impl App {
@@ -3087,49 +3021,70 @@ impl App {
             //
             // 这是不变量二（模型可见即已记录）的另一半：光记下来不算数，
             // **得有人真的能从日志重建**。跨进程恢复就是那个检验。
-            "replay" => {
+            // **读日志**（2026-09-23 起：它不再"重建上下文"）。
+            //
+            // L1 那一刀：**中控不再懂上下文的结构**。它只回答"有哪些记录"，至于
+            // "记录怎么变成我的上下文"（哪条是系统提示、哪条是模型消息、压缩怎么重放）
+            // 是**智能体自己的事** —— 所以"重建上下文"和"压缩手术的重放"这两块
+            // 从这儿**整块搬到了 `harness-agent`**（旧函数名在这里也不留，
+            // 免得判据 `git grep` 那三个标识符时被自己的注释绊住）。
+            //
+            // 为什么这是对的：上下文的结构是**某个智能体实现的私事**（换一个框架、
+            // 换一种记忆策略，结构就变了），而中控只要不认识它，就永远不用为它改。
+            // ⚠️ 代价写进规范了：不变量二（模型可见即已记录）的强度**从此取决于
+            // 智能体自己报告得诚不诚实** —— 中控记的仍然是每一条消息，但"模型看到了什么"
+            // 现在只有智能体知道。
+            "log" => {
                 let who = req
                     .payload
-                    .get("agent")
+                    .get("instance")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                // **低于 user 的调用方只能查自己**（2026-09-23）。
-                // 不带 `agent` 时 `who` 是空串，而空串在 `reconstruct` 里是
-                // **"谁都算"** —— 也就是说这条 op 默认会**把整场会话的模型上下文
-                // （系统提示 + 全部用户消息）交出去**。智能体自己恢复上下文是它该干的，
-                // 但"顺手读别人的"不是。
+                // **低于 user 的调用方只能读自己的流量**。
+                // 不给实例名（空串）等于"读整场"，那条路只留给用户。
                 if req.authority < Authority::User && who != req.from {
                     self.reply(
                         req,
                         json!({
                             "effect": "refused", "code": "refused",
                             "why": format!(
-                                "只能查自己的上下文：你是 `{}`，要查的是 `{}`",
+                                "只能读自己的：你是 `{}`，要读的是 `{}`",
                                 req.from,
-                                if who.is_empty() { "（空 = 所有人）" } else { who.as_str() }
+                                if who.is_empty() { "（空 = 全场）" } else { who.as_str() }
                             ),
-                            "remedy": "填你自己的实例 id；要看别人的上下文得让用户来问"
+                            "remedy": "填你自己的实例 id；要看别人的记录得让用户来问"
                         }),
                     );
                     return;
                 }
+                // `since` 是**游标**（字节以外的另一种页码）：只给 seq 比它大的。
+                // 默认 0 = 从头给。日志大了要分页 —— 那条还没做（见 §8）。
+                let since = req.payload.get("since").and_then(Value::as_u64).unwrap_or(0);
                 match self.log.read_all() {
                     Err(e) => self.reply(
                         req,
                         json!({"effect": "refused", "code": "invalid",
                                "why": format!("读不出会话日志：{e}"),
-                               "remedy": "日志中间有洞就没法重建（少一条也不许装作能重建）；\
-                                          尾部半残是允许的 —— 那种情况照常重建，只是会报出 broken_tail"}),
+                               "remedy": "日志中间有洞就没法重放（少一条也不许装作能重放）；\
+                                          尾部半残是允许的 —— 那种情况照常给，只是会报出 broken_tail"}),
                     ),
                     Ok(read) => {
-                        let (system, items, seen) = reconstruct(&read.records, &who);
+                        // **按"这条记录跟谁有关"过滤**：它是这个实例发的，或者发给它的。
+                        // 这就是"读自己的流量"的准确含义（一个实例的邻居只有这些）。
+                        let records: Vec<Value> = read
+                            .records
+                            .iter()
+                            .filter(|r| r.seq > since)
+                            .filter(|r| r.envelope.from == who || r.envelope.to == who)
+                            .filter_map(|r| serde_json::to_value(r).ok())
+                            .collect();
                         let to_seq = read.records.last().map(|r| r.seq).unwrap_or(0);
                         // **跳过尾部半残这件事要说出来**（§11.5 那条"诚实报告"）：
                         // 不说的话，调用方会以为它看到的就是全部记录。
                         if read.broken_tail > 0 {
                             eprintln!(
-                                "[ctrl] 回放：尾部跳过 {} 行半残（崩在写日志那一下就是长这样；\
+                                "[ctrl] 读日志：尾部跳过 {} 行半残（崩在写日志那一下就是长这样；\
                                  崩溃语义：尾部可以半残、中间不许有洞）",
                                 read.broken_tail
                             );
@@ -3137,8 +3092,7 @@ impl App {
                         self.reply(
                             req,
                             json!({"effect": "confirmed", "code": null,
-                                   "data": {"system": system, "items": items,
-                                            "records_seen": seen, "to_seq": to_seq,
+                                   "data": {"records": records, "to_seq": to_seq,
                                             "broken_tail": read.broken_tail}}),
                         );
                     }

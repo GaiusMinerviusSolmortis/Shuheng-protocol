@@ -11,8 +11,7 @@
 #   1. **只读那档真的只读**（`ping` / `list` / `index` / `session` / `prompts`）；
 #   2. **会改状态或寿命的那些，低级别一律拒** —— 而且**真的没动手**
 #      （不是"回了一句拒绝"就算：`spawn` 那条要看它有没有偷偷把进程拉起来）；
-#   3. **`replay` 只能查自己**（它是 `agent` 档，可它能读到整场会话的上下文 ——
-#      包括系统提示和全部用户消息）；
+#   3. **`log` 只能读自己的流量**（它是 `agent` 档，可一句"给我全场"就能读到整场会话）；
 #   4. **user 档照常**：矩阵不许把正常路堵上（`spawn`/`stop` 照样能用）。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -150,9 +149,9 @@ Check '6. 一串"改状态/寿命/授权"的 op 在 agent 档**全拒**，而且
     $leaks.Count -eq 0
 }
 if ($leaks.Count -gt 0) { Write-Host "      漏了的：$($leaks -join ', ')" -ForegroundColor DarkGray }
-$rp = Op 'c-replay-低' 'agent' @{ op = 'replay'; agent = 'agent:dada' }
-Check '7. `replay` 在低级别下**只能查自己**（不然它能读到整场会话的上下文）' {
-    $rp.payload.effect -eq 'refused' -and $rp.payload.why -like '*只能查自己*'
+$rp = Op 'c-log-低' 'agent' @{ op = 'log'; instance = 'agent:dada' }
+Check '7. `log` 在低级别下**只能读自己的**（不然一句"给我全场"就能读到整场会话）' {
+    $rp.payload.effect -eq 'refused' -and $rp.payload.why -like '*只能读自己的*'
 }
 
 Write-Host '== user 档照常：矩阵不许把正常路堵上 ==' -ForegroundColor Cyan
