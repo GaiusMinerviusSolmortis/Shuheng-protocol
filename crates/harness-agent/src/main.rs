@@ -920,7 +920,21 @@ impl Agent {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                 .unwrap_or_default();
-            let (cards, waiting) = cards_from(&data);
+            let (mut cards, waiting) = cards_from(&data);
+            // **把内核从模型的名册里摘出去**（2026-09-26）。
+            //
+            // 内核（`kernel.service` 那个实例）是**智能体自己的部件**，不是模型手里的工具：
+            // `review`（什么时候压）和 `recall`（捞什么）是**智能体在回合边界问的**，
+            // 让模型看见它们，等于把"我是怎么回忆的"塞进它的操作面板里 ——
+            // 它会开始自己调 `review`，而那件事根本不是它该决定的事。
+            // ⚠️ 绑还是要绑的（它得能被调用、能被授权），只是**不进名册**。
+            if let Some(svc) = self.args.kernel.service.as_deref() {
+                let before = cards.len();
+                cards.retain(|c| c.instance != svc);
+                if cards.len() != before {
+                    eprintln!("[agent] 内核 {svc} 不进名册（它是我的部件，不是模型能调的工具）");
+                }
+            }
             let ready = waiting.is_empty();
             if ready || Instant::now() >= deadline {
                 if !ready {

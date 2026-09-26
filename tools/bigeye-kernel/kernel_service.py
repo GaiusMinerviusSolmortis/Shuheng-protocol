@@ -101,11 +101,44 @@ class Store:
         return []
 
 
+class Attention:
+    """**照搬大眼自己的注意力指标**（`attention_metrics.py`）。
+
+    为什么必须用它、不能自己拍一个阈值：**"工作记忆占到多少算满"是它的判断**
+    （阈值在它库里的 `meta.compress_token_limit`，默认 200000）；
+    而它还给外部留了一个口子 —— `set_live_usage(真实用量)` ——
+    让"别人的智能体"把自己的真实 token 数报进去。我们就走那条口子：
+    **把我们的数字喂给它，让它按自己的尺子说满没满。**
+
+    所以这里没有"裁一半"这种我们的规矩：裁多少也是按**它的估算函数**
+    （`_est_tokens`：CJK 1.2 / 其他 0.3，×1.5）从前往后累计，直到低于它的阈值。
+    """
+
+    def __init__(self, bigeye: str):
+        if bigeye not in sys.path:
+            sys.path.insert(0, bigeye)
+        import attention_metrics  # type: ignore
+
+        self.m = attention_metrics
+
+    def feed(self, used_tokens: int) -> None:
+        """把**我们这个智能体**的真实用量喂进它的实时数据源，再让它重算。"""
+        self.m.set_live_usage(used_tokens, [used_tokens])
+        self.m.invalidate_cache()
+
+    def m1(self) -> dict:
+        """它的 M1：工作记忆使用率（`used / token_limit`）。"""
+        return self.m.m1_work_memory_pct()
+
+    def est_tokens(self, text: str) -> int:
+        """**它的** token 估算（不是我另写一个）。"""
+        return self.m._est_tokens(text)
+
+
 class Service:
     def __init__(self, args):
         self.instance = args.instance
         self.sid = args.sid
-        self.cut_ratio = args.cut_ratio
         self.top_k = args.top_k
         self.store = None
         self.store_error = None
@@ -116,6 +149,12 @@ class Service:
             # **起得来，但记得住"我为什么干不了活"** —— 每次调用如实报出来。
             self.store_error = str(e)
             log(f"记忆库没接上：{e}")
+        try:
+            self.attention = Attention(args.bigeye)
+        except Exception as e:  # noqa: BLE001
+            # 指标接不上就只能"不裁"（**保守那一边**），并如实说
+            self.attention = None
+            log(f"注意力指标没接上：{e} —— 那就不裁（保守）")
         self.seq = 0
         # **回信发给谁** —— 由进来的那条请求决定（见 `reply`）
         self.last_from = "ctrl"
@@ -170,11 +209,33 @@ class Service:
         with_text = sum(1 for t in texts if t)
         # ⚠️ **这一行是 `sees_content` 那一格的证据**：它数的是"我真收到了几条正文"。
         log(f"review：收到 {len(items)} 项，其中带正文 {with_text} 项（sees_content={sees}）")
-        if len(items) < 4:
-            # 太少就不动刀（远端也不该动不动就裁）
+        used = int(args.get("used_tokens") or 0)
+        # ---- 满没满：**问它的指标**（喂进真实用量，让它按自己的阈值说） ----
+        if self.attention is None:
             return {"route": None, "effect": "confirmed", "code": None, "plan": None,
-                    "note": "项数太少，不裁"}
-        cut = max(1, int(len(items) * self.cut_ratio))
+                    "note": "注意力指标接不上 —— 保守起见不裁"}
+        self.attention.feed(used)
+        m1 = self.attention.m1()
+        limit = int(m1.get("token_limit") or 0)
+        pct = m1.get("pct")
+        log(f"review：M1 工作记忆 {m1.get('used_tokens')}/{limit}（{pct}%，来源 {m1.get('source')}）")
+        if limit and used < limit:
+            # **它说没满 ⇒ 不裁。** 这一行就是"照搬它的判断"的样子。
+            return {"route": None, "effect": "confirmed", "code": None, "plan": None,
+                    "note": f"它的 M1 说没满（{used}/{limit} = {pct}%），不裁"}
+        # ---- 裁多少：按**它的估算**把用量降回它的阈值之下 ----
+        need = used - limit
+        cut, freed = 0, 0
+        for i, t in enumerate(texts):
+            if freed >= need and cut > 0:
+                break
+            cut = i + 1
+            freed += self.attention.est_tokens(t or "")
+        # **下限：绝不留成空** —— 最后一条不裁（它可能就是用户刚说的那句）
+        cut = max(1, min(cut, len(items) - 1)) if len(items) > 1 else 0
+        if cut == 0:
+            return {"route": None, "effect": "confirmed", "code": None, "plan": None,
+                    "note": "只剩一条，裁了就没上下文了"}
         if sees and self.store is not None:
             # **大眼的路子**：不是丢掉，是沉淀。压掉的那些进碎片库，下次能捞回来。
             deposited = 0
@@ -379,7 +440,6 @@ def main():
     ap.add_argument("--sid", default="s-1")
     ap.add_argument("--bigeye", default=os.path.join("D:\\", "agent", "bigeye-main"))
     ap.add_argument("--db", default=None, help="记忆库放哪（默认放在 bigeye 的 memory/ 下）")
-    ap.add_argument("--cut-ratio", type=float, default=0.5)
     ap.add_argument("--top-k", type=int, default=3)
     a = ap.parse_args()
     if a.db is None:

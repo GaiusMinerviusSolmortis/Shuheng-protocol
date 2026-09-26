@@ -58,10 +58,12 @@ $seedTexts = @(
 $seedItems = @(); for ($i = 0; $i -lt $seedTexts.Count; $i++) {
     $seedItems += [ordered]@{ index = $i; kind = 'user'; text = $seedTexts[$i] }
 }
+# ⚠️ **用量要给到它阈值之上**（大眼那边默认 `compress_token_limit = 200000`）：
+# 我们这一版是**照搬它的判断** —— 它说没满就不裁（下面第 7 条专门盯那条路）。
 $seedMsg = [ordered]@{
     id = 'seed-1'; ts = 0; type = 'request'; from = 'kernel:1'; to = 'kernel:1'
     corr = 'seed'; sid = 'seed'; authority = 'observe'
-    payload = @{ tool = 'review'; args = @{ window = 1; used_tokens = 1; sees_content = $true; items = $seedItems } }
+    payload = @{ tool = 'review'; args = @{ window = 1; used_tokens = 250000; sees_content = $true; items = $seedItems } }
 }
 $seedOut = ($seedMsg | ConvertTo-Json -Compress -Depth 12) | python $adapter --bigeye $bigeye --db $db 2>&1
 Check '1. 大眼适配器能起、能沉淀（记忆库落在我们指定的那个 sqlite 上）' {
@@ -147,7 +149,18 @@ Check '5. **那一格是真的门**：不看正文时**连查询都不发** —�
     $r2.err -notlike '*recall*' -and $r2.err -like '*不看正文*'
 }
 Check '6. `review` 把要裁掉的**沉淀进记忆库**，而不是丢掉（签名里说得出沉淀了几条）' {
-    ($seedOut -join "`n") -like '*沉淀 3 条*'
+    ($seedOut -join "`n") -like '*沉淀 5 条*'
+}
+# 7. **满没满是它的判断，不是我们的**：喂一个低于它阈值的用量 ⇒ 它回"没满，不裁"。
+#    （阈值在它库里的 `meta.compress_token_limit`；我们只是把真实用量喂进它留的那个口子。）
+$calmMsg = [ordered]@{
+    id = 'calm-1'; ts = 0; type = 'request'; from = 'kernel:1'; to = 'kernel:1'
+    corr = 'calm'; sid = 'seed'; authority = 'observe'
+    payload = @{ tool = 'review'; args = @{ window = 1; used_tokens = 1000; sees_content = $true; items = $seedItems } }
+}
+$calmOut = ($calmMsg | ConvertTo-Json -Compress -Depth 12) | python $adapter --bigeye $bigeye --db $db 2>&1
+Check '7. **它说没满就不裁**（阈值是它的，我们只是把真实用量喂进去）' {
+    ($calmOut -join "`n") -like '*不裁*'
 }
 Write-Host ''
 if ($failures.Count -gt 0) {
