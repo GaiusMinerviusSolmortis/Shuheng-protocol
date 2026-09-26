@@ -755,6 +755,7 @@ fn run() -> i32 {
         state: "running",
         service: None,
         manifest: None,
+        config: None,
         generation: 0,
         bindings: None,
         owns: None,
@@ -777,6 +778,7 @@ fn run() -> i32 {
         state: "connected",
         service: None,
         manifest: None,
+        config: None,
         generation: 0,
         bindings: None,
         owns: None,
@@ -1533,6 +1535,10 @@ impl App {
             .and_then(registry::Owns::from_manifest);
         // **把 manifest 正文存下来** —— "工具自报家门"这条链的后半截
         let manifest_body = env.payload.get("manifest").cloned();
+        // **实例配置**（智能体自报的那几位：内核 / 模型 / 人格）。
+        // 中控**只存不问**：它不认识里面任何一样东西（同 L1 那条），
+        // 存下来只是为了让"这个实例当初是怎么配的"在 `list` 和身份索引里查得到。
+        let cfg_body = env.payload.get("config").cloned();
         // **注册那道闸门**：家门报全了吗？（规范 §11.1 A~E 组的契约）
         let report = manifest_body
             .as_ref()
@@ -1557,6 +1563,9 @@ impl App {
             }
             if let Some(m) = manifest_body {
                 inst.manifest = Some(m);
+            }
+            if let Some(c) = cfg_body.clone() {
+                inst.config = Some(c);
             }
             if let Some(r) = &report {
                 inst.contract_errors = r.errors.clone();
@@ -1594,6 +1603,8 @@ impl App {
                     "manifest_id": m.get("id"),
                     "manifest_version": m.get("version"),
                     "title": m.get("title"),
+                    // 智能体才有：它自报的实例配置（内核 / 模型 / 人格）
+                    "config": cfg_body.clone(),
                 }),
             );
         }
@@ -3648,6 +3659,7 @@ impl App {
             state: "starting",
             service: Some(svc),
             manifest: None,
+        config: None,
             generation,
             // 只有智能体要检查授权；其它实例是 `None`（不检查）
             bindings: if is_agent { Some(bindings) } else { None },
@@ -3990,6 +4002,8 @@ mod tests {
             generation: 1,
             bindings: None,
             owns: None,
+            // 这条测试只验 Hint 的读取，实例配置这儿用不上
+            config: None,
             contract_errors: Vec::new(),
             contract_missing: Vec::new(),
             last_seen_ms: 1,

@@ -28,6 +28,10 @@ use harness_memory::{
     TokenCounter, Window,
 };
 use serde::Serialize;
+
+// **实例配置**这一块只属于这个 exe（它读的是启动参数），所以是**二进制的模块**，
+// 不进 `harness_agent` 那个库 —— 库那边是"怎么拼提示词、怎么调模型"。
+mod config;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufReader, Write};
@@ -39,6 +43,12 @@ const TICK: Duration = Duration::from_millis(50);
 struct Args {
     instance: String,
     sid: String,
+    /// **实例配置**（一份 JSON）：人格 / 模型 / 内核 / 步数上限。
+    /// 不给就按命令行起（老行为）。见 `config.rs` 里那条分界线。
+    config: Option<String>,
+    /// **命令行上真的出现过的开关**（`--persona` / `--model` …）。
+    /// 配置覆盖时只报"命令行真给过、而且值不一样"的那些 —— **别报假账**。
+    explicit: std::collections::BTreeSet<String>,
     persona: String,
     persona_version: String,
     persona_brief: String,
@@ -68,6 +78,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut it: I) -> Args {
     let mut a = Args {
         instance: "agent:dada".into(),
         sid: "s-1".into(),
+        config: None,
+        explicit: std::collections::BTreeSet::new(),
         persona: "达达".into(),
         persona_version: "1".into(),
         persona_brief: "一个干活麻利的编码助手；只说做过的事。".into(),
@@ -85,9 +97,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut it: I) -> Args {
         summarize: None,
     };
     while let Some(x) = it.next() {
+        // **记下命令行给过什么**（配置覆盖时要如实报出来，见 `config::apply`）
+        a.explicit.insert(x.clone());
         match x.as_str() {
             "--instance" => a.instance = it.next().unwrap_or(a.instance),
             "--sid" => a.sid = it.next().unwrap_or(a.sid),
+            "--config" => a.config = it.next(),
             "--persona" => a.persona = it.next().unwrap_or(a.persona),
             "--persona-version" => a.persona_version = it.next().unwrap_or(a.persona_version),
             "--persona-brief" => a.persona_brief = it.next().unwrap_or(a.persona_brief),
@@ -485,12 +500,51 @@ struct Agent {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
+    // **实例配置**（有就套上，配置优先，并**逐项报出**它覆盖了哪几个命令行开关）。
+    // 不认识的内核 / 声明做不到的事 ⇒ **不启动**（报错即手册）：配置写错了却照常起来，
+    // 会让人以为那份配置生效了 —— 那正是"隐性假设"最贵的一种。
+    if let Some(path) = args.config.clone() {
+        let cfg = match config::load(&path) {
+            Ok(c) => c,
+            Err(why) => {
+                eprintln!("[agent] 实例配置不能用：{why}");
+                std::process::exit(2);
+            }
+        };
+        let overridden = config::apply(&cfg, &mut args);
+        if overridden.is_empty() {
+            eprintln!("[agent] 实例配置 {path}：和命令行没有冲突");
+        } else {
+            eprintln!(
+                "[agent] **实例配置覆盖了命令行**（{} 项）：{}",
+                overridden.len(),
+                overridden.join(" / ")
+            );
+        }
+    }
     let persona = Persona {
         name: args.persona.clone(),
         version: args.persona_version.clone(),
         brief: args.persona_brief.clone(),
     };
+    // **我这份实例配置里"我是谁"的那几位**（内核 / 模型 / 人格 / 步数）。
+    //
+    // 为什么自报它：中控**不认识内核是什么**（同 L1 那条：它不该懂智能体的内部结构），
+    // 但它该**记下来**"这个实例当初是怎么配的" —— 于是"这个会话里跑的智能体用哪个内核"
+    // 在 `list` 和身份索引里都查得到，而不是只活在部署表那串命令行里。
+    //
+    // `kernel.kind` 今天只有一个可能值（`linear`）：跨进程内核还没做。
+    // 写死在这儿是**如实**的 —— 它现在用的就是这个。
+    let cfg_summary = json!({
+        "kernel": {"kind": "linear", "window": args.model_window, "sees_content": true},
+        "model": {
+            "kind": if args.model == "deepseek" { "deepseek" } else { "mock" },
+            "name": args.model_name,
+        },
+        "persona": {"name": persona.name, "version": persona.version},
+        "max_steps": args.max_steps,
+    });
     let mut a = Agent {
         ids: IdGen::with_floor(tag_of(&args.instance), water_from_env()),
         // 提示词要等**问完中控"我被授权用什么"**才能编译 ——
@@ -566,7 +620,8 @@ fn main() {
         json!({
             "state": "online",
             "kind": "agent",
-            "kind": "agent",
+            // **实例配置**：中控只存不问（它不认识这里面的东西）
+            "config": cfg_summary,
         }),
     );
     emit(&mut out, &hello);
@@ -1699,6 +1754,94 @@ mod tests {
     use super::*;
     // 只有测试里要造"失败的回包"和"空话的回包" —— 所以它在测试模块里引入
     use harness_agent::model::ModelReply;
+
+    /// **配置优先，而且要出声**：命令行给过、值又不一样的那几项必须被报出来。
+    #[test]
+    fn a_config_overrides_the_command_line_and_says_so() {
+        let mut args = parse_args_from(
+            ["--persona", "命令行", "--model-window", "100"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let cfg = config::AgentConfig {
+            persona: Some(config::PersonaCfg {
+                name: Some("配置".into()),
+                ..Default::default()
+            }),
+            kernel: Some(config::KernelCfg {
+                window: Some(200),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let hit = config::apply(&cfg, &mut args);
+        assert_eq!(args.persona, "配置");
+        assert_eq!(args.model_window, 200);
+        assert!(hit.contains(&"--persona".to_string()), "{hit:?}");
+        assert!(hit.contains(&"--model-window".to_string()), "{hit:?}");
+    }
+
+    /// **别报假账**：值一样就不算覆盖 —— 命令行没给过、或者给的是同一个值，都不报。
+    #[test]
+    fn a_config_that_changes_nothing_is_not_reported() {
+        // "达达" 正好是默认值 ⇒ 值没变
+        let cfg = config::AgentConfig {
+            persona: Some(config::PersonaCfg {
+                name: Some("达达".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut args = parse_args_from(std::iter::empty());
+        assert!(config::apply(&cfg, &mut args).is_empty());
+        // 命令行**给过**、但值一样 ⇒ 同样不算覆盖
+        let mut args2 = parse_args_from(["--persona", "达达"].into_iter().map(str::to_string));
+        assert!(config::apply(&cfg, &mut args2).is_empty());
+    }
+
+    /// **不认识的内核要拒绝，并说清现在有哪些**（报错即手册）。
+    #[test]
+    fn an_unknown_kernel_is_refused_with_the_list() {
+        let cfg = config::AgentConfig {
+            kernel: Some(config::KernelCfg {
+                kind: Some("bigeye".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let why = config::check(&cfg).expect_err("不认识的内核必须拒");
+        assert!(why.contains("bigeye") && why.contains("linear"), "{why}");
+    }
+
+    /// **不许声明做不到的事**：这一版的内核就在智能体进程里，
+    /// 写 `sees_content: false` 是假话 —— 拒，并说清为什么。
+    #[test]
+    fn claiming_the_kernel_cannot_see_content_is_refused() {
+        let cfg = config::AgentConfig {
+            kernel: Some(config::KernelCfg {
+                kind: Some("linear".into()),
+                sees_content: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let why = config::check(&cfg).expect_err("假话必须拒");
+        assert!(why.contains("sees_content"), "{why}");
+    }
+
+    /// 配置是个**闭合**的面：字段写错就拒（宁可拒绝，也不猜）。
+    #[test]
+    fn a_config_is_strict_about_fields() {
+        let e = serde_json::from_str::<config::AgentConfig>(r#"{"persona":{"namm":"x"}}"#)
+            .expect_err("写错的字段不许被忽略");
+        let msg = e.to_string();
+        assert!(msg.contains("namm") || msg.contains("unknown"), "{msg}");
+        // 认识的那种照常
+        let ok = serde_json::from_str::<config::AgentConfig>(
+            r#"{"persona":{"name":"x"},"kernel":{"kind":"linear","window":100}}"#,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
 
     /// 一个**永远失败**的模型 —— 用来验"摘要模型挂了会怎样"。
     struct Failing;

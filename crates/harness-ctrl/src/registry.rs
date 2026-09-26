@@ -23,6 +23,12 @@ pub struct Instance {
     /// 于是"工具自报家门"这条链只走了一半：报到了，没人接。
     /// 规范 §5.10 的原话是"中控据此知道该画成什么节点"，那就得存下来。
     pub manifest: Option<serde_json::Value>,
+    /// **它自报的实例配置**（智能体才有：内核 / 模型 / 人格 / 步数）。
+    ///
+    /// 中控**只存不问** —— 它不认识"内核"是什么，也不去解释里面那几个字段
+    /// （同 L1 那条：中控不该懂智能体的内部结构）。它存在这儿的理由只有一个：
+    /// **"这个实例当初是怎么配的"要查得到**，而不是只活在部署表那串命令行里。
+    pub config: Option<serde_json::Value>,
     /// 这个服务处在**第几代**（重新装配会 +1）。用来丢掉旧世代的迟到消息。
     pub generation: u64,
     /// **这个实例被授权用哪些实例、以及被授予了哪些能力**（§2.3 的雏形）。
@@ -466,6 +472,9 @@ impl Registry {
                     "ceiling": i.ceiling.as_str(),
                     "cmd": i.service.as_ref().map(|s| s.cmd.join(" ")),
                     "has_manifest": i.manifest.is_some(),
+                    // **它自报的实例配置**（智能体才有：内核 / 模型 / 人格 / 步数）。
+                    // 中控不解释它，只把它摆出来 —— 图上看得到"这个智能体是拿什么配的"。
+                    "config": i.config,
                     "contract_errors": i.contract_errors,
                     "contract_missing": i.contract_missing,
                     // **给人看的两样**：多久没听见它了 / 它最近不应答探针
