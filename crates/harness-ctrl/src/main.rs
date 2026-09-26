@@ -2377,6 +2377,14 @@ impl App {
                 Some(i) if !i.is_agent && i.service.is_some() => i.manifest.is_some(),
                 _ => true,
             };
+            // ⚠️ **这条队列是"报到"排空的，不是 tick 排空的**（2026-09-26 更正）。
+            //
+            // 我一度在这里加了"关了 tick 就当场拒" —— **那是错的**，而且当场
+            // 把五份验收（editor / pager / spill / parallel / lifecycle-field）判红了：
+            // 它们在启动瞬间就发请求，那些请求正是靠**服务报到那一刻**照序放行的
+            // （见 `note_presence` 里 `waiting_ready.remove`）。tick 只管**宽限到点
+            // 还没报到**的那条兜底（把它逐个拒掉）——关掉 tick 只是少了兜底，
+            // 不是"队列没人管"。**同一个队列有两个出口，我当时只看见了一个。**
             if !seen {
                 if self.debug_barriers {
                     eprintln!("[ctrl] `{}` 还没自报家门 —— 这条请求先攒着", env.to);

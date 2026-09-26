@@ -222,6 +222,9 @@ impl DeepSeekModel {
                 // 敕令与摘要都是**非用户**的插入 —— 用 system 角色 + 标记，
                 // 免得模型把中控的话当成用户说的话（§4.5 那条分级）
                 ItemKind::Injected => msgs.push(json!({"role": "system", "content": item.text})),
+                // **回忆也是非用户的插入**（同敕令那条理由：别让模型把它当成用户说的），
+                // 但它自己的正文里已经带了「【回忆】」这个记号 —— 那是内核加的。
+                ItemKind::Recalled => msgs.push(json!({"role": "system", "content": item.text})),
                 ItemKind::Summary => msgs.push(json!({
                     "role": "system",
                     "content": format!("【交接摘要】{}", item.text)

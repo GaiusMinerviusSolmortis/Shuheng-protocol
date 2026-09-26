@@ -25,11 +25,13 @@
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
-/// **已知的内核**。这一版只有一个：留在智能体进程里的线性记忆。
+/// **已知的内核**，两个档：
 ///
-/// 跨进程的内核（能接外来技术栈的那一条）**还没做** —— 它一旦出现，
-/// 就该在这张表里多一个名字，而 `sees_content` 那一格也才真的有差别。
-pub const KERNELS: [&str; 1] = ["linear"];
+/// | 名字 | 在哪 | `sees_content` |
+/// |---|---|---|
+/// | `linear` | 智能体**进程内**（codex 那套窗口 + 压缩）| 只能是 `true` —— 它就在手里，读不到反而不可能 |
+/// | `remote` | **另一个进程**（一个服务），要写 `service` | `true` / `false` **都行** —— 写 `false` 就不给它正文，只给元数据 |
+pub const KERNELS: [&str; 2] = ["linear", "remote"];
 
 /// **已知的模型适配器**（和 `build_model` 认识的那两个对齐）。
 pub const MODELS: [&str; 2] = ["mock", "deepseek"];
@@ -77,6 +79,9 @@ pub struct ModelCfg {
 pub struct KernelCfg {
     #[serde(default)]
     pub kind: Option<String>,
+    /// `kind: "remote"` 时必填：内核服务的实例 id（比如 `kernel:1`）
+    #[serde(default)]
+    pub service: Option<String>,
     /// 上下文窗口有多大（原来的 `--model-window`）
     #[serde(default)]
     pub window: Option<u64>,
@@ -85,9 +90,11 @@ pub struct KernelCfg {
     pub summarize: Option<String>,
     /// **这个内核会不会读到上下文正文**。
     ///
-    /// 这一版只能写 `true`（或者不写）—— 因为内核就在智能体进程里，
-    /// 读不到正文反而是不可能的。写 `false` 会被**拒绝启动**：
-    /// 那是声明一件它做不到的事，比不声明更糟。
+    /// `linear` 只能写 `true`（或者不写）—— 内核就在智能体进程里，
+    /// 读不到正文反而是不可能的，写 `false` 会被**拒绝启动**。
+    ///
+    /// `remote` 两边都行，而且**这一格是真的门**：写 `false`，智能体就
+    /// **一个字节的正文都不发过去**（只给下标 / 类型 / 字节数）。
     #[serde(default)]
     pub sees_content: Option<bool>,
 }
@@ -114,6 +121,7 @@ pub fn load(path: &str) -> Result<AgentConfig, String> {
 /// 校验：不知道的拒绝；**声明做不到的也拒绝**。
 pub fn check(cfg: &AgentConfig) -> Result<(), String> {
     if let Some(k) = &cfg.kernel {
+        let kind = k.kind.as_deref().unwrap_or("linear");
         if let Some(kind) = &k.kind {
             if !KERNELS.contains(&kind.as_str()) {
                 return Err(format!(
@@ -123,11 +131,25 @@ pub fn check(cfg: &AgentConfig) -> Result<(), String> {
                 ));
             }
         }
-        if k.sees_content == Some(false) {
+        if kind == "remote" {
+            if k.service.as_deref().unwrap_or("").is_empty() {
+                return Err(
+                    "`kernel.kind` 是 `remote` 就得写 `service` —— 那是内核服务的实例 id\
+                     （比如 `kernel:1`）。不写的话，智能体不知道该去问谁"
+                        .into(),
+                );
+            }
+        } else if k.service.is_some() {
+            return Err(format!(
+                "`kernel.service` 只在 `kind: \"remote\"` 时有意义 —— 现在是 `{kind}`\
+                 （进程内的内核不需要服务）"
+            ));
+        }
+        if kind == "linear" && k.sees_content == Some(false) {
             return Err(
                 "`kernel.sees_content` 写 `false` 是不对的：这一版的内核**在智能体进程里**，\
                  它必然读得到上下文正文 —— 声明一件做不到的事，比不声明更糟。\
-                 要去掉这个字段，要么就写 `true`"
+                 要真的不给它正文，就把内核换成 `remote`（那一格在那边才是真的门）"
                     .into(),
             );
         }
@@ -229,6 +251,9 @@ pub fn apply(cfg: &AgentConfig, args: &mut crate::Args) -> Vec<String> {
         }
     }
     if let Some(k) = &cfg.kernel {
+        // **整块搬过去**（内核那几格是一组：kind / service / sees_content / window / summarize）。
+        // 它没有对应的命令行开关，所以不报"覆盖了谁" —— 但它就在下面 `apply` 里生效。
+        args.kernel = k.clone();
         if let Some(v) = k.window {
             let changed = args.model_window != v;
             note("--model-window", &ex, changed, &mut hit);

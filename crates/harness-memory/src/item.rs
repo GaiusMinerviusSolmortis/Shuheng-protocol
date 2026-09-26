@@ -19,6 +19,12 @@ pub enum ItemKind {
     ToolResult { name: String },
     /// 敕令：中控塞进上下文的那条（§4.4）
     Injected,
+    /// **回忆**：内核从长期记忆里捞出来放进上下文的那条（2026-09-26 加）。
+    ///
+    /// 它和 `Injected` 分开记，是因为**来源不一样**：敕令是**别人**塞进来的
+    /// （中控，权威 `system`），回忆是**内核自己**捞出来的 —— 排查"它为什么
+    /// 突然提起一件很久以前的事"时，这两者要分得开。
+    Recalled,
     /// 上一次压缩留下的摘要
     Summary,
 }
@@ -32,6 +38,7 @@ impl ItemKind {
             ItemKind::ToolCall { .. } => "tool_call",
             ItemKind::ToolResult { .. } => "tool_result",
             ItemKind::Injected => "injected",
+            ItemKind::Recalled => "recalled",
             ItemKind::Summary => "summary",
         }
     }

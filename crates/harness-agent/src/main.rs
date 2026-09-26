@@ -23,15 +23,17 @@ use harness_core::envelope::{Authority, Envelope, MessageType};
 use harness_core::id::{IdGen, tag_of, water_from_env};
 use harness_core::now_ms;
 use harness_memory::{
-    compact::{CompactionRecord, Hooks, Reason, When},
-    CompactionPolicy, Compactor, HeuristicCounter, History, Item, ItemKind, MockSummarizer,
-    TokenCounter, Window,
+    compact::{CompactionRecord, Hooks},
+    CompactionPolicy, HeuristicCounter, Item, ItemKind, MockSummarizer,
 };
 use serde::Serialize;
 
 // **实例配置**这一块只属于这个 exe（它读的是启动参数），所以是**二进制的模块**，
 // 不进 `harness_agent` 那个库 —— 库那边是"怎么拼提示词、怎么调模型"。
 mod config;
+// **内核**这一块也在这儿：它决定"什么进上下文、什么时候压、怎么压"（见 `kernel.rs`）。
+mod kernel;
+use crate::kernel::Kernel;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufReader, Write};
@@ -46,6 +48,9 @@ struct Args {
     /// **实例配置**（一份 JSON）：人格 / 模型 / 内核 / 步数上限。
     /// 不给就按命令行起（老行为）。见 `config.rs` 里那条分界线。
     config: Option<String>,
+    /// **生效之后的实例配置里"内核"那一格**（配置套完之后的形态）。
+    /// 没有配置文件时是空的 = 用进程内那个 `linear`。
+    kernel: config::KernelCfg,
     /// **命令行上真的出现过的开关**（`--persona` / `--model` …）。
     /// 配置覆盖时只报"命令行真给过、而且值不一样"的那些 —— **别报假账**。
     explicit: std::collections::BTreeSet<String>,
@@ -79,6 +84,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut it: I) -> Args {
         instance: "agent:dada".into(),
         sid: "s-1".into(),
         config: None,
+        kernel: config::KernelCfg::default(),
         explicit: std::collections::BTreeSet::new(),
         persona: "达达".into(),
         persona_version: "1".into(),
@@ -380,6 +386,89 @@ impl harness_memory::summarize::Summarizer for ModelSummarizer {
 }
 
 /// 挑一个模型：mock（脚本）还是真 provider。
+/// **按实例配置造内核**（第 2 步：这一层以前是写死在 `Agent` 里的三样东西）。
+///
+/// 两档：进程内的 `linear`（默认，行为一字未改）、跨进程的 `remote`（要写 `service`）。
+/// ⚠️ `remote` 的 `sees_content` **缺省是 `false`** —— 不给正文是默认，
+/// 想看正文得在配置里明说。这一格就是那个档位，**它不是文档里的一句话**。
+fn build_kernel(args: &Args) -> Box<dyn Kernel> {
+    match args.kernel.kind.as_deref().unwrap_or("linear") {
+        "remote" => Box::new(kernel::RemoteKernel::new(
+            &args.sid,
+            args.model_window,
+            args.kernel.service.clone().unwrap_or_default(),
+            args.kernel.sees_content.unwrap_or(false),
+        )),
+        _ => Box::new(kernel::LinearKernel::new(&args.sid, args.model_window)),
+    }
+}
+
+/// **内核跟外面对话的那个口子**：走中控（同一套信封、同一套记账）。
+///
+/// 为什么不直连：这个仓库花了很久把"**凡实例之间说话都过中控**"钉死
+/// （方向检查、留痕、探针、水位、权限矩阵全挂在那条路上）。内核是另一个进程，
+/// 它跟智能体之间的话**也是实例之间的话** —— 绕开中控，等于把它们全绕开。
+struct CtlrIo<'a, W: Write> {
+    ids: &'a mut IdGen,
+    /// 我是谁（信封的 `from` 必须是它 —— 通道会把冒充的挡下来）
+    me: &'a str,
+    sid: &'a str,
+    inbox: &'a mut std::collections::VecDeque<String>,
+    out: &'a mut W,
+    rx: &'a Receiver<Inbound>,
+    timeout: Duration,
+}
+
+impl<W: Write> kernel::KernelIo for CtlrIo<'_, W> {
+    fn ask(&mut self, to: &str, tool: &str, args: Value) -> Option<Value> {
+        let id = self.ids.next_message();
+        let corr = self.ids.next_corr();
+        let req = Envelope {
+            id,
+            ts: now_ms(),
+            kind: MessageType::Request,
+            from: self.me.to_string(),
+            to: to.into(),
+            corr: Some(corr.clone()),
+            sid: self.sid.to_string(),
+            authority: Authority::Agent,
+            payload: json!({"tool": tool, "args": args}),
+        };
+        emit(self.out, &req);
+        let deadline = Instant::now() + self.timeout;
+        while Instant::now() < deadline {
+            match self.rx.recv_timeout(TICK) {
+                Ok(Inbound::Line(l)) => {
+                    let env = match codec::decode(&l) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    if env.kind == MessageType::Result && env.corr.as_deref() == Some(&corr) {
+                        let payload = env.payload;
+                        if payload.get("effect").and_then(Value::as_str)
+                            == Some("confirmed")
+                        {
+                            return Some(payload);
+                        }
+                        eprintln!(
+                            "[agent] 内核服务 {to} 拒绝了 `{tool}`：{}",
+                            payload.get("why").and_then(Value::as_str).unwrap_or("（它没说为什么）")
+                        );
+                        return None;
+                    }
+                    // **不是等我这条的，收好，别丢**（同 `ask_ctrl`）
+                    self.inbox.push_back(l);
+                }
+                Ok(Inbound::Eof) => return None,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+        eprintln!("[agent] 内核服务 {to} 在 {:?} 里没回答 `{tool}` —— 这一步跳过", self.timeout);
+        None
+    }
+}
+
 fn build_model(args: &Args) -> Box<dyn Model> {
     if args.model != "deepseek" {
         return Box::new(MockModel::new(args.script.clone()));
@@ -472,9 +561,13 @@ struct Agent {
     /// 编译一次就冻住的那段前缀（§15.2）
     system: String,
     manifest: prompt::CompositionManifest,
-    history: History,
-    window: Window,
     policy: CompactionPolicy,
+    /// **内核**：它拿着历史和窗口，决定"什么进上下文、什么时候压、怎么压"。
+    ///
+    /// 2026-09-26 之前这三样（历史 / 窗口 / 压缩器）是直接挂在 `Agent` 上的 ——
+    /// 于是"换个内核"无从谈起。现在它是一个 trait 对象：进程内的 `linear`，
+    /// 或者跨进程的 `remote`（见 `kernel.rs`）。
+    kernel: Box<dyn Kernel>,
     hooks: TraceHooks,
     model: Box<dyn Model>,
     pending: HashMap<String, Pending>,
@@ -536,8 +629,11 @@ fn main() {
     //
     // `kernel.kind` 今天只有一个可能值（`linear`）：跨进程内核还没做。
     // 写死在这儿是**如实**的 —— 它现在用的就是这个。
+    let kernel = build_kernel(&args);
     let cfg_summary = json!({
-        "kernel": {"kind": "linear", "window": args.model_window, "sees_content": true},
+        // **如实自报**：内核名 / 窗口 / 它能不能看正文 —— 都问内核自己（别抄常量）
+        "kernel": {"kind": kernel.kind(), "window": args.model_window,
+                   "sees_content": kernel.sees_content()},
         "model": {
             "kind": if args.model == "deepseek" { "deepseek" } else { "mock" },
             "name": args.model_name,
@@ -561,9 +657,8 @@ fn main() {
         },
     cards: Vec::new(),
     caps_sig: Vec::new(),
-        history: History::new(),
-        window: Window::first(&args.sid, args.model_window),
         policy: CompactionPolicy::default(),
+        kernel,
         hooks: TraceHooks::default(),
         model: build_model(&args),
         pending: HashMap::new(),
@@ -691,7 +786,7 @@ fn main() {
                 let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("");
                 if let Some(i) = rebuild_item(kind, text, item.get("data")) {
-                    a.history.push(i);
+                    a.kernel.push(i);
                 }
             }
             // 系统提示是**重新编译**出来的（它是冻住那段，同样的输入必须逐字节一样）；
@@ -996,7 +1091,7 @@ impl Agent {
             payload,
         );
         emit(out, &ev);
-        self.history.push(item);
+        self.kernel.push(item);
     }
 
     fn mint(
@@ -1131,6 +1226,11 @@ impl Agent {
         // 放在"记下用户这条任务"之前：敕令进上下文，才是模型这一轮看到的顺序
         // （先知道工具集变了，再接到活）。
         self.refresh_tools(out, rx);
+        // **回忆**：问内核一句"关于这件事，你那边有什么"（在"接到活"之前 —— 先给背景）。
+        //
+        // 线性内核**恒空**（它的记忆就是那一段线性历史），所以默认这条路上什么都没发生；
+        // 远端内核（比如接了大眼那套）才会真的捞东西出来。
+        self.recall_into_context(out, rx, &task);
         self.note_item(out, Item::user(task));
         let mut steps = 0usize;
         let mut failure: Option<(String, String, String)> = None; // (效果, 码, 补救)
@@ -1146,11 +1246,11 @@ impl Agent {
                 ));
                 break;
             }
-            self.maybe_compact(out);
+            self.maybe_compact(out, rx);
 
             let model_req = ModelRequest {
                 system: self.system.clone(),
-                items: self.history.items().to_vec(),
+                items: self.kernel.items().to_vec(),
                 tools: self.cards.clone(),
             };
             // **落盘屏障：第三个边界 —— 模型请求前**（规范-消息协议 §5.5 #8）。
@@ -1184,9 +1284,9 @@ impl Agent {
                 break;
             }
             // **真值校准**：provider 报回来的输入 token 才是基线（§5.4.3 ②）
-            self.window.calibrate(reply.usage_input_tokens);
+            self.kernel.calibrate(reply.usage_input_tokens);
             self.trace.tokens = reply.usage_input_tokens;
-            self.trace.window = self.window.number;
+            self.trace.window = self.kernel.window_number();
 
             if reply.calls.is_empty() {
                 let text = reply.text.unwrap_or_default();
@@ -1444,8 +1544,54 @@ impl Agent {
         out
     }
 
-    /// 每轮前问一句"该压了吗" —— **回合中压缩，摘要贴到最后一条 user 之前**（§5.4.3 ④）。
-    fn maybe_compact(&mut self, out: &mut impl Write) {
+    /// **问内核要回忆**（每回合一次，在"接到活"之前）。
+    ///
+    /// 为什么归内核而不是归智能体主循环：**"什么该进上下文"就是内核的定义**
+    /// （见 `kernel.rs` 开头那张表）。线性内核回空 —— 它只有那一段线性历史；
+    /// 远端内核可以把外面那套记忆（向量、反思、碎片库）捞进来。
+    ///
+    /// 捞回来的东西**照样要记账**：它们进的是模型上下文（不变量二），
+    /// 所以走 `note_item` —— 那条路的尽头是日志里的一行 `model_item`。
+    fn recall_into_context(&mut self, out: &mut impl Write, rx: &Receiver<Inbound>, query: &str) {
+        let recalled = {
+            // 借的东西分开（同 `maybe_compact`）：内核要 `&mut`，口子要另外几个字段
+            let Agent {
+                kernel,
+                ids,
+                inbox,
+                args,
+                ..
+            } = self;
+            let mut io = CtlrIo {
+                ids,
+                me: &args.instance,
+                sid: &args.sid,
+                inbox,
+                out: &mut *out,
+                rx,
+                timeout: args.call_timeout,
+            };
+            let mut ctx = kernel::RecallCtx {
+                session: &args.sid,
+                io: &mut io,
+            };
+            kernel.recall(query, &mut ctx)
+        };
+        if recalled.is_empty() {
+            return;
+        }
+        eprintln!("[agent] 内核捞回 {} 条相关的记忆", recalled.len());
+        for it in recalled {
+            self.note_item(out, it);
+        }
+    }
+
+    /// 每轮前问内核一句"该压了吗" —— **回合中压缩，摘要贴到最后一条 user 之前**（§5.4.3 ④）。
+    ///
+    /// ⚠️ 2026-09-26（第 2 步）：**判断搬进了内核**（`kernel.rs`）。
+    /// 这一边只剩三件事：给它准备好环境（摘要器 / 策略 / 钩子 / 跟外面对话的口子）、
+    /// **把它交回来的事实记进日志**、更新 trace。谁压、怎么压，不在这条路上。
+    fn maybe_compact(&mut self, out: &mut impl Write, rx: &Receiver<Inbound>) {
         let counter = HeuristicCounter::new();
         // **谁来摘要**（待定 #103）：真 provider 就用真模型，mock 脚本就用确定性那条。
         // 判定写在 `summarize_with()` 一个地方 —— 两处各判一次迟早会不一致。
@@ -1456,29 +1602,43 @@ impl Agent {
             Some(s) => s,
             None => &mock,
         };
-        let compactor = Compactor {
-            policy: self.policy.clone(),
-            counter: &counter,
-            summarizer,
-            session: self.args.sid.clone(),
+        let before = self.kernel.tokens(&counter);
+        // **借的东西先分开**：内核要 `&mut`，而口子要用另外几个字段 ——
+        // 它们是不相交的字段，解构一次就都拿得到（不用把谁 clone 一份）。
+        let Agent {
+            kernel,
+            ids,
+            inbox,
+            system,
+            args,
+            policy,
+            hooks,
+            ..
+        } = self;
+        let mut io = CtlrIo {
+            ids,
+            me: &args.instance,
+            sid: &args.sid,
+            inbox,
+            // **只借不搬**：`io` 活在这一段里，后面还要用 `out` 记那条事件
+            out: &mut *out,
+            rx,
+            timeout: args.call_timeout,
         };
-        // **算的是整个请求**（系统提示 + 历史），不是只有历史 ——
-        // 而系统提示现在装着一整张工具名片，它可能比历史还大。
-        let used = counter.count_text(&self.system) + self.history.tokens(&counter);
-        if compactor.should_compact_with(used, &self.window).is_none() {
-            return;
-        }
-        let before = self.history.tokens(&counter);
-        if let Some(r) = compactor.compact(
-            &mut self.history,
-            &mut self.window,
-            When::MidTurn,
-            Reason::ContextLimit,
-            &mut self.hooks,
-        ) {
+        let mut ctx = kernel::ReviewCtx {
+            system,
+            session: &args.sid,
+            policy,
+            summarizer,
+            hooks,
+            io: &mut io,
+        };
+        if let Some(c) = kernel.review(&mut ctx) {
+            let r = c.record;
             eprintln!(
-                "[agent] {} → {} token，窗口 {}→{}",
+                "[agent] {} → {} token，窗口 {}→{}（{}）",
                 before, r.tokens_after, r.window_before, r.window_after
+                , kernel.kind()
             );
             // **压缩也要进日志** —— 否则重放没法把同一刀切回去，
             // 而"切在哪、摘要是什么"只有智能体自己知道。
@@ -1486,7 +1646,7 @@ impl Agent {
                 "kind": "compaction",
                 "cut": r.cut,
                 "summary_at": r.summary_at,
-                "summary": self.history.previous_summary(),
+                "summary": c.summary,
                 // **摘要这件事是谁干的**（2026-09-20，待定 #103）：
                 // 只写"压过了"不够 —— 判词要能回答"这一刀是模型切的还是确定性切的、
                 // 那次调用花了多少 token、有没有失败退回来"。
@@ -1500,11 +1660,7 @@ impl Agent {
                 "summarizer_fell_back": real
                     .as_ref()
                     .and_then(|s| s.last.borrow().fell_back.clone()),
-                "summary_chars": self
-                    .history
-                    .previous_summary()
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0),
+                "summary_chars": c.summary.chars().count(),
                 // **这一刀切在回合内部吗**（#105）：它决定"模型接下来看到什么"的形状 ——
                 // 轮边界那刀是"摘要 + 若干完整轮次"，回合内部那刀是
                 // "摘要 + 同一个回合的后半截"。排查"它为什么忘了刚说过的话"时要分得开。
@@ -1528,7 +1684,7 @@ impl Agent {
             );
             emit(out, &ev);
             self.trace.compactions += 1;
-            self.trace.window = self.window.number;
+            self.trace.window = self.kernel.window_number();
         }
     }
 
@@ -1681,6 +1837,7 @@ fn rebuild_item(kind: &str, text: &str, data: Option<&Value>) -> Option<Item> {
         "user" => ItemKind::User,
         "assistant" => ItemKind::Assistant,
         "injected" => ItemKind::Injected,
+        "recalled" => ItemKind::Recalled,
         "summary" => ItemKind::Summary,
         "tool_call" => ItemKind::ToolCall {
             name: tool_name(data),
