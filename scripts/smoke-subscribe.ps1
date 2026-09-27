@@ -151,6 +151,34 @@ Check '6. 它想 `spawn`：**拒**（权限矩阵：`spawn` 要 user，而它的
 $alive = Ask 'c-alive' @{ op = 'ping' }
 Check '7. 拒了它，**会话照常**（中控还活着）' { $alive.payload.effect -eq 'confirmed' }
 
+Write-Host '== ⑩ 顺带收掉 §8 #4：`to:"*"` 是保留字，不是广播 ==' -ForegroundColor Cyan
+# **订阅做完之后，"广播"这个需求就有别的形状了**：订阅者本来就收这条会话里的一切，
+# 所以要"公告"，发一条**平常的 event** 就行 —— 它进日志、也进订阅流，
+# 只是**不进任何人的收件箱**。于是 `to:"*"` 保持"保留字 + 明确拒"（不定义一套广播语义）。
+$star = [ordered]@{ id = 'm-star'; ts = 0; type = 'request'; from = 'console'; to = '*'
+                    corr = 'c-star'; sid = $sid; authority = 'user'; payload = @{ op = 'ping' } }
+$proc.StandardInput.WriteLine(($star | ConvertTo-Json -Compress -Depth 12))
+$proc.StandardInput.Flush()
+$starReply = $null
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+while ([DateTime]::UtcNow -lt $deadline -and -not $starReply) {
+    $line = NextLine 3000
+    if (-not $line) { continue }
+    if ($line.Trim() -eq '') { continue }
+    $m = $line | ConvertFrom-Json
+    if ($m.type -eq 'result' -and $m.corr -eq 'c-star') { $starReply = $m }
+}
+Check '10. `to:"*"` 是**保留字**（拒），并指路"要公告就发一条平常的 `event`"' {
+    $starReply.payload.effect -eq 'refused' -and $starReply.payload.why -like '*保留字*' -and `
+        $starReply.payload.remedy -like '*event*'
+}
+# ⚠️ 这条是**要害**：那条被拒的消息**照样进了订阅流**（记录在路由之前）。
+# 所以"公告"根本不需要新的收件人语义 —— **它就是这个形状**。
+$seenStar = SubWait 'c-star'
+Check '11. 而它**照样进了订阅流** —— 这就是"公告"的形状（用不着广播）' {
+    $seenStar -ne $null -and $seenStar.payload.effect -eq 'refused'
+}
+
 Write-Host '== ⑤ 它走了 ==' -ForegroundColor Cyan
 $tcp.Close()
 Start-Sleep -Milliseconds 800

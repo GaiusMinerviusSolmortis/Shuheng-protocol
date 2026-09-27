@@ -93,7 +93,7 @@
 | [07-界面](07-界面.md) | **§9、§12** GUI 作为消息流的投影、表示层、点击策略、桌宠不在框架内。 |
 | [08-记忆](08-记忆.md) | **§16** 锚点、分层、沉淀，以及**大眼记忆实现的评估**。 |
 | [09-模型](09-模型.md) | **§8、§15** 提示词编译与模型拼装。 |
-| [10-决策](10-决策.md) | 已定 **314** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
+| [10-决策](10-决策.md) | 已定 **315** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
 | [**规范-消息协议**](规范-消息协议.md) | **规范性文件**：信封、消息种类、配对、会话日志、stdio 传输。 |
 | [规范-工具服务](规范-工具服务.md) | **规范性文件**，与其余探索性文档性质不同。 |
 | [附录-参考](附录-参考.md) | **§10、§17** 与已有工作的对照，以及和 MCP 的定位比较。 |
@@ -1535,7 +1535,7 @@ pwsh -File scripts/smoke-term-session.ps1    # 终端会话模式：真 PTY 的�
 pwsh -File scripts/smoke-ctrl-ops.ps1           # 中控的 op 名册：权限矩阵（谁能发什么）+ 上限与矩阵是一对（13 条判据）
 pwsh -File scripts/smoke-agent-config.ps1         # 智能体实例配置：配置生效 / 覆盖出声 / 坏配置拒绝启动 / 同一份配置重建同一实例（8 条判据）
 pwsh -File scripts/smoke-kernel-remote.ps1          # 第二个内核（跨进程）：大眼那套记忆接进来，recall 进上下文、sees_content 是真的门、满没满由它判断（7 条判据）
-pwsh -File scripts/smoke-subscribe.ps1             # 订阅：独立进程接进来看这条会话（只读：上限 observe）（9 条判据）
+pwsh -File scripts/smoke-subscribe.ps1             # 订阅：独立进程接进来看这条会话（只读：上限 observe）（11 条判据）
 pwsh -File scripts/smoke-logspill.ps1            # 会话日志侧的溢出：大 payload 溢出成文件 + 引用可解（6 条判据）
 pwsh -File scripts/smoke-memory.ps1              # 阶段 3 验收（14 条判据）
 pwsh -File scripts/smoke-agent.ps1               # 智能体层验收（18 条判据）
