@@ -53,7 +53,9 @@ function Run-Scenario([string]$name, [string]$scriptBody, [string]$task) {
 "@ | Set-Content -LiteralPath $servicesPath -Encoding utf8
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ctrl
-    $psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 8000"
+    # ⚠️ **托管是必须的**（2026-09-27）：不托管路径的会话不能使唤带围栏的服务。
+    # 这一份本来就在一个项目里干活 —— 把那条路径**托出来**，才是它真实的形状。
+    $psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 8000 --host `"$project`""
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true

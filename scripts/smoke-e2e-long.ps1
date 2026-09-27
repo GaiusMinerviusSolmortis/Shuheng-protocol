@@ -79,7 +79,7 @@ $servicesPath = Join-Path $work 'services.json'
 "@ | Set-Content -LiteralPath $servicesPath -Encoding utf8
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $ctrl
-$psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 60000"
+$psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 60000 --host `"$project`""
 $psi.RedirectStandardInput = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true

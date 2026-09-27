@@ -85,7 +85,7 @@ Write-Services $servicesPath $false
 function Start-Ctrl([string]$svcPath) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ctrl
-    $psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$svcPath`" --drain-ms 30000"
+    $psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$svcPath`" --drain-ms 30000 --host `"$project`""
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true

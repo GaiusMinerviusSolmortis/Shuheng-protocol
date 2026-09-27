@@ -2575,6 +2575,32 @@ impl App {
                         .filter_map(|h| h.get("path").and_then(Value::as_str))
                         .map(str::to_string)
                         .collect();
+                    // ⚠️ **托管是必须的**（2026-09-27）。
+                    //
+                    // 原来这里有一条短路：`if !hosts.is_empty() && ...` ——
+                    // 也就是**本会话什么都没托管的时候，范围检查直接跳过**。
+                    // 那意味着"不托管 = 放弃会话范围这一层"：一个空会话可以随便使唤
+                    // 别处（别的项目）的工具。而这套设计里，"用户托管了什么"
+                    // **是会话唯一的范围来源** —— 服务表里那串 `--fence` 是**部署**
+                    // 写的，不是用户在这次会话里交出来的。
+                    //
+                    // 所以：**要用带围栏的实例，就得先托管**（哪怕只托管一条）。
+                    // 不带围栏的那些（`echo` 之类）照常，不受这条影响。
+                    if hosts.is_empty() {
+                        let target = env.to.clone();
+                        self.refuse_call(
+                            &env,
+                            "refused",
+                            format!(
+                                "`{target}` 管着一条路径，而**本会话什么都没托管** —— \
+                                 托管是「你能碰什么范围」的声明"
+                            ),
+                            "先 `{\"op\":\"host\",\"path\":\"…\"}` 把要用的那条路径托管进来\
+                             （托管会立刻重新装配那些要围栏的服务）；\
+                             或者换一个已经托管过路径的会话",
+                        );
+                        return;
+                    }
                     let outside: Vec<&String> =
                         fence.iter().filter(|f| !hosts.contains(f)).collect();
                     if !hosts.is_empty() && outside.len() == fence.len() {
@@ -3448,6 +3474,29 @@ impl App {
                 let anchor_note = "会话托管的是**路径**（绑定范围与围栏都按它算）；\
                                    记忆那层的「锚点」由调用方给 —— §16.5 的修订已删掉\
                                    「项目层」那一档，所以这里**没有待实现的锚点**";
+                // **同一条路径托管两次 = 一条**（2026-09-27，被 `smoke-resume` 抓出来的）。
+                //
+                // 那次会话是这么开的：`--host <project>` **加** 脚本又发了一条 `host <project>`
+                // —— 于是 `session.hosts` 里躺了两条一模一样的记录（判据 3 当场红：
+                // "托管 2 条"）。托管是**声明范围内有什么**，不是流水账：
+                // 一条路径写两遍，后面所有"按托管算范围"的地方都要自己记得去重。
+                // 已经在里面就**如实说已经在里面**（幂等），别再加一条。
+                let already = self
+                    .session
+                    .hosts
+                    .iter()
+                    .any(|h| h.get("path").and_then(Value::as_str) == Some(canon.as_str()));
+                if already {
+                    self.reply(
+                        req,
+                        json!({"route": null, "effect": "confirmed", "code": null,
+                               "data": {"path": canon, "idempotent": true,
+                                        "hosts": self.session.hosts.len(),
+                                        "note": "这条路径**已经托管过了** —— 托管是『范围内有什么』，\
+                                                 不是流水账"}}),
+                    );
+                    return;
+                }
                 self.session.hosts.push(json!({
                     "path": canon,
                     "hosted_at": now_ms(),

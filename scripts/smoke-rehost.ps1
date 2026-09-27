@@ -142,6 +142,71 @@ Check '7. **光有实例名白名单还不够**：绑在别的路径上的服务
 Check '8. 在托管范围内的那个照常能用' {
     ($records | Where-Object { $_.type -eq 'result' -and $_.from -eq 'term:1' -and $_.payload.effect -eq 'confirmed' } | Measure-Object).Count -ge 1
 }
+
+Write-Host ''
+Write-Host '== ④ 托管是**必须的**（2026-09-27 补）==' -ForegroundColor Cyan
+# 这条判的是：**本会话什么都没托管时，带围栏的实例一律不许用**。
+# 原来那儿有个短路（`if !hosts.is_empty() && ...`）—— 也就是"不托管 = 放弃会话范围这层"，
+# 于是一个空会话可以随便使唤别处（别的项目）的工具。
+# 现在：**要用带围栏的实例，就得先托管**（不带围栏的那些不受影响）。
+$services2 = $servicesPath
+$dataDir2 = Join-Path $work 'data2'
+$psi2 = New-Object System.Diagnostics.ProcessStartInfo
+$psi2.FileName = $ctrl
+# 注意：**故意不给 `--host`**
+$psi2.Arguments = "--sid s-rehost2 --data-dir `"$dataDir2`" --services `"$services2`" --drain-ms 5000"
+$psi2.RedirectStandardInput = $true
+$psi2.RedirectStandardOutput = $true
+$psi2.RedirectStandardError = $true
+$psi2.UseShellExecute = $false
+$psi2.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+$proc2 = [System.Diagnostics.Process]::Start($psi2)
+Start-Sleep -Seconds 2
+function Ask2([string]$corr, [hashtable]$payload) {
+    $m = [ordered]@{ id = "m-$corr"; ts = 0; type = 'request'; from = 'console'; to = 'ctrl'
+                     corr = $corr; sid = 's-rehost2'; authority = 'user'; payload = $payload }
+    $proc2.StandardInput.WriteLine(($m | ConvertTo-Json -Compress -Depth 12))
+    $proc2.StandardInput.Flush()
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $t = $proc2.StandardOutput.ReadLineAsync()
+        if (-not $t.Wait(5000)) { continue }
+        $l = $t.Result
+        if (-not $l) { break }
+        if ($l.Trim() -eq '') { continue }
+        $r = $l | ConvertFrom-Json
+        if ($r.type -eq 'result' -and $r.corr -eq $corr) { return $r }
+    }
+    return $null
+}
+# ⚠️ **这一条得走智能体那条路**（2026-09-27 实测）：
+# 那道范围检查只对**有绑定表的调用方**（智能体）跑 —— 用户直连工具是**不查范围**的
+# （用户本来就是范围的来源）。我第一次拿 console 直连去验，结果调成了 ——
+# 判据指错了对象，而规则没错。
+$task = [ordered]@{ id = 'm-task2'; ts = 0; type = 'request'; from = 'console'; to = 'agent:dada'
+                    corr = 'c-task2'; sid = 's-rehost2'; authority = 'user'
+                    payload = @{ task = '两个终端都试一下' } }
+$proc2.StandardInput.WriteLine(($task | ConvertTo-Json -Compress -Depth 12))
+$proc2.StandardInput.Flush()
+$deadline = [DateTime]::UtcNow.AddSeconds(25)
+while ([DateTime]::UtcNow -lt $deadline) {
+    $t = $proc2.StandardOutput.ReadLineAsync()
+    if (-not $t.Wait(5000)) { continue }
+    $l = $t.Result
+    if (-not $l) { break }
+    if ($l.Trim() -eq '') { continue }
+    $r = $l | ConvertFrom-Json
+    if ($r.type -eq 'result' -and $r.corr -eq 'c-task2') { break }
+}
+$logPath2 = Join-Path (Join-Path (Join-Path $dataDir2 'sessions') 's-rehost2') 'log.jsonl'
+$records2 = @(Get-Content -LiteralPath $logPath2 | Where-Object { $_.Trim() -ne '' } |
+    ForEach-Object { $_ | ConvertFrom-Json })
+$noHost = @($records2 | Where-Object { $_.payload.code -eq 'refused' -and $_.payload.why -like '*什么都没托管*' })
+Check '9. **没托管的会话里，智能体用带围栏的服务：拒**，并说清"托管是必须的"、怎么托管' {
+    $noHost.Count -ge 1 -and $noHost[0].payload.remedy -like '*host*'
+}
+$proc2.StandardInput.Close()
+$proc2.WaitForExit(8000) | Out-Null
 Write-Host ''
 Write-Host '== 中控的 stderr ==' -ForegroundColor Cyan
 if ($et.IsCompleted) { foreach ($l in ($et.Result -split "`n")) { if ($l.Trim() -ne '') { Write-Host "  $l" } } }

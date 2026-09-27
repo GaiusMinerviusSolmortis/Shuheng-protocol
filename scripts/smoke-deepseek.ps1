@@ -66,7 +66,7 @@ $servicesPath = Join-Path $work 'services.json'
 "@ | Set-Content -LiteralPath $servicesPath -Encoding utf8
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $ctrl
-$psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 20000"
+$psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$servicesPath`" --drain-ms 20000 --host `"$project`""
 $psi.RedirectStandardInput = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
@@ -177,7 +177,7 @@ $services2 = Join-Path $work2 'services.json'
 "@ | Set-Content -LiteralPath $services2 -Encoding utf8
 $psi2 = New-Object System.Diagnostics.ProcessStartInfo
 $psi2.FileName = $ctrl
-$psi2.Arguments = "--sid $sid2 --data-dir `"$dataDir2`" --services `"$services2`" --drain-ms 20000"
+$psi2.Arguments = "--sid $sid2 --data-dir `"$dataDir2`" --services `"$services2`" --drain-ms 20000 --host `"$project`""
 $psi2.RedirectStandardInput = $true
 $psi2.RedirectStandardOutput = $true
 $psi2.RedirectStandardError = $true

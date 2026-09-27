@@ -48,7 +48,9 @@ $servicesPath = Join-Path $work 'services.json'
 function Start-Ctrl([string[]]$extra) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ctrl
-    $base = @("--sid", $sid, "--data-dir", "`"$dataDir`"", "--services", "`"$servicesPath`"", "--drain-ms", "5000")
+    # ⚠️ **托管是必须的**（2026-09-27）：这一份本来就在 `$project` 里干活 —— 如实托出来。
+    $base = @("--sid", $sid, "--data-dir", "`"$dataDir`"", "--services", "`"$servicesPath`"",
+              "--drain-ms", "5000", "--host", "`"$project`"")
     $psi.Arguments = (($base + $extra) -join ' ')
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true

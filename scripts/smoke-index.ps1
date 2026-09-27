@@ -42,7 +42,7 @@ $servicesPath = Join-Path $work 'services.json'
 function Start-Ctrl([string]$sid, [string]$services) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ctrl
-    $psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$services`" --drain-ms 6000"
+    $psi.Arguments = "--sid $sid --data-dir `"$dataDir`" --services `"$services`" --drain-ms 6000 --host `"$project`""
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
