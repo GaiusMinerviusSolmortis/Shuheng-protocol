@@ -64,7 +64,32 @@ pub struct SessionLog {
     seq: u64,
     /// 距上次屏障以来有没有新写入 —— barrier 用它做短路
     dirty: bool,
+    /// **一条记录里 payload 可以内联多少字节**（超了就溢出成文件，日志里放引用）。
+    ///
+    /// 这是 §5.1 那条"大 payload 溢出成文件、日志里放引用"的**阈值**。
+    /// 默认 **65 536（64 KiB）**。
+    ///
+    /// ⚠️ **为什么不是 8 192**（第一版我照 §5.4 那张表取了 8 192，结果当场红了三份验收）：
+    /// 这是**"大块"的门槛，不是"稍微大一点"的门槛**。8 192 会把**正常大小的消息**
+    /// 也赶进引用 —— 比如 MCP 桥自报的那份 manifest（它把对端的工具表原样报过来），
+    /// 于是所有**直接读日志**的消费者（验收脚本、以后的分析工具）都得先学会解引用
+    /// 才能看见一份**本该在内联里**的东西。
+    /// 大块（截图、一段几 MB 的文本、刷屏的终端）随便都超过 64 KiB，
+    /// 而"正常的一条消息"远小于它 —— **门槛要落在两堆之间，不是落在中间那堆里面**。
+    ///
+    /// ⚠️ 它仍然是**部署选择**（`--log-inline`），不是普适值（同 `--inline-limit` 那条）。
+    inline_limit: usize,
 }
+
+/// 默认的内联上限（64 KiB）。
+pub const DEFAULT_LOG_INLINE: usize = 65_536;
+
+/// **一条记录里的 payload 太大了** —— 它是引用，不是正文。
+///
+/// 形状（§5.1）：`{"spilled": {"file": "<相对会话目录>", "bytes": N}}`。
+/// **引用是可解的**（不变量二要的正是这个）：`resolve_payload()` 把它换回正文，
+/// 而"换回来必须逐字节一样"有一条判据盯着。
+pub const SPILL_KEY: &str = "spilled";
 
 /// 读回来的日志 + **尾部跳过了几行**。
 ///
@@ -96,7 +121,19 @@ impl SessionLog {
             writer: BufWriter::new(file),
             seq,
             dirty: false,
+            inline_limit: DEFAULT_LOG_INLINE,
         })
+    }
+
+    /// 改内联上限（`--log-inline`，部署选择）。
+    pub fn set_inline_limit(&mut self, n: usize) {
+        if n > 0 {
+            self.inline_limit = n;
+        }
+    }
+
+    pub fn inline_limit(&self) -> usize {
+        self.inline_limit
     }
 
     pub fn dir(&self) -> &Path {
@@ -109,6 +146,31 @@ impl SessionLog {
 
     pub fn last_seq(&self) -> u64 {
         self.seq
+    }
+
+    /// **把一条记录里的引用解回正文**（§5.1 那半："引用可解"）。
+    ///
+    /// 记录里是引用就返回正文，不是引用就**原样返回**（调用方不用先判断）。
+    /// 解不开的时候**如实说**（`{"resolve_error": "..."}`）—— 那意味着这条日志
+    /// 重建不出当时的东西了，那是**要立刻知道**的事，不是悄悄吞掉的事。
+    pub fn resolve_payload(&self, payload: &serde_json::Value) -> serde_json::Value {
+        let Some(rel) = payload
+            .get(SPILL_KEY)
+            .and_then(|s| s.get("file"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return payload.clone();
+        };
+        let path = self.dir.join(rel);
+        match fs::read(&path).and_then(|b| {
+            serde_json::from_slice::<serde_json::Value>(&b)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }) {
+            Ok(v) => v,
+            Err(e) => serde_json::json!({
+                "resolve_error": format!("溢出文件读不回来（{}）：{e}", path.display())
+            }),
+        }
     }
 
     /// 把整份日志读回来。**重放要用它** —— 不变量二说"能从日志重建"，
@@ -180,10 +242,25 @@ impl SessionLog {
     /// **不变量二（可重放）靠调用顺序保证**：先记进来，再投递。
     pub fn append(&mut self, envelope: &Envelope) -> Result<u64, LogError> {
         self.seq += 1;
+        let mut envelope = envelope.clone();
+        // **§5.1：大 payload 溢出成文件，日志里放引用。**
+        //
+        // 为什么必须在**写日志这一侧**做（原来靠"工具自己先截"）：
+        // 那条路只管得住**工具结果**，管不住别的 —— 而日志是**不变量二**的载体，
+        // 它得自己保证"不会被任何一条消息撑爆"。终端刷屏、一张截图、一段
+        // 塞进 `args` 的大文本，都会从这儿过。
+        //
+        // ⚠️ **引用必须是可解的**（不变量二："能从日志重建"）：
+        // 所以溢出文件**当场 fsync**（一次写 + 一次同步；它只在大 payload 上发生），
+        // —— `barrier` 只 fsync 日志那条流，管不到这个文件，而"引用指向一个
+        // 还在缓存里的文件"就等于"崩了之后重建不出来"。
+        if let Some(reference) = self.spill_payload(self.seq, &mut envelope)? {
+            debug_assert!(reference.is_object());
+        }
         let record = LogRecord {
             seq: self.seq,
             recorded_at: crate::now_ms(),
-            envelope: envelope.clone(),
+            envelope,
         };
         let line = serde_json::to_string(&record)?;
         debug_assert!(!line.contains('\n'), "日志行里出现了裸换行，重放会被打断");
@@ -191,6 +268,35 @@ impl SessionLog {
         self.writer.write_all(b"\n")?;
         self.dirty = true;
         Ok(self.seq)
+    }
+
+    /// 太大就溢出；返回**那条引用**（没溢出就是 `None`）。
+    fn spill_payload(
+        &self,
+        seq: u64,
+        envelope: &mut Envelope,
+    ) -> Result<Option<serde_json::Value>, LogError> {
+        let bytes = serde_json::to_vec(&envelope.payload)?;
+        if bytes.len() <= self.inline_limit {
+            return Ok(None);
+        }
+        let dir = self.dir.join("spill");
+        fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{seq}.json"));
+        // 一次写 + 一次同步：**引用可解**这件事不能只靠"大概写下去了"
+        let mut f = File::create(&file)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        let reference = serde_json::json!({
+            SPILL_KEY: {
+                // 相对会话目录的路径：日志跟着会话走，引用也得跟着走
+                "file": format!("spill/{seq}.json"),
+                "bytes": bytes.len(),
+                "note": "这条 payload 太大，正文在溢出文件里；`log {resolve:true}` 会就地展开它",
+            }
+        });
+        envelope.payload = reference.clone();
+        Ok(Some(reference))
     }
 
     /// **落盘屏障**：flush + fsync。**返回"这一次真的落了吗"**。

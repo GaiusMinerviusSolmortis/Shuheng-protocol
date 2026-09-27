@@ -96,6 +96,11 @@ struct Args {
     /// **开不开订阅口**（`--no-subscribe` 关掉）。**默认开** ——
     /// 一条"谁也看不见"的会话是更糟的默认值（而且订阅口只是回环，不经网卡）。
     subscribe: bool,
+    /// **一条日志记录里 payload 内联多少字节**（`--log-inline`）。
+    ///
+    /// 超了就**溢出成文件、日志里放引用**（§5.1）—— 那条路原来靠"工具自己先截"，
+    /// 只管得住工具结果；日志是不变量二的载体，得自己保证不被一条消息撑爆。
+    log_inline: usize,
     /// **给刚拉起来的服务留多久"报到"的时间**（`--startup-grace-ms`）。
     ///
     /// 为什么需要它：`route` 原来会**在服务自报家门之前就派活** ——
@@ -124,6 +129,7 @@ fn parse_args() -> Args {
         tick: Duration::from_millis(2000),
         debug_barriers: false,
         subscribe: true,
+        log_inline: harness_core::session_log::DEFAULT_LOG_INLINE,
         startup_grace: Duration::from_millis(2000),
     };
     let mut it = std::env::args().skip(1);
@@ -174,6 +180,11 @@ fn parse_args() -> Args {
             "--debug-barriers" => args.debug_barriers = true,
             // 关掉订阅口：用在不希望开一个回环端口的场合（比如受限环境）。
             "--no-subscribe" => args.subscribe = false,
+            "--log-inline" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<usize>().ok()) {
+                    args.log_inline = v;
+                }
+            }
             "--startup-grace-ms" => {
                 if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
                     args.startup_grace = Duration::from_millis(v);
@@ -640,13 +651,15 @@ fn run() -> i32 {
         return 2;
     }
 
-    let log = match SessionLog::open(&args.data_dir, &args.sid) {
+    let mut log = match SessionLog::open(&args.data_dir, &args.sid) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[ctrl] 打不开会话日志：{e}");
             return 2;
         }
     };
+    // **日志侧的内联上限**（`--log-inline`，部署选择）：超了就溢出成文件、日志里放引用。
+    log.set_inline_limit(args.log_inline);
     eprintln!(
         "[ctrl] 会话 {} 日志：{}",
         args.sid,
@@ -3435,6 +3448,17 @@ impl App {
                 // `since` 是**游标**（字节以外的另一种页码）：只给 seq 比它大的。
                 // 默认 0 = 从头给。日志大了要分页 —— 那条还没做（见 §8）。
                 let since = req.payload.get("since").and_then(Value::as_u64).unwrap_or(0);
+                // **要不要把引用就地解开**（§5.1 那半"引用可解"）。
+                //
+                // ⚠️ **默认不展开**：展开就是把大字节搬给调用方 ——
+                // 而这条路是智能体恢复上下文走的（它要的是"我放过什么"，
+                // 不是"把那张 20 KB 的截图原样再吃一遍"）。
+                // 要正文就显式写 `resolve: true`（比如审计、GUI 里点开看）。
+                let resolve = req
+                    .payload
+                    .get("resolve")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 match self.log.read_all() {
                     Err(e) => self.reply(
                         req,
@@ -3451,7 +3475,15 @@ impl App {
                             .iter()
                             .filter(|r| r.seq > since)
                             .filter(|r| r.envelope.from == who || r.envelope.to == who)
-                            .filter_map(|r| serde_json::to_value(r).ok())
+                            .filter_map(|r| {
+                                let mut v = serde_json::to_value(r).ok()?;
+                                if resolve {
+                                    let payload =
+                                        self.log.resolve_payload(&r.envelope.payload);
+                                    v["payload"] = payload;
+                                }
+                                Some(v)
+                            })
                             .collect();
                         let to_seq = read.records.last().map(|r| r.seq).unwrap_or(0);
                         // **跳过尾部半残这件事要说出来**（§11.5 那条"诚实报告"）：
