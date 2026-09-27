@@ -141,6 +141,70 @@ fn a_rendezvous_with_a_foreign_protocol_is_not_alive() {
     assert!(!rv.alive());
 }
 
+/// **传输的版本闸门：同 major 就认**（2026-09-27，规范-消息协议 §9）。
+///
+/// 这条以前是等号（`self.protocol == PROTOCOL`），而**等号就是"没有兼容处理"**：
+/// 同一个 major 里加一个可选字段（抬一下 minor），
+/// **所有还活着的常驻服务的会合文件当场全失效** —— 明明什么都没变。
+#[test]
+fn a_same_major_tag_connects_even_when_the_minor_is_newer() {
+    let l = Listener::bind("mem:1").unwrap();
+    let mut rv = Rendezvous::new("mem:1", "mem", l.addr(), l.token());
+    // 造一个"更新的 minor"：同一个 major，所以该连上。
+    rv.protocol = "ndjson-tcp-1.7".into();
+    let h = std::thread::spawn(move || {
+        let _ = l.accept();
+    });
+    assert!(rv.alive(), "同一个 major 该连上（原来的等号会把它判成死的）");
+    h.join().unwrap();
+    // 而 major 对不上就不连 —— 硬连上去只会拿到一堆看不懂的字节。
+    rv.protocol = "ndjson-tcp-2.0".into();
+    assert!(!rv.alive(), "major 对不上不许连");
+    // 名字就不是这个协议的，更不许连。
+    rv.protocol = "named-pipe-1".into();
+    assert!(!rv.alive());
+}
+
+/// **那份小解析和 `harness-core` 的版本口径必须一致。**
+///
+/// 为什么要有这一条：`harness-ipc` 的产品代码刻意不依赖 core
+/// （传输不该认识信封），于是"版本怎么读"这件事**有两份实现** ——
+/// 而两份手写的东西一定会漂。它们没法共用一行代码，那就至少**共用一组例子**：
+/// 下面每一行，两边的答案必须一样。
+#[test]
+fn the_transport_tag_reads_versions_exactly_like_core_does() {
+    let cases = [
+        ("ndjson-tcp-1", "1"),
+        ("ndjson-tcp-1.0", "1.0"),
+        ("ndjson-tcp-1.7", "1.7"),
+        ("ndjson-tcp-2.0", "2.0"),
+        ("ndjson-tcp-10.20", "10.20"),
+    ];
+    for (tag, ver) in cases {
+        let theirs = harness_core::Version::parse(ver).unwrap();
+        assert_eq!(
+            harness_ipc::tag_version(tag),
+            Some((theirs.major, theirs.minor)),
+            "`{tag}` 两边读出来不一样"
+        );
+    }
+    // 读不出来的那些也要一致：两边都不许猜。
+    for bad in ["ndjson-tcp", "ndjson-tcp-", "ndjson-tcp-x", "ndjson-tcp-1.", "ndjson-tcp-1.0.2", "named-pipe-1"] {
+        assert!(harness_ipc::tag_version(bad).is_none(), "`{bad}` 不该读出来");
+        assert!(harness_core::Version::parse(bad).is_none(), "`{bad}` 两边都不该认");
+    }
+    // 自己报的那一版，也得和 core 常量是同一版。
+    let mine = harness_ipc::tag_version(PROTOCOL).unwrap();
+    assert_eq!(
+        mine,
+        (
+            harness_core::version::protocol_version().major,
+            harness_core::version::protocol_version().minor
+        ),
+        "传输自报的版本和 `PROTOCOL_VERSION` 不是同一版"
+    );
+}
+
 /// 口令**每次都不一样**（不然"口令"这两个字就没意义了）。
 #[test]
 fn tokens_differ_between_instances() {

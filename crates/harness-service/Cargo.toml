@@ -6,6 +6,10 @@ description = "工具服务的公共件：路径围栏、域锁、能力凭证�
 
 [dependencies]
 serde_json = "1"
+# **版本那一条规矩只有一份**（`harness-core::version`）。这里借的是它，
+# 不是抄它 —— 传输那一侧（`harness-ipc`）刻意没依赖 core（见那个 crate 的说明），
+# 所以它那份标签解析由 `tests/transport.rs` 盯着与 core 一致。
+harness-core = { path = "../harness-core" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

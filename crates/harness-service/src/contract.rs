@@ -93,24 +93,14 @@ pub const INJECTION_POLICIES: &[&str] = &["card", "help", "full"];
 
 /// §11.1 E 组 `lifecycle` 的闭合取值。
 pub const LIFECYCLES: &[&str] = &["per_call", "per_session", "resident"];
-/// **中控认识的那一版契约**（规范-工具服务 §11.6 #8，2026-09-20 定）。
+/// **中控认识的那一版契约** —— 它就是**协议的那一版**，不是另立一个号
+/// （规范-工具服务 §11.6 #8 / 规范-消息协议 §9）。
 ///
-/// 规则（写在这儿，因为它是**闸门**在执行的）：
-///
-/// | 改动 | 算不算破坏性 | 版本怎么动 |
-/// |---|---|---|
-/// | **加必报字段** | ✅ 破坏性（老服务会突然不合规、被闸门拦）| **升**（`1` → `2`）|
-/// | 加**可选**字段 | 兼容 | 不动 |
-/// | 往**闭合枚举**里加值 | 兼容（不报那个值的老服务不受影响）| 不动 |
-/// | 删值 / 改语义 | ✅ 破坏性 | **升** |
-///
-/// ⚠️ **有一处例外要说清楚**：`sandbox` / `sandbox_note` 是 2026-09-20
-/// **加进 `"1"` 的必报字段** —— 按上表它本该升版。之所以没升：
-/// **那时还没有第三方服务**（六个服务全在这个仓库里，一起改完的）。
-/// 这是**唯一一次**可以这么干的情形；下一次加必报字段就得升版，
-/// 否则"版本号"这三个字就废了 —— 而版本号废掉之后，
-/// 对不上版本的两边只会互相报"你少了个字段"，谁也查不出真正的原因。
-pub const CONTRACT_VERSION: &str = "1";
+/// ⚠️ **2026-09-27 之前这里写的是 `"1"`，而闸门写的是 `v == CONTRACT_VERSION`。**
+/// 那个等号就是"没有兼容处理"：它把"加一个可选字段"这种本该系统性地兼容的改动，
+/// 变成"所有老服务当场被拒"。现在规则是**看 major**（`harness_core::version`）——
+/// 唯一真相也搬过去了，**这里不再抄一份版本号**。
+pub const CONTRACT_VERSION: &str = harness_core::version::PROTOCOL_VERSION;
 
 /// **沙箱的五个面**（04-安全 §5.8 决定二）—— 每个面一个**闭集**。
 ///
@@ -211,11 +201,24 @@ pub const LIVENESS_WORDS: &[&str] = &["starting", "online", "offline", "degraded
 pub struct ManifestReport {
     pub errors: Vec<String>,
     pub missing_optional: Vec<String>,
+    /// **收下、但要说一声。**
+    ///
+    /// 现在只有一样东西走这条路：`contract_version` 的 **minor 比我们新**
+    /// （规范-消息协议 §9）。它**不是错** —— 同一个 major，对面加的是可选字段，
+    /// 我们照常接活、只是把那些没见过的字段当没有。
+    ///
+    /// 那为什么还要记一笔：将来出了怪事，"原来是它带了扩展"这件事必须能
+    /// **从日志里查出来**，而不是靠谁记得。同"服务表里能力拼错要出声"那条。
+    pub notes: Vec<String>,
 }
 
 impl ManifestReport {
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
+    }
+    /// **收下了，但有没有话要说？**
+    pub fn has_notes(&self) -> bool {
+        !self.notes.is_empty()
     }
     /// 给人和模型看的一句话。
     pub fn summary(&self) -> String {
@@ -545,21 +548,41 @@ fn need_str_array(m: &Value, key: &str, out: &mut Vec<String>) -> bool {
 /// 比不声明更糟** —— 那正是规范里那些洞变成隐性假设的方式。
 pub fn check_manifest(m: &Value) -> ManifestReport {
     let mut r = ManifestReport::default();
+    // **"收下、但要说一声"** 的那几条 —— 攒着，等 `r.errors` 那笔借用还回去再装车。
+    let mut notes: Vec<String> = Vec::new();
 
     // ---- A 身份 ----
     {
         let e = &mut r.errors;
-        // **契约版本**（2026-09-20 定下演进规则，见下面那段注释）：
-        // 只接受我们认识的版本 —— **不认识的版本不许照旧解析**，
+        // **契约版本**（规范-工具服务 §11.6 #8 / 规范-消息协议 §9）：
+        // **同 major 就谈，major 对不上就按名字拒** —— 不认识的版本不许照旧解析，
         // 那正是"版本号白写"的经典死法（拿到 2 的字段集合却按 1 去读，
         // 报出来的错会指向"少字段"，而不是"版本不对"）。
+        //
+        // ⚠️ **这里原来是个等号**（`v == CONTRACT_VERSION`）。等号的问题不在"太严"，
+        // 在"把兼容的改动逼成不兼容的"：服务加一个可选字段、抬一下 minor，
+        // 老中控当场把它整个拒掉。判词和"怎么办"都归 `Compat`（一处写）。
+        let mine = harness_core::version::protocol_version();
         match m.get("contract_version").and_then(Value::as_str) {
-            Some(v) if v == CONTRACT_VERSION => {}
-            Some(v) => e.push(format!(
-                "`contract_version` 是 `{v}`，我只认识 `{CONTRACT_VERSION}` —— \
-                 这不是「你写错了」，是**我们对不上**：要么你在实现更新的契约，\
-                 要么我太老。**别按旧版本硬解释它**（那样报出来的错会指向错的地方）"
-            )),
+            Some(v) => match harness_core::Version::parse(v) {
+                None => e.push(format!(
+                    "`contract_version` 是 `{v}`，这不是一个版本号 —— \
+                     版本写成 `major.minor`（如 `{CONTRACT_VERSION}`），\
+                     缺 minor 就写 `{major}`。拼错了和版本对不上是**两回事**：\
+                     这一条说明它是个笔误，不是我们在谈两个不同的形状",
+                    major = mine.major
+                )),
+                Some(theirs) => {
+                    let how = mine.speak(theirs);
+                    if let Some(why) = how.why(mine, theirs) {
+                        e.push(format!("`contract_version` —— {why}"));
+                    }
+                    // 收下、但要说一声：**它带了我没见过的字段**。
+                    if let Some(note) = how.note(mine, theirs) {
+                        notes.push(note);
+                    }
+                }
+            },
             None => e.push(
                 "少 `contract_version` —— 没有它，中控就只能**猜**该按哪一版解释这份 manifest"
                     .into(),
@@ -736,6 +759,8 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
             .missing_optional
             .push("没写 `will`（遗嘱）：你崩了之后，中控发给智能体的敕令里「影响」那一段只能用一句套话 —— 而「我手里那几个锁会释放、我起的子进程会被带走」只有你知道".into()),
     }
+    // A~E 那一段查完了：把"收下但要说一声"的那几条装车。
+    r.notes = notes;
     }
 
     // ---- 工具表（C 组：一层一张）----
@@ -1447,6 +1472,10 @@ mod tests {
             "版本对不上该点名：{:?}",
             r.errors
         );
+        // 判词里**两个版本号都要在**：只说"我不认识"而不说"我认识的是几"，
+        // 对面还是不知道该往哪边改。
+        let why = r.errors.join(" ");
+        assert!(why.contains("2.0") && why.contains(CONTRACT_VERSION), "{why}");
         // 少写也一样要被拦（不然中控只能猜）
         let mut m2 = conforming_manifest();
         m2.as_object_mut().unwrap().remove("contract_version");
@@ -1457,6 +1486,72 @@ mod tests {
                 .any(|w| w.contains("contract_version")),
             "没写版本号也得拦"
         );
+    }
+
+    /// **等号换成了"看 major"**（2026-09-27，规范-消息协议 §9）。
+    ///
+    /// 三档一眼看完，因为它们要修的地方各不相同：
+    ///
+    /// | 它声明 | 结果 |
+    /// |---|---|
+    /// | `1.0` / `1`（同一个形状，两种写法）| 收下，**静悄悄** |
+    /// | `1.9`（同 major、更新）| 收下，**要出声** |
+    /// | `2.0` / `0.9`（major 对不上）| **按名字拒**，而且"太新/太老"分开说 |
+    #[test]
+    fn compatibility_is_decided_by_major_not_by_equality() {
+        // `"1"` 与 `"1.0"` 是同一版 —— 六个服务 manifest 里写的就是前者，
+        // 这条不成立的话，闸门会把这个仓库自己的服务全拒掉。
+        for same in ["1", "1.0", "1.00"] {
+            let mut m = conforming_manifest();
+            m["contract_version"] = json!(same);
+            let r = check_manifest(&m);
+            assert!(r.is_ok(), "`{same}` 该被收下：{:?}", r.errors);
+            assert!(
+                !r.has_notes(),
+                "`{same}` 和我是同一版，不该出声：{:?}",
+                r.notes
+            );
+        }
+        // 同 major、更新的 minor：**收下 + 出声**（这条原来会被等号拒掉）。
+        let mut m = conforming_manifest();
+        m["contract_version"] = json!("1.9");
+        let r = check_manifest(&m);
+        assert!(r.is_ok(), "同 major 不该拒：{:?}", r.errors);
+        assert!(
+            r.notes.iter().any(|n| n.contains("1.9")),
+            "收下了就得说一声：{:?}",
+            r.notes
+        );
+        // major 对不上：两档都拒，但**判词不是同一句**（要修的地方不一样）。
+        let mut newer = conforming_manifest();
+        newer["contract_version"] = json!("2.0");
+        let mut older = conforming_manifest();
+        older["contract_version"] = json!("0.9");
+        let new_why = check_manifest(&newer).errors.join(" ");
+        let old_why = check_manifest(&older).errors.join(" ");
+        assert_ne!(new_why, old_why, "太新和太老不该共用一句话");
+        assert!(new_why.contains("更新的协议"), "{new_why}");
+        assert!(old_why.contains("老"), "{old_why}");
+    }
+
+    /// **版本号写坏了 ≠ 版本对不上。**
+    ///
+    /// 这两件事要分开说：前者是它自己打错了字（改一个字就好），
+    /// 后者是我们在谈两个不同的形状（得动版本）。混成一句，
+    /// 拿到那句话的人会照着错的方向改。
+    #[test]
+    fn a_typo_in_the_version_is_not_a_version_mismatch() {
+        for typo in ["1.", "v1", "版本一", "1.0.2"] {
+            let mut m = conforming_manifest();
+            m["contract_version"] = json!(typo);
+            let r = check_manifest(&m);
+            let why = r.errors.join(" ");
+            assert!(why.contains("不是一个版本号"), "`{typo}`：{why}");
+            assert!(
+                !why.contains("更新的协议"),
+                "`{typo}` 是笔误，不该被说成「对面更新」：{why}"
+            );
+        }
     }
 
     #[test]

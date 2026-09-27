@@ -54,6 +54,8 @@ struct Args {
     /// **编一个能力名**（`super.power`）：令牌表是闭合的（2026-09-27），
     /// 编的名字要让注册那道闸门当场拦下 —— 它演的是"签了却什么也管不住的能力"。
     bad_caps: bool,
+    /// 它要在 manifest 里报的 `contract_version`（默认 `1` = 本仓库那一版）。
+    contract_version: String,
 }
 
 fn parse_args() -> Args {
@@ -68,6 +70,7 @@ fn parse_args() -> Args {
     let mut inject = String::from("card");
     let mut bad_state = false;
     let mut bad_caps = false;
+    let mut contract_version = String::from("1");
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -81,6 +84,13 @@ fn parse_args() -> Args {
             "--inject" => inject = it.next().unwrap_or(inject),
             "--bad-state" => bad_state = true,
             "--manifest-bad-caps" => bad_caps = true,
+            // **它会给自己报一个别的协议版本** —— 用来演 §9 的兼容闸门：
+            //   `1.9` 同 major ⇒ 收下 + 出声；`2.0` / `0.9` ⇒ 按名字拒。
+            // 没有这个开关，"版本对不上"这条规则**只活在单元测试里**，
+            // 而那正是上一条（能力令牌表）栽过的地方。
+            "--contract-version" => {
+                contract_version = it.next().unwrap_or(contract_version)
+            }
             _ => {}
         }
     }
@@ -95,6 +105,7 @@ fn parse_args() -> Args {
         inject,
         bad_state,
         bad_caps,
+        contract_version,
     }
 }
 
@@ -159,7 +170,7 @@ fn main() {
 
 fn manifest(args: &Args) -> Value {
     let mut m = json!({
-        "contract_version": "1",
+        "contract_version": args.contract_version.clone(),
         "id": format!("{}-mock", args.kind),
         "version": env!("CARGO_PKG_VERSION"),
         "title": "Echo（阶段 1 的 mock 工具）",
@@ -526,6 +537,8 @@ mod tests {
             bad_state: false,
             // 测试默认那份是**合规的**；要演"编了能力名"就显式传 `true`
             bad_caps: false,
+            // 同上：默认报本仓库那一版（`"1"` 与 `"1.0"` 是同一版）
+            contract_version: "1".into(),
         }
     }
 

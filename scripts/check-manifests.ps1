@@ -189,6 +189,45 @@ Check '9. 能力令牌表：**规范里那张 == 代码里那张**（两边手�
 foreach ($c in $onlySpec) { Write-Host "  只在规范里：$c" -ForegroundColor Yellow }
 foreach ($c in $onlyCode) { Write-Host "  只在代码里：$c" -ForegroundColor Yellow }
 
+# **10. 协议版本：规范说的 == 代码里那个常量 == 六个服务自报的**（2026-09-27）。
+#
+# 为什么这条必须机器判：版本号在这套东西里有**四个住址** ——
+# 规范抬头那句、`harness_core::version::PROTOCOL_VERSION`、
+# 传输会合文件的 `protocol` 标签、以及六个服务 manifest 里的 `contract_version`。
+# 四份手写的东西一定会漂，而它漂的后果正是 2026-09-27 之前那个样子：
+# **闸门用的是一处，声明用的是另一处，谁也没发现。**
+#
+# 口径只有一条：**看 major**（§9）。所以这里比的是**同一版**，
+# 而 `"1"` 与 `"1.0"` 是同一版 —— 缺 minor 就是 0。
+function V([string]$s) {
+    $t = $s.Trim()
+    if ($t -notmatch '^\d+(\.\d+)?$') { return "坏值：$t" }
+    if ($t -notmatch '\.') { $t = "$t.0" }
+    return $t
+}
+$specVer = $null
+foreach ($l in (Get-Content -LiteralPath (Join-Path $root '规范-消息协议.md'))) {
+    if ($l -match '协议版本：`([0-9][0-9.]*)`') { $specVer = $Matches[1]; break }
+}
+$coreSrc = Get-Content -LiteralPath (Join-Path $root 'crates/harness-core/src/version.rs') -Raw
+$codeVer = [regex]::Match($coreSrc, 'pub const PROTOCOL_VERSION: &str = "([0-9][0-9.]*)"').Groups[1].Value
+$svcVer = @{}
+foreach ($k in $manifests.Keys) { $svcVer[$k] = "$($manifests[$k].contract_version)" }
+$wrong = @()
+if (-not $specVer) { $wrong += '规范-消息协议.md 里没有那句「协议版本：`x.y`」' }
+if (-not $codeVer) { $wrong += 'harness-core/src/version.rs 里没有 PROTOCOL_VERSION' }
+if ($specVer -and $codeVer -and (V $specVer) -ne (V $codeVer)) {
+    $wrong += "规范说 $specVer，代码说 $codeVer"
+}
+foreach ($k in ($svcVer.Keys | Sort-Object)) {
+    if ($codeVer -and (V $svcVer[$k]) -ne (V $codeVer)) {
+        $wrong += "$k 自报的 contract_version 是 $($svcVer[$k])，代码那一版是 $codeVer"
+    }
+}
+Check '10. 协议版本：**规范 / 代码常量 / 六个服务自报的，是同一版**' { $wrong.Count -eq 0 }
+foreach ($w in $wrong) { Write-Host "  $w" -ForegroundColor Yellow }
+Write-Host "          规范 $specVer / 代码 $codeVer / 六个服务 $(($svcVer.Keys | Sort-Object | ForEach-Object { $svcVer[$_] }) -join ' ')" -ForegroundColor DarkGray
+
 Write-Host ''
 Write-Host '== 六个服务自报的沙箱五面（这张表是从活服务里读出来的）==' -ForegroundColor Cyan
 Write-Host ("  {0,-10} {1,-12} {2,-14} {3,-11} {4,-11} {5}" -f '服务', 'filesystem', 'network', 'identity', 'executables', 'resources')

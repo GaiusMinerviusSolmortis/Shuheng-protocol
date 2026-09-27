@@ -803,6 +803,7 @@ fn run() -> i32 {
         owns: None,
         contract_errors: Vec::new(),
         contract_missing: Vec::new(),
+        contract_notes: Vec::new(),
         last_seen_ms: 0,
         unresponsive: false,
         lifecycle: "resident".into(),
@@ -826,6 +827,7 @@ fn run() -> i32 {
         owns: None,
         contract_errors: Vec::new(),
         contract_missing: Vec::new(),
+        contract_notes: Vec::new(),
         last_seen_ms: 0,
         unresponsive: false,
         lifecycle: "resident".into(),
@@ -1347,6 +1349,7 @@ impl App {
                 owns: None,
                 contract_errors: Vec::new(),
                 contract_missing: Vec::new(),
+                contract_notes: Vec::new(),
                 last_seen_ms: now_ms(),
                 unresponsive: false,
                 lifecycle: "resident".into(),
@@ -1876,6 +1879,7 @@ impl App {
             if let Some(r) = &report {
                 inst.contract_errors = r.errors.clone();
                 inst.contract_missing = r.missing_optional.clone();
+                inst.contract_notes = r.notes.clone();
                 // **家门不全 = 活着但接不了活。** 用的就是 §11.1 那个现成的状态词
                 // `degraded`（"活着，但别指望它干活"）—— 中控再往下不猜一步：
                 // 它照样在线、照样能 ping，但**有活要派给它时会被挡下**（见 route）。
@@ -1936,6 +1940,32 @@ impl App {
                              改法是服务自己补齐再上线；在那之前它进 degraded，\
                              有活派给它时会被挡下{missing}"
                         ),
+                    }),
+                );
+                self.route(ev);
+            }
+            // **收下了，但要说一声**（规范-消息协议 §9）。
+            //
+            // 它和自己那份 `contract_errors` 是**反的**：那条拦活，这条什么都不拦。
+            // 那为什么还要占一条日志：它声明了一个我还不认识的协议形状，
+            // 而那些我读不懂的字段是**静悄悄**被忽略的 —— 将来出了怪事，
+            // "原来是它带了扩展"这件事必须能从日志里查出来，而不是靠谁记得。
+            if r.errors.is_empty() && r.has_notes() {
+                let ev = self.system_event(
+                    &self.channel_id(),
+                    json!({
+                        "code": "contract_extensions_ignored",
+                        "instance": env.from,
+                        "contract_version": self
+                            .reg
+                            .manifest_of(&env.from)
+                            .and_then(|m| m.get("contract_version").cloned())
+                            .unwrap_or(Value::Null),
+                        "mine": harness_service::contract::CONTRACT_VERSION,
+                        "notes": r.notes,
+                        "remedy": "这**不是错误**，别照着修什么：同一个 major，\
+                                   它加的是可选字段，我们照常接活、只是把没见过的当没有。\
+                                   要是它真的需要中控照着那些字段做事，那是它该把 major 抬上去。"
                     }),
                 );
                 self.route(ev);
@@ -4093,6 +4123,7 @@ impl App {
             owns: None,
             contract_errors: Vec::new(),
             contract_missing: Vec::new(),
+            contract_notes: Vec::new(),
             last_seen_ms: now_ms(),
             unresponsive: false,
             // 部署决定的拉起时机（智能体也是"跟着会话"，所以默认 per_session）
@@ -4449,6 +4480,7 @@ mod tests {
             config: None,
             contract_errors: Vec::new(),
             contract_missing: Vec::new(),
+            contract_notes: Vec::new(),
             last_seen_ms: 1,
             unresponsive: false,
             lifecycle: "per_session".into(),

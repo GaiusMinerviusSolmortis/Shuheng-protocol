@@ -29,7 +29,47 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 
 /// 传输自报的名字。**会合文件里要写它** ——
 /// 以后换实现时，老客户端看见不认识的名字该拒绝，而不是猜着乱连。
+///
+/// ⚠️ **2026-09-27：认不认它，不再用等号了。** 原来 `alive()` 写的是
+/// `self.protocol == PROTOCOL`，而**等号就是"没有兼容处理"**：
+/// 同一个 major 里加个可选字段（抬一下 minor），全世界的会合文件当场全失效。
+/// 现在口径是 [`accepts_tag`]：**名字要对得上，major 要对得上**
+/// （规范-消息协议 §9）。
 pub const PROTOCOL: &str = "ndjson-tcp-1";
+
+/// **从标签里取出"它是第几版"**：`ndjson-tcp-1.7` → `(1, 7)`。
+///
+/// 为什么不直接借 `harness_core::Version`：这个 crate 的产品代码**刻意不依赖 core**
+/// （见 `Cargo.toml` 里那段说明：传输不该认识信封）。所以这里自带一个小解析，
+/// 而**它与 core 一致这件事由 `tests/transport.rs` 逐例盯着** ——
+/// 两份会漂的实现，得有人查。
+///
+/// 不认识的标签一律 `None`（名字不对、版本不是数字、段数不对）：**不猜**。
+pub fn tag_version(tag: &str) -> Option<(u32, u32)> {
+    let rest = tag.strip_prefix("ndjson-tcp-")?;
+    let (major, minor) = match rest.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (rest, "0"),
+    };
+    let digits = |s: &str| -> Option<u32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
+    Some((digits(major)?, digits(minor)?))
+}
+
+/// **这一版传输认它吗？** —— 同 major 就认（规范-消息协议 §9）。
+///
+/// 反过来不认（major 不同）是**故意的**：会合文件里那句"我是什么协议"
+/// 要是对不上，硬连上去只会拿到一堆看不懂的字节。
+pub fn accepts_tag(tag: &str) -> bool {
+    match (tag_version(tag), tag_version(PROTOCOL)) {
+        (Some(theirs), Some(mine)) => theirs.0 == mine.0,
+        _ => false,
+    }
+}
 
 /// 一条连接。**只搬行**：每一行对上面那层是一个 NDJSON 消息。
 #[derive(Debug)]
@@ -253,7 +293,7 @@ impl Rendezvous {
     /// 为什么不看进程号：进程号会被系统复用；为什么不只看文件：
     /// 崩了的进程不会来删文件。**能连上并答话，才叫活着。**
     pub fn alive(&self) -> bool {
-        self.protocol == PROTOCOL
+        accepts_tag(&self.protocol)
             // 连上 + 口令通过 + 拿到 ack，三件事一次做完才算活着。
             // **不发任何协议消息**：探活不该在别人的协议流里留下东西。
             && Conn::connect(&self.addr, &self.token).is_ok()

@@ -33,6 +33,9 @@ $servicesPath = Join-Path $work 'services.json'
   { "kind": "echo",   "id": "echo:sandbox-liar", "role": "tool", "cmd": ["$(J $echo)"], "args": ["--sandbox-lie"] },
   { "kind": "echo",   "id": "echo:state-liar",   "role": "tool", "cmd": ["$(J $echo)"], "args": ["--bad-state"] },
   { "kind": "echo",   "id": "echo:cap-liar",     "role": "tool", "cmd": ["$(J $echo)"], "args": ["--manifest-bad-caps"] },
+  { "kind": "echo",   "id": "echo:future",       "role": "tool", "cmd": ["$(J $echo)"], "args": ["--contract-version", "2.0"] },
+  { "kind": "echo",   "id": "echo:ancient",      "role": "tool", "cmd": ["$(J $echo)"], "args": ["--contract-version", "0.9"] },
+  { "kind": "echo",   "id": "echo:extended",     "role": "tool", "cmd": ["$(J $echo)"], "args": ["--contract-version", "1.9"] },
   { "kind": "editor", "id": "editor:1",   "role": "tool",
     "cmd": ["$(J $editor)"], "args": ["--fence", "$(J $project)"] }
 ]
@@ -85,7 +88,8 @@ for ($i = 0; $i -lt 25 -and -not $ready; $i++) {
     if ($replies.ContainsKey($corr)) {
         $ids = @($replies[$corr].payload.data.instances | ForEach-Object { $_.id })
         $ready = ($ids -contains 'echo:1') -and ($ids -contains 'echo:holes') -and
-                 ($ids -contains 'echo:liar') -and ($ids -contains 'editor:1')
+                 ($ids -contains 'echo:liar') -and ($ids -contains 'editor:1') -and
+                 ($ids -contains 'echo:extended')
     }
     if (-not $ready) { Start-Sleep -Milliseconds 200 }
 }
@@ -94,11 +98,15 @@ Send @{ to = 'echo:1';     body = @{ tool = 'echo'; args = @{ text = '正常的�
 Send @{ to = 'echo:holes'; body = @{ tool = 'ping'; args = @{} } }                   'c-holes'
 Send @{ to = 'echo:liar';  body = @{ tool = 'echo'; args = @{ text = '说谎的那个' } } } 'c-liar'
 Send @{ to = 'echo:state-liar'; body = @{ tool = 'ping'; args = @{} } }            'c-state'
+Send @{ to = 'echo:extended'; body = @{ tool = 'echo'; args = @{ text = '带扩展的那个' } } } 'c-ext'
+Send @{ to = 'echo:future';   body = @{ tool = 'ping'; args = @{} } }              'c-future'
+Send @{ to = 'echo:ancient';  body = @{ tool = 'ping'; args = @{} } }              'c-ancient'
 Send @{ to = 'ctrl';       body = @{ op = 'list' } }                                 'c-list'
 Pump 25000 {
     $replies.ContainsKey('c-good') -and $replies.ContainsKey('c-holes') -and
     $replies.ContainsKey('c-liar') -and $replies.ContainsKey('c-list') -and
-    $replies.ContainsKey('c-state')
+    $replies.ContainsKey('c-state') -and $replies.ContainsKey('c-ext') -and
+    $replies.ContainsKey('c-future') -and $replies.ContainsKey('c-ancient')
 } | Out-Null
 $proc.StandardInput.Close()
 $proc.WaitForExit(8000) | Out-Null
@@ -118,6 +126,10 @@ $holes = $replies['c-holes']
 $liar = $replies['c-liar']
 $list = $replies['c-list']
 $listed = @($list.payload.data.instances | Where-Object { $_.id -eq 'echo:holes' })
+$ext = $replies['c-ext']
+$extListed = @($list.payload.data.instances | Where-Object { $_.id -eq 'echo:extended' })
+$future = $replies['c-future']
+$ancient = $replies['c-ancient']
 
 Write-Host '== 判据 ==' -ForegroundColor Cyan
 Check '1. **注册闸门响了**：家门少报一项的实例被点名' {
@@ -223,6 +235,42 @@ Check '18. **编一个能力名 ⇒ 注册关拦下**，并列出合法的那几
     $capLiar = @($records | Where-Object { $_.payload.code -eq 'contract_violation' -or $_.payload.problems } |
         Where-Object { ($_.payload.problems -join ' ') -like '*super.power*' })
     $capLiar.Count -ge 1 -and ($capLiar[0].payload.problems -join ' ') -like '*fs.write*'
+}
+
+# 19-23. **版本对不上：说清，而且不认识的版本不许硬解释**（2026-09-27）。
+#
+# 在这之前，三处版本闸门全是**等号**（`v == CONTRACT_VERSION`）——
+# 而**等号就是"没有兼容处理"**：它把"加一个可选字段"这种本该系统性地兼容的改动，
+# 变成了"所有老服务当场被拒"。规则现在只有一条：**看 major**（规范 §9 / §11.6）。
+#
+# 三个替身各演一档：`2.0` 太新、`0.9` 太老、`1.9` 同 major 但更新。
+$futureBad = @($nonconforming | Where-Object { $_.payload.instance -eq 'echo:future' })
+$ancientBad = @($nonconforming | Where-Object { $_.payload.instance -eq 'echo:ancient' })
+$futureWhy = if ($futureBad.Count -gt 0) { $futureBad[0].payload.problems -join ' ' } else { '' }
+$ancientWhy = if ($ancientBad.Count -gt 0) { $ancientBad[0].payload.problems -join ' ' } else { '' }
+Check '19. **未来的 major ⇒ 按名字拒**，判词里两个版本号都在（"你是几 / 我会的是几"）' {
+    $futureBad.Count -ge 1 -and $futureWhy -like '*2.0*' -and $futureWhy -like '*1.0*'
+}
+Check '20. 它**活着但接不了活**：派活被挡下（`degraded` 那条老规矩照旧）' {
+    $future -and $future.payload.effect -eq 'refused'
+}
+Check '21. **老的那一档判词不一样** —— "比我老"和"比我新"要分得开，不能同一句搪塞' {
+    $ancientBad.Count -ge 1 -and $ancientWhy -ne $futureWhy -and
+        $ancientWhy -like '*老*' -and $futureWhy -notlike '*老*'
+}
+Check '22. **同 major 的更新 minor ⇒ 收下**（这条原来会被等号拒掉）' {
+    $named = @($nonconforming | ForEach-Object { $_.payload.instance })
+    ($named -notcontains 'echo:extended') -and
+        @($list.payload.data.instances | Where-Object { $_.id -eq 'echo:extended' -and $_.state -ne 'degraded' }).Count -eq 1 -and
+        $ext -and $ext.payload.effect -eq 'confirmed' -and $ext.payload.data.text -eq '带扩展的那个'
+}
+Check '23. 但它**要出声**：日志里有一条"它在用我还不认识的追加字段"' {
+    $note = @($records | Where-Object { $_.payload.code -eq 'contract_extensions_ignored' })
+    $note.Count -ge 1 -and (($note[0].payload.notes -join ' ') -like '*1.9*')
+}
+Check '24. 那条备注**在 `list` 上也看得见**（中控不解释它，但不许闷着）' {
+    $extListed.Count -eq 1 -and @($extListed[0].contract_notes).Count -ge 1 -and
+        (@($extListed[0].contract_notes) -join ' ') -like '*1.9*'
 }
 
 Write-Host ''

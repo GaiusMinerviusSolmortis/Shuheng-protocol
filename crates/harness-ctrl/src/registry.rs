@@ -47,6 +47,14 @@ pub struct Instance {
     pub contract_errors: Vec<String>,
     /// 规范要求了、但服务还没报的那几项（`lifecycle` / `idle_timeout` / `health`）。
     pub contract_missing: Vec<String>,
+    /// **收下了，但要说一声**的那几条（现在只有一样：它声明的协议 minor 比我新，
+    /// 见规范-消息协议 §9）。
+    ///
+    /// 它和上面那两栏的区别是**要不要拦**：`contract_errors` 拦活，
+    /// `contract_missing` 只是欠账，这一栏**什么都不拦** ——
+    /// 它记的是"我见过它带了我不认识的字段"。将来出了怪事，
+    /// 这件事必须能**从 `list` 上查出来**，而不是靠谁记得。
+    pub contract_notes: Vec<String>,
     /// **最后一次听见它说话**（它的管道上过来任何一条消息都算）。
     ///
     /// 两个用处：`list` 上给人看（"这个服务多久没动静了"），
@@ -477,6 +485,7 @@ impl Registry {
                     "config": i.config,
                     "contract_errors": i.contract_errors,
                     "contract_missing": i.contract_missing,
+                    "contract_notes": i.contract_notes,
                     // **给人看的两样**：多久没听见它了 / 它最近不应答探针
                     "last_seen_ms": i.last_seen_ms,
                     "idle_ms": if i.last_seen_ms > 0 {
