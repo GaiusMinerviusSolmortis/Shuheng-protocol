@@ -155,6 +155,40 @@ foreach ($svc in $manifests.Keys) {
 Check '8. 报 `executables: none` 的服务，源码里**不许有 `Command::new`**' { $spawners.Count -eq 0 }
 foreach ($s in $spawners) { Write-Host "  $s" -ForegroundColor Yellow }
 
+# **9. 能力令牌表：规范里那张 == 代码里那张**（2026-09-27）。
+#
+# 为什么这条必须机器判：那张表**两处手写** —— 规范 §11.6 的 Markdown，
+# 和 `harness_service::contract::CAPABILITIES`（编译不进 Markdown）。
+# 两份手写的表一定会漂，而它漂的后果正是一开始要防的那个：
+# 加了一个新令牌、只改了一边 ⇒ **签得出、管不住**（或者反过来，签不出来）。
+# ⚠️ **要锚到那张表自己**（第一版我从整份规范里抓 `` `a.b` ``，结果把
+# `mcp.py` / `package.json` / `owns.domain` 这些**顺手提到的东西**也当成了令牌 ——
+# 判据自己红了）。表头是 `| 令牌 | 谁用 | 范围（scope）在哪儿 |`，
+# 只从那之后连续的表格行里、只取**第一格**。
+$specLines = Get-Content -LiteralPath (Join-Path $root '规范-工具服务.md')
+$start = ($specLines | Select-String -Pattern '^\|\s*令牌\s*\|' -SimpleMatch:$false |
+    Select-Object -First 1).LineNumber
+$specCaps = @()
+for ($i = $start; $i -lt $specLines.Count; $i++) {
+    $l = $specLines[$i]
+    if (-not $l.StartsWith('|')) { break }
+    $first = ($l -split '\|')[1]
+    $specCaps += [regex]::Matches($first, '`([a-z]+\.[a-z]+)`') | ForEach-Object { $_.Groups[1].Value }
+}
+$specCaps = @($specCaps | Sort-Object -Unique)
+$src = Get-Content -LiteralPath (Join-Path $root 'crates/harness-service/src/contract.rs') -Raw
+$codeCaps = @([regex]::Match($src, 'pub const CAPABILITIES: &\[&str\] = &\[(.*?)\];',
+    [System.Text.RegularExpressions.RegexOptions]::Singleline).Groups[1].Value -split "`n" |
+    ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^"' } |
+    ForEach-Object { $_.Trim(' ', ',', '"') } | Sort-Object -Unique)
+$onlySpec = @($specCaps | Where-Object { $codeCaps -notcontains $_ })
+$onlyCode = @($codeCaps | Where-Object { $specCaps -notcontains $_ })
+Check '9. 能力令牌表：**规范里那张 == 代码里那张**（两边手写，一定会漂）' {
+    $onlySpec.Count -eq 0 -and $onlyCode.Count -eq 0
+}
+foreach ($c in $onlySpec) { Write-Host "  只在规范里：$c" -ForegroundColor Yellow }
+foreach ($c in $onlyCode) { Write-Host "  只在代码里：$c" -ForegroundColor Yellow }
+
 Write-Host ''
 Write-Host '== 六个服务自报的沙箱五面（这张表是从活服务里读出来的）==' -ForegroundColor Cyan
 Write-Host ("  {0,-10} {1,-12} {2,-14} {3,-11} {4,-11} {5}" -f '服务', 'filesystem', 'network', 'identity', 'executables', 'resources')

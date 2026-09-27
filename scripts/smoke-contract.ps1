@@ -32,6 +32,7 @@ $servicesPath = Join-Path $work 'services.json'
   { "kind": "echo",   "id": "echo:liar",  "role": "tool", "cmd": ["$(J $echo)"], "args": ["--bad-result"] },
   { "kind": "echo",   "id": "echo:sandbox-liar", "role": "tool", "cmd": ["$(J $echo)"], "args": ["--sandbox-lie"] },
   { "kind": "echo",   "id": "echo:state-liar",   "role": "tool", "cmd": ["$(J $echo)"], "args": ["--bad-state"] },
+  { "kind": "echo",   "id": "echo:cap-liar",     "role": "tool", "cmd": ["$(J $echo)"], "args": ["--manifest-bad-caps"] },
   { "kind": "editor", "id": "editor:1",   "role": "tool",
     "cmd": ["$(J $editor)"], "args": ["--fence", "$(J $project)"] }
 ]
@@ -213,6 +214,15 @@ Check '16. 判词里要**给出它声明过的那几个词**（照着就能改�
 }
 Check '17. 同一个词**只吵一次**（不然每报一次状态就刷一条审计）' {
     @($records | Where-Object { $_.payload.code -eq 'instance_state_undeclared' }).Count -eq 1
+}
+# 18-19. **能力名必须是认识的**（2026-09-27）：令牌表是**闭合**的。
+# 拼错一个字母、或者编一个（`super.power`），签下去的都是"**看起来多了一条权限、
+# 其实什么也管不住**"的能力 —— 用户以为给了权限，工具那边永远拒，两边的话还对不上。
+# 这条闸门有**三个入口**：服务自报的 manifest（这儿）、`grant` op、服务表。
+Check '18. **编一个能力名 ⇒ 注册关拦下**，并列出合法的那几个' {
+    $capLiar = @($records | Where-Object { $_.payload.code -eq 'contract_violation' -or $_.payload.problems } |
+        Where-Object { ($_.payload.problems -join ' ') -like '*super.power*' })
+    $capLiar.Count -ge 1 -and ($capLiar[0].payload.problems -join ' ') -like '*fs.write*'
 }
 
 Write-Host ''

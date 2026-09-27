@@ -147,6 +147,48 @@ pub const SANDBOX_FACES: &[(&str, &[&str])] = &[
 ];
 
 /// **存活状态**的词表 —— 这一轴归**中控**，不归服务。
+/// **能力令牌表**（规范-工具服务 §11.6 那张表）。
+///
+/// 为什么它必须是一张**闭合**的表（2026-09-27 补）：
+/// `capabilities` 是**鉴权**用的 —— 中控按它签发、服务按它校验。
+/// 而在这之前，闸门只验"是不是字符串数组"，于是**编一个没人认识的名字**
+/// （`fs.wirte` / `super.power`）可以一路签下去：
+///
+/// * 拼错了 ⇒ 工具永远拒，而拒的话里必须自己比对两个词才看得出错在哪儿；
+/// * 编一个 ⇒ **看起来多了一条权限，其实什么也没有** —— "看起来有边界、其实没有"那族。
+///
+/// 令牌本身只是**标签**，范围（scope）由各个域自己定（§11.6）：
+/// 文件域是围栏、记忆域是锚点、MCP 桥是部署方那份白名单。
+/// **加一条就要同时改这张表和规范里那张表** —— 有一条判据盯着它们一致
+/// （`check-manifests.ps1`），因为 Markdown 那边的表没法被编译进来。
+pub const CAPABILITIES: &[&str] = &[
+    // 编辑器
+    "fs.read",
+    "fs.write",
+    // 终端
+    "proc.exec",
+    // 记忆服务（作用域是**锚点**）
+    "mem.read",
+    "mem.write",
+    "mem.curate",
+    // 技能服务
+    "skill.read",
+    // MCP 桥（作用域是部署方给的 `--allow` 白名单）
+    "mcp.call",
+];
+
+/// 这个名字是不是一个**认识的能力**？不认识的话给出那句话（含合法清单）。
+pub fn unknown_capability(name: &str) -> Option<String> {
+    if CAPABILITIES.contains(&name) {
+        return None;
+    }
+    Some(format!(
+        "不认识的能力 `{name}` —— 令牌表是闭合的（规范-工具服务 §11.6）。现在有：{}。\
+         令牌本身只是**标签**：要新加一条，得同时改那张表和 `CAPABILITIES`",
+        CAPABILITIES.join(" / ")
+    ))
+}
+
 ///
 /// 为什么要把两个轴分开：`state_vocabulary` 原来把两种东西混在一个字段里 ——
 /// **进程活着没有**（中控看得到）和**这个实例在干什么**（只有服务知道）。
@@ -770,7 +812,15 @@ pub fn check_manifest(m: &Value) -> ManifestReport {
             )),
         }
         match t.get("capabilities") {
-            Some(Value::Array(a)) if a.iter().all(Value::is_string) => {}
+            Some(Value::Array(a)) if a.iter().all(Value::is_string) => {
+                // **名字必须在令牌表里**（2026-09-27 补）：拼错一个字母或者编一个，
+                // 都会变成"签了却什么也管不住"的能力。
+                for c in a.iter().filter_map(Value::as_str) {
+                    if let Some(why) = unknown_capability(c) {
+                        r.errors.push(format!("工具 `{name}`：{why}"));
+                    }
+                }
+            }
             Some(_) => r
                 .errors
                 .push(format!("工具 `{name}` 的 `capabilities` 要是字符串数组")),

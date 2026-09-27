@@ -3241,6 +3241,27 @@ impl App {
                             .collect::<Vec<_>>(),
                         _ => vec!["*".to_string()],
                     };
+                    // **能力名必须是认识的**（2026-09-27）。
+                    //
+                    // 这是授权这一侧的同一道闸（服务那边在 `check_manifest` 里也有一道）：
+                    // 名字编一个（`super.power`）或者拼错（`fs.wirte`），
+                    // 签下去的是**一条什么也管不住的能力** —— 用户以为给了权限，
+                    // 工具那边永远拒，而两边的话都对不上。
+                    // `"*"` 是**全权**那个特例（它不是一个令牌，是"不限制"）。
+                    if let Some(bad) = caps
+                        .iter()
+                        .filter(|c| c.as_str() != "*")
+                        .find_map(|c| harness_service::contract::unknown_capability(c))
+                    {
+                        self.reply(
+                            req,
+                            json!({"route": null, "effect": "refused", "code": "invalid",
+                                   "why": bad,
+                                   "remedy": "照着那张表写（想全权就用 `\"*\"`）；\
+                                              新加一条令牌要同时改规范 §11.6 那张表和代码里的表"}),
+                        );
+                        return;
+                    }
                     self.reg.grant(&agent, Binding::new(&instance, caps))
                 } else {
                     self.reg.revoke(&agent, &instance)
@@ -4102,6 +4123,22 @@ impl App {
         } else {
             Launcher::Stdio
         };
+        // **服务表里的能力名也要过同一张表**（2026-09-27）：这条和前两条
+        // （服务自报的 manifest、`grant` op）是**同一个校验、三个入口** ——
+        // 表是部署方手写的，写错一个字母就是"签了却什么也管不住的能力"。
+        // ⚠️ **就地校验、把坏名字报出来，但不拦启动**（表是部署配置：写错的后果
+        // 应该是"能跑、而且看得见"，不是"整个会话起不来"—— 那条纪律在 `should_start_now`
+        // 那段注释里写着）。它会在 `list` 上显示成 `contract_errors` 一类的东西。
+        for b in &spec.bindings {
+            for c in b.capabilities() {
+                if c != "*" {
+                    if let Some(why) = harness_service::contract::unknown_capability(c.as_str()) {
+                        let who = spec.id.clone().unwrap_or_else(|| spec.kind.clone());
+                        eprintln!("[ctrl] 服务表里 `{who}` 的能力名有问题：{why}");
+                    }
+                }
+            }
+        }
         let started = self.start_service(Spawn {
             kind: spec.kind.clone(),
             id: id.clone(),

@@ -93,7 +93,7 @@
 | [07-界面](07-界面.md) | **§9、§12** GUI 作为消息流的投影、表示层、点击策略、桌宠不在框架内。 |
 | [08-记忆](08-记忆.md) | **§16** 锚点、分层、沉淀，以及**大眼记忆实现的评估**。 |
 | [09-模型](09-模型.md) | **§8、§15** 提示词编译与模型拼装。 |
-| [10-决策](10-决策.md) | 已定 **312** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
+| [10-决策](10-决策.md) | 已定 **313** + 待定 **73** + 已解决待清账 3。**按主题分组，不再按时间追加。** 小节的计数由 [check-decisions.ps1](scripts/check-decisions.ps1) 校验，**这一行汇总由 [check-docs.ps1](scripts/check-docs.ps1) 校验** —— 它被漏过两次（写 256 真值 257、后来又漂一次），原因就是"小节的数有人查、汇总的数没人查" |
 | [**规范-消息协议**](规范-消息协议.md) | **规范性文件**：信封、消息种类、配对、会话日志、stdio 传输。 |
 | [规范-工具服务](规范-工具服务.md) | **规范性文件**，与其余探索性文档性质不同。 |
 | [附录-参考](附录-参考.md) | **§10、§17** 与已有工作的对照，以及和 MCP 的定位比较。 |
@@ -961,7 +961,7 @@ ctrl 分不清"哪一代"，于是新实例被旧消息打死。
 crates/harness-ctrl/src/registry.rs   grant / revoke（改签一条绑定）
 crates/harness-ctrl/src/main.rs       两个 op + 敕令 + 审计事件
 crates/harness-agent/src/main.rs      refresh_tools：回合边界扫一遍授权，变了就换名册
-scripts/smoke-regrant.ps1             验收：21 条判据（改签 + 敕令 + 换名册 + 盖章 + 审计事件）
+scripts/smoke-regrant.ps1             验收：22 条判据（改签 + 敕令 + 换名册 + 盖章 + 审计事件）
 ```
 
 跑法：`pwsh -File scripts/smoke-regrant.ps1`。
@@ -1548,8 +1548,8 @@ pwsh -File scripts/smoke-help-grant.ps1          # 手册与能力校验（10 �
 pwsh -File scripts/smoke-cancel.ps1              # 取消（7 条判据）
 pwsh -File scripts/smoke-compact-turn.ps1        # 循环里真的触发压缩（9 条判据）
 pwsh -File scripts/smoke-verify.ps1              # 独立验证（6 条判据）
-pwsh -File scripts/smoke-contract.ps1            # 契约闸门：注册 + 投递 + 状态词表外的报法（17 条判据）
-pwsh -File scripts/smoke-regrant.ps1             # 运行期改签：grant/revoke + 敕令 + 换名册 + 盖章 + 审计事件（21 条判据）
+pwsh -File scripts/smoke-contract.ps1            # 契约闸门：注册 + 投递 + 状态词表外 + **能力名必须在令牌表里**（18 条判据）
+pwsh -File scripts/smoke-regrant.ps1             # 运行期改签：grant/revoke + 敕令 + 换名册 + 盖章 + 审计事件 + 编能力名被拒（22 条判据）
 pwsh -File scripts/smoke-ownership.ps1           # 实例独属：谁的实例谁动（11 条判据）
 pwsh -File scripts/smoke-ids.ps1                 # id 铸造：撞 id 被拒、spawn 只增不减（8 条判据）
 pwsh -File scripts/smoke-index.ps1               # 身份索引：跨会话追溯 + 那条链（8 条判据）
@@ -1579,7 +1579,7 @@ pwsh -File scripts/smoke-e2e-long.ps1             # **整机**：小窗口连下
 pwsh -File scripts/smoke-e2e-mcp.ps1              # **整机**：智能体用 MCP 那边的工具（隔着三层），白名单在真模型面前也成立（6 条判据；没 key 就跳过）
 pwsh -File scripts/smoke-e2e-crashresume.ps1     # **整机**：干到一半被硬杀 —— 半成品在、对话在、恢复后还能接着干（8 条判据；没 key 就跳过）
 pwsh -File scripts/check-decisions.ps1           # 决策册的计数校验（不是验收，是查账）
-pwsh -File scripts/check-manifests.ps1           # manifest 体检：六个服务的家门逐项查，并打出那张沙箱表
+pwsh -File scripts/check-manifests.ps1           # manifest 体检：六个服务的家门逐项查 + **能力令牌表（规范 vs 代码）** + 打出那张沙箱表
 pwsh -File scripts/check-docs.ps1                # 文档里的数字对账：脚本条数 / 判据条数 / 测试总数 / 行数
 pwsh -File scripts/check-clippy.ps1              # lint 闸门：clippy 一条警告都不许有
 pwsh -File scripts/check-layers.ps1             # 层的界限：中控不许认识上下文的结构（L1 的验收）

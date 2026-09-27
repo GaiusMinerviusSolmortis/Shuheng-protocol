@@ -112,18 +112,24 @@ $r3 = Wait-Corr 't3'
 # ---- 第四幕（2026-09-20 加）：**只改凭证、不改名册** ----
 #
 # 这一段盯的是"授权的粒度"和"能力的粒度"不是一个东西（§7）：
+# ⚠️ 名字**必须来自令牌表**（2026-09-27 起闭合了）—— 这一段原来是拿 `echo.read`
+# 这种编的名字试的，闸门一落地它就红了。**规则对、模型过时**：换成真令牌（`fs.read`）。
 # ① 带**显式能力清单**的 grant ⇒ 敕令必须把能力名报出来（不能只说"你能用 X 了"）；
 # ② 同一个实例再改签一次（只换能力）⇒ **名册一个字都不该动**
 #    （动名册 = 后面的缓存全作废），但账要留（`caps_changed`）。
-Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('echo.read') } 'g9'
+Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('fs.read') } 'g9'
 $g9 = Wait-Corr 'g9'
 Send @{ task = '第四幕：先用一次 echo' } 't4' 'agent:dada'
 $r4 = Wait-Corr 't4'
 $changesBeforeCapsOnly = @((Get-Content -LiteralPath (Join-Path (Join-Path (Join-Path $dataDir 'sessions') $sid) 'log.jsonl') |
     Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_ | ConvertFrom-Json }) |
     Where-Object { $_.payload.kind -eq 'toolset_changed' }).Count
-Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('echo.read', 'echo.write') } 'g10'
+Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('fs.read', 'fs.write') } 'g10'
 $g10 = Wait-Corr 'g10'
+# **编一个能力名**（令牌表是闭合的）：这一条要在关流**之前**发 ——
+# 我第一次把它写在下面（读日志那一段之后），那儿 stdin 早关了，发不出去。
+Send @{ op = 'grant'; agent = 'agent:dada'; instance = 'echo:1'; capabilities = @('super.power') } 'g11'
+$g11 = Wait-Corr 'g11'
 Send @{ task = '第四幕：再用一次 echo' } 't5' 'agent:dada'
 $r5 = Wait-Corr 't5'
 $proc.StandardInput.Close()
@@ -182,7 +188,10 @@ Check '12. 三次任务都收掉了（授权变动没把回合打断）' {
 }
 Check '19. 带**显式能力清单**的 grant，敕令里把能力名报出来了（不只说"你能用 X 了"）' {
     $t = ($injGrant | Select-Object -Last 1).payload.text
-    $t -like '*echo.read*' -and $t -notlike '*通配*'
+    $t -like '*fs.read*' -and $t -notlike '*通配*'
+}
+Check '19b. **编一个能力名 ⇒ 拒**（令牌表是闭合的：签了也什么也管不住）' {
+    $g11.payload.effect -eq 'refused' -and $g11.payload.why -like '*super.power*' -and $g11.payload.why -like '*fs.write*'
 }
 Check '20. 同一个实例**只换凭证**时：不换名册（缓存不动），但账要留' {
     # 名册事件数在"只换凭证"那两次之间**没有增长**，而 caps_changed 记了一笔。

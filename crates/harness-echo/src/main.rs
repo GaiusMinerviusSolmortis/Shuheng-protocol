@@ -51,6 +51,9 @@ struct Args {
     /// **那条规则是真抓到过东西的**（终端声明 `exited` 却报 `closed`），
     /// 而"中控发现了会说"这半截一直没有判据 —— 这个开关就是给它的靶子。
     bad_state: bool,
+    /// **编一个能力名**（`super.power`）：令牌表是闭合的（2026-09-27），
+    /// 编的名字要让注册那道闸门当场拦下 —— 它演的是"签了却什么也管不住的能力"。
+    bad_caps: bool,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +67,7 @@ fn parse_args() -> Args {
     let mut sandbox_lie = false;
     let mut inject = String::from("card");
     let mut bad_state = false;
+    let mut bad_caps = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -76,6 +80,7 @@ fn parse_args() -> Args {
             "--sandbox-lie" => sandbox_lie = true,
             "--inject" => inject = it.next().unwrap_or(inject),
             "--bad-state" => bad_state = true,
+            "--manifest-bad-caps" => bad_caps = true,
             _ => {}
         }
     }
@@ -89,6 +94,7 @@ fn parse_args() -> Args {
         sandbox_lie,
         inject,
         bad_state,
+        bad_caps,
     }
 }
 
@@ -203,6 +209,15 @@ fn manifest(args: &Args) -> Value {
     if args.sandbox_lie {
         // **说了要围、却没围栏** —— 这条声明是假的，闸门该在注册时拦下
         m["sandbox"]["filesystem"] = json!("fence-args");
+    }
+    if args.bad_caps {
+        // **编一个没人认识的能力名** —— 令牌表是闭合的，闸门该在注册时拦下。
+        // 它演的是那条最隐蔽的：签下去"看起来多了一条权限"，其实什么也管不住。
+        if let Some(t) = m["tools"].as_array_mut() {
+            if let Some(obj) = t.first_mut().and_then(Value::as_object_mut) {
+                obj.insert("capabilities".into(), json!(["super.power"]));
+            }
+        }
     }
     m
 }
@@ -509,6 +524,8 @@ mod tests {
             sandbox_lie: false,
             inject: "card".into(),
             bad_state: false,
+            // 测试默认那份是**合规的**；要演"编了能力名"就显式传 `true`
+            bad_caps: false,
         }
     }
 
