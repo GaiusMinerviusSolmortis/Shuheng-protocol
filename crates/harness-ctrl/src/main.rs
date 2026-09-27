@@ -50,6 +50,13 @@ pub enum Inbound {
     ConsoleEof,
     ServiceLine { instance: String, generation: u64, line: String },
     ServiceExited { instance: String, generation: u64 },
+    /// **订阅口上来了一个人**（2026-09-27）：连接已经握手通过，交回主循环。
+    /// `seq` 是**这条连接自己的随机标签**（读线程的报告靠它认人）。
+    Subscribe { seq: String, conn: harness_ipc::Conn },
+    /// 订阅口上的一行（在他 `subscribe` 之前也可能有 —— 那正是"我要订阅"那句话）
+    SubLine { seq: String, line: String },
+    /// 订阅口上的人走了
+    SubEof { seq: String },
 }
 
 #[derive(Debug)]
@@ -86,6 +93,9 @@ struct Args {
     /// 而终端跑一条命令就落一次，出声会把 stderr 淹掉。
     /// 但"它到底落了没有"必须是**可验的**，否则这条机制只能靠读代码相信。
     debug_barriers: bool,
+    /// **开不开订阅口**（`--no-subscribe` 关掉）。**默认开** ——
+    /// 一条"谁也看不见"的会话是更糟的默认值（而且订阅口只是回环，不经网卡）。
+    subscribe: bool,
     /// **给刚拉起来的服务留多久"报到"的时间**（`--startup-grace-ms`）。
     ///
     /// 为什么需要它：`route` 原来会**在服务自报家门之前就派活** ——
@@ -113,6 +123,7 @@ fn parse_args() -> Args {
         prompts: None,
         tick: Duration::from_millis(2000),
         debug_barriers: false,
+        subscribe: true,
         startup_grace: Duration::from_millis(2000),
     };
     let mut it = std::env::args().skip(1);
@@ -161,6 +172,8 @@ fn parse_args() -> Args {
                 }
             }
             "--debug-barriers" => args.debug_barriers = true,
+            // 关掉订阅口：用在不希望开一个回环端口的场合（比如受限环境）。
+            "--no-subscribe" => args.subscribe = false,
             "--startup-grace-ms" => {
                 if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
                     args.startup_grace = Duration::from_millis(v);
@@ -567,6 +580,21 @@ struct App {
     /// 已经报过的"实例状态不在自己声明的词表里"（`<服务>/<状态>`）——
     /// 同一个只吵一次，否则一个报错的循环服务能把日志刷爆。
     undeclared_states: std::collections::HashSet<String>,
+    /// **订阅者**（2026-09-27）：连在订阅口上的那些只读观察者（GUI / 调试台 / 另一个界面）。
+    ///
+    /// 它们拿到的是**这条会话里路由过的每一条消息**（和 console 那份完全一样），
+    /// 而它们自己**没有任何权力**：注册成实例、上限 `observe` —— 想动手就会被权限矩阵挡下。
+    /// 这就是"每个客户端只要遵守协议就能接进来"在界面上那一半。
+    subs: Vec<Sub>,
+}
+
+/// 一个订阅者：**一条连接 + 它自报的名字**。
+pub struct Sub {
+    /// 这条连接自己的随机标签（读线程靠它认人）
+    seq: String,
+    /// 还没 `subscribe` 的时候是 `None`（连上了、但还没说要订阅）
+    id: Option<String>,
+    conn: harness_ipc::Conn,
 }
 
 impl App {
@@ -670,6 +698,7 @@ fn run() -> i32 {
         waiting_ready: HashMap::new(),
         startup_grace: args.startup_grace,
         undeclared_states: std::collections::HashSet::new(),
+        subs: Vec::new(),
     };
 
     app.session.participants.push(app.channel.id.clone());
@@ -798,6 +827,81 @@ fn run() -> i32 {
         app.channel.ceiling.as_str()
     );
 
+    // ---- 订阅口：**让别的进程也能看着这条会话**（2026-09-27）----
+    //
+    // 在这之前，能看见整条会话的只有"拉起中控的那个进程"（它占着 stdout）。
+    // 于是一个**独立的 GUI 想接进来 —— 没有门**：它既不是服务表里的服务，
+    // 也不是中控的子进程。现在中控**自己也当一次服务端**：
+    // 回环端口 + 会合文件 + 一问一答握手，全是 `harness-ipc` 那套现成的东西
+    // （常驻服务用的是同一份 —— 换了方向而已）。
+    //
+    // ⚠️ 口令不是安全边界（同 §6.3 那句）：它挡的是"同一台机器上随手连上来的
+    // 别的东西"，不是"已经能读你文件的人"。
+    // ⚠️ 订阅者是**只读**的：注册成实例、上限 `observe` —— 想动手会被权限矩阵挡下。
+    if args.subscribe {
+        let name = format!("{}-console", args.sid);
+        match harness_ipc::Listener::bind(&name) {
+            Ok(l) => {
+                let dir = args.data_dir.join("rendezvous");
+                let _ = std::fs::create_dir_all(&dir);
+                let rv = harness_ipc::Rendezvous::new(&name, "console", l.addr(), l.token());
+                match rv.write(&dir) {
+                    Ok(p) => eprintln!(
+                        "[ctrl] 订阅口：{}（别的进程带着里面那个口令连上来，\
+                         `subscribe` 之后就能看见这条会话里的一切）",
+                        p.display()
+                    ),
+                    Err(e) => eprintln!("[ctrl] 订阅口的会合文件写不进去：{e}（它只在内存里活着）"),
+                }
+                if let Ok(l2) = l.try_clone() {
+                    let tx = tx.clone();
+                    std::thread::spawn(move || loop {
+                        match l2.accept() {
+                            Ok(conn) => {
+                                // **这条连接自己的标签**：读线程和主循环靠它认人
+                                let seq = harness_ipc::random_token();
+                                // 读的那半交给这条读线程；写的那半（连 ack 一起）交回主循环
+                                let Ok(rd) = conn.try_clone() else { continue };
+                                let seq_rd = seq.clone();
+                                let tx2 = tx.clone();
+                                std::thread::spawn(move || {
+                                    let mut rd = rd;
+                                    loop {
+                                        match rd.read_line() {
+                                            Ok(Some(line)) => {
+                                                if tx2
+                                                    .send(Inbound::SubLine {
+                                                        seq: seq_rd.clone(),
+                                                        line,
+                                                    })
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                            Ok(None) | Err(_) => {
+                                                let _ = tx2.send(Inbound::SubEof {
+                                                    seq: seq_rd.clone(),
+                                                });
+                                                return;
+                                            }
+                                        }
+                                    }
+                                });
+                                if tx.send(Inbound::Subscribe { seq, conn }).is_err() {
+                                    return;
+                                }
+                            }
+                            // 握手不过：`accept()` 已经回过一句"口令不对"，这里记一笔就够
+                            Err(e) => eprintln!("[ctrl] 订阅口上来了一条握手不过的连接：{e}"),
+                        }
+                    });
+                }
+            }
+            Err(e) => eprintln!("[ctrl] 订阅口起不来：{e} —— **会话照常**（订阅不是它的前提）"),
+        }
+    }
+
     // console 那条读线程：stdin 关了就报 EOF，主循环据此进入排空
     {
         let tx = tx.clone();
@@ -890,6 +994,10 @@ fn run() -> i32 {
                 next_tick = Instant::now() + app.tick;
             }
             Some(Inbound::Console(line)) => app.on_console_line(&line),
+            // ---- 订阅口（2026-09-27）----
+            Some(Inbound::Subscribe { seq, conn }) => app.on_subscribe(seq, conn),
+            Some(Inbound::SubLine { seq, line }) => app.on_sub_line(&seq, &line),
+            Some(Inbound::SubEof { seq }) => app.on_sub_eof(&seq),
             Some(Inbound::ConsoleInvalid { bytes }) => {
                 // 报出来，并且指出**最可能的原因** —— 这是"报错即手册"里最值钱的一种：
                 // 编码问题在中文 Windows 上几乎总是同一个成因。
@@ -972,16 +1080,19 @@ fn load_specs(path: &PathBuf) -> Result<Vec<ServiceSpec>, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-/// **中控认识的全部 op**（规范-消息协议 §2.7 那张名册）：**20 个名字 / 19 条分支**
+/// **中控认识的全部 op**（规范-消息协议 §2.7 那张名册）：**21 个名字 / 20 条分支**
 /// （`grant` 和 `revoke` 共用一条分支，但它们是两个 op）。
 ///
 /// 为什么要这一份：权限矩阵要能分清"认识的 op 但级别不够"和"根本不认识这个 op" ——
 /// 前者是**权限**问题（说要多少级），后者是**拼错了**（要教对的名字）。
 /// 把两件事混成一句，模型会拿"权限不够"去改自己的写法，然后在原地打转。
-const KNOWN_OPS: [&str; 20] = [
+const KNOWN_OPS: [&str; 21] = [
     "ping", "barrier", "list", "index", "session", "prompts", "prompt", "grant", "revoke",
     "my_tools", "log", "host", "delegate", "unhost", "suspend", "resume", "end", "spawn",
     "stop", "shutdown",
+    // **订阅**（2026-09-27）：它不是"发给中控的活"，而是"在订阅口那条连接上说的一句话" ——
+    // 列在这儿是为了让"认识但不许"和"根本不认识"分得开（见下面那条拒的样子）。
+    "subscribe",
 ];
 
 /// **哪个 op 至少要多高的权威。**
@@ -998,7 +1109,7 @@ const KNOWN_OPS: [&str; 20] = [
 /// 所以它还有第二道门：**低于 `user` 的调用方只能查自己**（见那一支的注释）。
 fn op_min_authority(op: &str) -> Authority {
     match op {
-        "ping" | "list" | "index" | "session" | "prompts" => Authority::Observe,
+        "ping" | "list" | "index" | "session" | "prompts" | "subscribe" => Authority::Observe,
         "my_tools" | "barrier" | "log" => Authority::Agent,
         _ => Authority::User,
     }
@@ -1090,9 +1201,191 @@ impl App {
                 if let Err(e) = codec::write_line(&mut out, &line) {
                     eprintln!("[ctrl] 写 stdout 失败：{e}");
                 }
+                self.fanout(&line);
             }
             Err(e) => eprintln!("[ctrl] 自己的消息编码失败：{e}"),
         }
+    }
+
+    /// **把这一行也给订阅者抄一份**（2026-09-27）。
+    ///
+    /// 订阅者拿到的和 console 完全一样：**这条会话里路由过的每一条消息**。
+    /// 没有过滤、没有裁剪 —— 今天就是这个语义（要"只看某类"是以后的事，
+    /// 现在别声明一个做不到的筛子）。
+    ///
+    /// 写不进去 = **那个人走了**（transport 自己会说，不用等超时）：
+    /// 当场把他从名单上摘掉，并留一笔 —— 不留一个永远失败的写。
+    fn fanout(&mut self, line: &str) {
+        if self.subs.is_empty() {
+            return;
+        }
+        let mut dead: Vec<String> = Vec::new();
+        for s in self.subs.iter_mut() {
+            // 还没 `subscribe` 的：他没要过，别塞给他
+            if s.id.is_none() {
+                continue;
+            }
+            if s.conn.write_line(line).is_err() {
+                dead.push(s.seq.clone());
+            }
+        }
+        for seq in dead {
+            self.on_sub_eof(&seq);
+        }
+    }
+
+    /// 订阅口上来了一个人（**握手已经过了**，这儿的连接是可以直接写的）。
+    fn on_subscribe(&mut self, seq: String, conn: harness_ipc::Conn) {
+        eprintln!("[ctrl] 订阅口上来了一条连接（等它说 `subscribe` —— 在那之前它什么也收不到）");
+        self.subs.push(Sub {
+            seq,
+            id: None,
+            conn,
+        });
+    }
+
+    /// 订阅口上的一行。
+    ///
+    /// 两条路，取决于他**说过没有**：
+    ///
+    /// | 状态 | 允许说什么 |
+    /// |---|---|
+    /// | 还没 `subscribe` | **只有** `{"op":"subscribe"}` —— 别的都拒（并教他那句话）|
+    /// | 说过了 | 一条普通消息：**以他自己的身份**（`from` 必须是他自报的那个名字）|
+    ///
+    /// ⚠️ 第二条那句"必须以自己的身份"和通道那条是**同一条纪律**：
+    /// **别在一个口子上冒充别人**（冒充了就是既不投递、又留痕）。
+    /// ⚠️ 他发得出消息，但**动不了手**：他的上限是 `observe`，权限矩阵会挡下一切要更高档的活。
+    /// "订阅者只读"就是这么来的 —— **不是一条新规矩，是一条已知的规矩**。
+    fn on_sub_line(&mut self, seq: &str, line: &str) {
+        let env = match codec::decode(line) {
+            Ok(e) => e,
+            Err(e) => {
+                if let Some(s) = self.subs.iter().find(|s| s.seq == seq) {
+                    let mut c = s.conn.try_clone().ok();
+                    // 手上没有 `fault` 那种"发给别人"的方便：他连身份都还没说清，
+                    // 就用他自己那条连接回一句（能读到就行）
+                    if let Some(c) = c.as_mut() {
+                        let _ = c.write_line(&format!(
+                            "{{\"type\":\"event\",\"code\":\"invalid\",\"why\":{}}}",
+                            serde_json::to_string(&format!("这一行读不出来：{e}")).unwrap_or_default()
+                        ));
+                    }
+                }
+                return;
+            }
+        };
+        let Some(idx) = self.subs.iter().position(|s| s.seq == seq) else {
+            return; // 已经下线了
+        };
+        if self.subs[idx].id.is_none() {
+            // ---- 还没订阅：只受理 `subscribe` ----
+            let op = env.payload.get("op").and_then(Value::as_str).unwrap_or("");
+            if op != "subscribe" {
+                self.subs[idx].id = None;
+                let reply = self.mint(
+                    MessageType::Result,
+                    CTRL,
+                    &env.from,
+                    env.corr.clone(),
+                    Authority::System,
+                    json!({"route": null, "effect": "refused", "code": "refused",
+                           "why": "这条连接还没订阅 —— 在订阅之前它只受理 `subscribe`",
+                           "remedy": "先发 {\"op\":\"subscribe\"}（`from` 写你想用的名字，比如 gui:main）" }),
+                );
+                let _ = self.subs[idx].conn.write_line(&codec::encode(&reply).unwrap_or_default());
+                return;
+            }
+            if env.from.trim().is_empty() {
+                let reply = self.mint(
+                    MessageType::Result, CTRL, &env.from, env.corr.clone(), Authority::System,
+                    json!({"route": null, "effect": "refused", "code": "invalid",
+                           "why": "`subscribe` 没写 `from` —— 订阅者也要有个名字",
+                           "remedy": "`from` 写成你想用的实例名（比如 gui:main）" }),
+                );
+                let _ = self.subs[idx].conn.write_line(&codec::encode(&reply).unwrap_or_default());
+                return;
+            }
+            // **登记成实例**：图上看得见"这个界面上来了"，而且它的上限是 `observe`。
+            // （通道那条路也是这么登的 —— 于是"入口是个实例"这句话对订阅者也成立。）
+            let id = env.from.clone();
+            if self.reg.contains(&id) {
+                let reply = self.mint(
+                    MessageType::Result, CTRL, &env.from, env.corr.clone(), Authority::System,
+                    json!({"route": null, "effect": "refused", "code": "refused",
+                           "why": format!("`{id}` 这个名字已经被占着了"),
+                           "remedy": "换一个名字再 `subscribe`" }),
+                );
+                let _ = self.subs[idx].conn.write_line(&codec::encode(&reply).unwrap_or_default());
+                return;
+            }
+            self.reg.insert(Instance {
+                id: id.clone(),
+                kind: "channel".into(),
+                is_agent: false,
+                // **只读**：上限 `observe` —— 它想动手就会被权限矩阵挡下
+                ceiling: Authority::Observe,
+                state: "connected",
+                service: None,
+                manifest: None,
+                config: None,
+                generation: 0,
+                bindings: None,
+                owns: None,
+                contract_errors: Vec::new(),
+                contract_missing: Vec::new(),
+                last_seen_ms: now_ms(),
+                unresponsive: false,
+                lifecycle: "resident".into(),
+                lifecycle_declared: None,
+            });
+            self.subs[idx].id = Some(id.clone());
+            let sid_now = self.sid.clone();
+            self.index.append(&sid_now, &id, "channel", "subscribed",
+                              json!({"ceiling": "observe", "note": "订阅者：只读"}));
+            eprintln!("[ctrl] `{id}` 订阅了这条会话（只读：上限 observe）");
+            let reply = self.mint(
+                MessageType::Result, CTRL, &id, env.corr.clone(), Authority::System,
+                json!({"route": null, "effect": "confirmed", "code": null,
+                       "data": {"subscribed": true, "sid": sid_now,
+                                "note": "接下来这条会话里路由过的每一条消息都会给你一份；\
+                                         你发得出消息，但你的上限是 observe —— 动不了手"}}),
+            );
+            let _ = self.subs[idx].conn.write_line(&codec::encode(&reply).unwrap_or_default());
+            return;
+        }
+        // ---- 已经订阅了：以他自己的身份走正常那条路 ----
+        let mine = self.subs[idx].id.clone().unwrap_or_default();
+        if env.from != mine {
+            self.fault(
+                &self.channel_id(),
+                env.corr.clone(),
+                "refused",
+                format!("订阅口上的 `{mine}` 发了 from=`{}` 的消息", env.from),
+                "在一个口子上别冒充别人；这条消息已被丢弃，没有投递",
+            );
+            return;
+        }
+        self.route(env);
+    }
+
+    /// 订阅口上的人走了。
+    fn on_sub_eof(&mut self, seq: &str) {
+        let Some(pos) = self.subs.iter().position(|s| s.seq == seq) else {
+            return;
+        };
+        let sub = self.subs.remove(pos);
+        let Some(id) = sub.id else {
+            eprintln!("[ctrl] 订阅口上一条还没订阅的连接断了");
+            return;
+        };
+        eprintln!("[ctrl] 订阅者 `{id}` 走了");
+        if let Some(inst) = self.reg.get_mut(&id) {
+            inst.state = "offline";
+        }
+        let sid_now = self.sid.clone();
+        self.index
+            .append(&sid_now, &id, "channel", "unsubscribed", json!({}));
     }
 
     fn mint(
@@ -3041,6 +3334,21 @@ impl App {
             // 这是不变量二（模型可见即已记录）的另一半：光记下来不算数，
             // **得有人真的能从日志重建**。跨进程恢复就是那个检验。
             // **读日志**（2026-09-23 起：它不再"重建上下文"）。
+            // **订阅**（2026-09-27）：**要在订阅口那条连接上说，不是在这儿说。**
+            //
+            // 为什么拒：订阅这件事是**连接级**的（"你这条连接从此收一份副本"），
+            // 而控制通道本来就是"谁拉起中控谁看得见一切"的那条路 ——
+            // 它已经在收全量了，再订阅一次没有意义。
+            "subscribe" => {
+                self.reply(
+                    req,
+                    json!({"route": null, "effect": "refused", "code": "refused",
+                           "why": "订阅要在**订阅口那条连接**上说 —— 控制通道已经在收全量了",
+                           "remedy": "订阅口的地址与口令在 data/rendezvous/<会话>-console.json 里；\
+                                      连上去先发那行口令，再发 {\"op\":\"subscribe\"}。\
+                                      拉起中控的那个进程不需要订阅（它本来就看得见全部）"}),
+                );
+            }
             //
             // L1 那一刀：**中控不再懂上下文的结构**。它只回答"有哪些记录"，至于
             // "记录怎么变成我的上下文"（哪条是系统提示、哪条是模型消息、压缩怎么重放）
