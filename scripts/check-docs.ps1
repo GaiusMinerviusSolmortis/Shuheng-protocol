@@ -83,24 +83,37 @@ Write-Host '== 散文里的「N 条判据」也要对账 ==' -ForegroundColor Cy
 # 而 README 的**正文**里还散着一堆同样的数字（`验收：18 条判据` 那种）——
 # **同一类手写数字，不能只查一半**。规则很简单：一行里同时出现脚本名和
 # `N 条判据`，就拿那一行数（不跨行匹配，跨行的宁可漏也别猜）。
+#
+# ⚠️ **2026-09-28：范围从"只有 README"扩到"所有 .md"。**
+# 原来只扫 README，于是**别的文档里的同一个数字没人查** —— 而它们真的漂了六处
+# （02-工具 写 12 实际 14、决策册三处 12/16/13 实际 15/21/17、
+#  附录-参考 写 12 实际 15、规范-工具服务 写 16 实际 21）。
+# "同一类手写数字不能只查一半"这句话，那天才算真的做到。
+# 顺带一条纪律：**这一轮不要再写新的手写条数** —— 能数出来的别写死。
 $proseStale = @()
 $proseChecked = 0
-foreach ($l in $readme) {
-    if ($l -match '([a-z0-9\-]+\.ps1).*?(\d+)\s*条判据') {
-        $file = $matches[1]
-        $said = [int]$matches[2]
-        $path = Join-Path $root "scripts/$file"
-        if (-not (Test-Path $path)) { continue }
-        $proseChecked++
-        $actual = ([regex]::Matches((Get-Content $path -Raw), '(?m)^\s*Check\s')).Count
-        if ($said -ne $actual) { $proseStale += "$file：正文写 $said，实际 $actual" }
+foreach ($doc in (Get-ChildItem $root -Filter *.md)) {
+    $n = 0
+    foreach ($l in (Get-Content $doc.FullName)) {
+        $n++
+        if ($l -match '([a-z0-9\-]+\.ps1).*?(\d+)\s*条判据') {
+            $file = $matches[1]
+            $said = [int]$matches[2]
+            $path = Join-Path $root "scripts/$file"
+            if (-not (Test-Path $path)) { continue }
+            $proseChecked++
+            $actual = ([regex]::Matches((Get-Content $path -Raw), '(?m)^\s*Check\s')).Count
+            if ($said -ne $actual) {
+                $proseStale += "$($doc.Name):$n：$file 写 $said，实际 $actual"
+            }
+        }
     }
 }
 Check "正文里那 $proseChecked 处的条数都对得上" { $proseStale.Count -eq 0 }
 foreach ($s in $proseStale) { Say $s }
 
 Write-Host ''
-Write-Host '== 测试总数（跑出来的）==' -ForegroundColor Cyan
+Write-Host '== 判据脚本自己的坑：`-like` 里的通配符 ==' -ForegroundColor Cyan
 # **判据脚本自己的坑：`-like` 里的通配符**（2026-09-20 加，因为我自己踩了三次）。
 #
 # PowerShell 的 `-like` 用的是**通配符**：`[abc]` 是**字符类**、反引号是转义符。
@@ -124,6 +137,43 @@ foreach ($f in (Get-ChildItem (Join-Path $root 'scripts') -Filter '*.ps1')) {
 }
 Check '所有脚本里 `-like` 的模式都不带通配符陷阱（`[` / 反引号）' { $wildcardTraps.Count -eq 0 }
 foreach ($t in $wildcardTraps) { Say $t }
+
+Write-Host ''
+Write-Host '== 文档里点名的文件真的在 ==' -ForegroundColor Cyan
+# **2026-09-28 加。** 文档最爱烂的第二种方式（第一种是写死的数字）：**点一个不存在的文件**。
+# 重构把文件搬走了、脚本改名了，而那句引用**没有任何东西去查** ——
+# 这次梳理一口气抓到两处：决策册里写着 `crates/harness-editor/src/fence.rs`
+# （围栏早就搬进公共件 `harness-service` 了），以及我自己在规范里顺手写的 `smoke-owns`
+# （真名是 `smoke-ownership`）。两处都是"读起来完全合理"的那种错。
+#
+# 查两个作用域，**刻意不查散文里那种举例**：
+#   · `scripts/xxx.ps1` —— 判据脚本（`tools/...` 那些是别人的仓库，不查）
+#   · `crates/<crate>/(src|tests)/....rs` —— 我们自己的源码路径
+$scriptRefs = @{}
+$crateRefs = @{}
+foreach ($f in (Get-ChildItem $root -Filter *.md)) {
+    $i = 0
+    foreach ($line in (Get-Content $f.FullName)) {
+        $i++
+        foreach ($m in [regex]::Matches($line, 'scripts/[A-Za-z0-9_\-]+\.ps1')) {
+            $scriptRefs[$m.Value] = "$($f.Name):$i"
+        }
+        foreach ($m in [regex]::Matches($line, 'crates/[A-Za-z0-9_\-]+/(src|tests)/[A-Za-z0-9_\-/\.]+\.rs')) {
+            $crateRefs[$m.Value] = "$($f.Name):$i"
+        }
+    }
+}
+$badRefs = @()
+foreach ($k in $scriptRefs.Keys) {
+    if (-not (Test-Path (Join-Path $root $k))) { $badRefs += "$k（$($scriptRefs[$k])）" }
+}
+foreach ($k in $crateRefs.Keys) {
+    if (-not (Test-Path (Join-Path $root $k))) { $badRefs += "$k（$($crateRefs[$k])）" }
+}
+Check "文档点名的 $($scriptRefs.Count) 个脚本 + $($crateRefs.Count) 个源码路径都在" {
+    $badRefs.Count -eq 0
+}
+foreach ($b in $badRefs) { Say "不在了：$b" }
 
 Write-Host ''
 Write-Host '== 测试总数（跑出来的）==' -ForegroundColor Cyan
