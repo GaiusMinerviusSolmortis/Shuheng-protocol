@@ -107,6 +107,10 @@ mod imp {
 
     pub fn acquire(domain: &str, fences: &[std::path::PathBuf]) -> Result<DomainLock, Conflict> {
         let plan = lock_plan(fences, |f| {
+            // ⚠️ 名字里的 `instance-harness` 是**故意留着**的（2026-10-15 项目改名时没动它）。
+            // 锁名是"跨进程互斥"的**命名空间**：改了名字，新旧两代进程就互相看不见
+            // 对方手里的锁 —— 一个还开着的旧编辑器 + 一个新编译器会同时以为自己独占。
+            // 换它要挑一个"没有旧进程在跑"的时刻，那是一次**有代价的迁移**，不是改个字符串。
             format!("Local\\instance-harness-{domain}-{}", tag(f))
         });
         let mut handles: Vec<*mut core::ffi::c_void> = Vec::new();

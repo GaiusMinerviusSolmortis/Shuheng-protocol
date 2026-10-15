@@ -147,7 +147,7 @@ impl McpClient {
         let params = json!({
             "protocolVersion": Self::PROTOCOL,
             "capabilities": {},
-            "clientInfo": {"name": "instance-harness", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": "Shuheng-protocol", "version": env!("CARGO_PKG_VERSION")},
         });
         let res = self.request("initialize", params, timeout)?;
         self.protocol_version = res
