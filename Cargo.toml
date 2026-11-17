@@ -13,6 +13,7 @@ members = [
     "crates/harness-skill",
     "crates/harness-ipc",
     "crates/harness-mcp",
+    "crates/harness-runtime",
 ]
 
 [workspace.package]

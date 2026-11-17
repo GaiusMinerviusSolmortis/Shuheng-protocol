@@ -26,6 +26,7 @@ use harness_core::{invariant, now_ms, SessionLog};
 use registry::{Binding, Instance, Registry};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
@@ -539,6 +540,8 @@ struct Channel {
 struct App {
     sid: String,
     log: SessionLog,
+    /// 执行事务账本。消息日志记“说了什么”，这本账记“现实里可能做了什么”。
+    exec: harness_runtime::ExecutionJournal,
     reg: Registry,
     ids: IdGen,
     channel: Channel,
@@ -660,6 +663,24 @@ fn run() -> i32 {
     };
     // **日志侧的内联上限**（`--log-inline`，部署选择）：超了就溢出成文件、日志里放引用。
     log.set_inline_limit(args.log_inline);
+    let mut exec = match harness_runtime::ExecutionJournal::open_for_session(
+        &args.data_dir,
+        &args.sid,
+    ) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[ctrl] 打不开执行账本：{e}");
+            return 2;
+        }
+    };
+    match exec.recover_inflight("controller_restarted") {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[ctrl] 执行账本：上次有 {n} 个未决效果，已标为 unverifiable"),
+        Err(e) => {
+            eprintln!("[ctrl] 执行账本恢复失败：{e}");
+            return 2;
+        }
+    }
     eprintln!(
         "[ctrl] 会话 {} 日志：{}",
         args.sid,
@@ -669,6 +690,7 @@ fn run() -> i32 {
         "[ctrl] 身份索引（跨会话、只追加）：{}",
         args.data_dir.join(index::FILE).display()
     );
+    eprintln!("[ctrl] 执行账本：{}", exec.path().display());
 
     let (tx, rx): (Sender<Inbound>, Receiver<Inbound>) = mpsc::channel();
 
@@ -680,6 +702,7 @@ fn run() -> i32 {
     let mut app = App {
         sid: args.sid.clone(),
         log,
+        exec,
         reg: Registry::default(),
         ids: IdGen::with_floor("ctrl", ctrl_water),
         channel: Channel {
@@ -2385,6 +2408,9 @@ impl App {
         if seq == 0 {
             return; // 日志写不进去，宁可不投递
         }
+        // 结果也进消息日志之后，再把对应的现实效果结算掉。孤立结果、错误发送方
+        // 或已经结算的效果都改不了这本账。
+        self.settle_execution_effect(&env);
 
         // console 自己的输入不回显给它；其余每一条都让它看得见
         if env.from != self.channel_id() {
@@ -2783,6 +2809,143 @@ impl App {
         );
     }
 
+    /// 在把工具请求写进目标进程之前，先把它记成 `in_flight` 效果。
+    ///
+    /// 当前消息协议还没有携带完整的用户意图，所以旧客户端发来的单次调用会得到
+    /// 一个合成意图/尝试（`call-intent:<corr>` / `call-attempt:<corr>`）。这是兼容层，
+    /// 不是最终语义；它保证现阶段每次可能产生副作用的调用都能进入同一本执行账。
+    fn begin_execution_effect(&mut self, env: &Envelope) -> Result<bool, String> {
+        if env.kind != MessageType::Request || env.from == CTRL {
+            return Ok(false);
+        }
+        let Some(corr) = env.corr.as_deref() else {
+            return Ok(false);
+        };
+        let is_tool = self
+            .reg
+            .get_ref(&env.to)
+            .map(|i| !i.is_agent && i.service.is_some())
+            .unwrap_or(false);
+        if !is_tool || self.exec.snapshot().effects.contains_key(corr) {
+            return Ok(false);
+        }
+
+        let intent_id = format!("call-intent:{corr}");
+        let attempt_id = format!("call-attempt:{corr}");
+        let tool = env
+            .payload
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let goal = format!("{} 调用 {}.{}", env.from, env.to, tool);
+        self.exec
+            .open_intent(&intent_id, &env.sid, &env.from, goal)
+            .map_err(|e| e.to_string())?;
+        self.exec
+            .open_attempt(&attempt_id, &intent_id)
+            .map_err(|e| e.to_string())?;
+        let args = env.payload.get("args").cloned().unwrap_or(Value::Null);
+        let digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&args).unwrap_or_default())
+        );
+        self.exec
+            .start_effect(
+                corr,
+                &attempt_id,
+                &env.from,
+                &env.to,
+                tool,
+                Some(digest),
+            )
+            .map_err(|e| e.to_string())?;
+        // 效果开始事件必须先于目标进程看到请求；否则崩溃窗口里会出现
+        // “设备可能动了，但账本从没提过这次尝试”。
+        self.exec.barrier().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// 用协议结果结算一次效果，并把尝试/合成意图推进到终态。
+    ///
+    /// 结果已经写进消息日志之后才调用这里。调用方和收件人必须与在途记录一致，
+    /// 孤立的伪造结果不能改写执行账。
+    fn settle_execution_effect(&mut self, env: &Envelope) {
+        if env.kind != MessageType::Result {
+            return;
+        }
+        let Some(corr) = env.corr.as_deref() else {
+            return;
+        };
+        let legitimate = self
+            .pending
+            .get(corr)
+            .map(|p| env.from == CTRL || env.from == p.target)
+            .unwrap_or(false);
+        let Some(effect) = self.exec.snapshot().effects.get(corr).cloned() else {
+            return;
+        };
+        if !legitimate || effect.state.is_terminal() {
+            return;
+        }
+        let wire = env
+            .payload
+            .get("effect")
+            .and_then(Value::as_str)
+            .unwrap_or("unverifiable");
+        let state = harness_runtime::EffectState::from_result(wire)
+            .unwrap_or(harness_runtime::EffectState::Unverifiable);
+        let code = env
+            .payload
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.apply_effect_settlement(corr, state, code);
+    }
+
+    fn apply_effect_settlement(
+        &mut self,
+        corr: &str,
+        state: harness_runtime::EffectState,
+        code: Option<String>,
+    ) {
+        let Some(effect) = self.exec.snapshot().effects.get(corr).cloned() else {
+            return;
+        };
+        if effect.state.is_terminal() {
+            return;
+        }
+        if let Err(e) = self.exec.settle_effect(corr, state, code, None) {
+            eprintln!("[ctrl] 执行账本结算 {corr} 失败：{e}");
+            return;
+        }
+        let attempt_state = match state {
+            harness_runtime::EffectState::Confirmed => harness_runtime::AttemptState::Succeeded,
+            harness_runtime::EffectState::Partial => harness_runtime::AttemptState::Partial,
+            _ => harness_runtime::AttemptState::Failed,
+        };
+        if let Err(e) = self.exec.finish_attempt(&effect.attempt_id, attempt_state) {
+            eprintln!("[ctrl] 执行账本结束尝试 {} 失败：{e}", effect.attempt_id);
+            return;
+        }
+        let intent_state = match attempt_state {
+            harness_runtime::AttemptState::Succeeded => harness_runtime::IntentState::Succeeded,
+            harness_runtime::AttemptState::Partial => harness_runtime::IntentState::Partial,
+            _ => harness_runtime::IntentState::Failed,
+        };
+        let intent_id = self
+            .exec
+            .snapshot()
+            .attempts
+            .get(&effect.attempt_id)
+            .map(|a| a.intent_id.clone());
+        if let Some(intent_id) = intent_id {
+            if let Err(e) = self.exec.finish_intent(&intent_id, intent_state) {
+                eprintln!("[ctrl] 执行账本结束意图 {intent_id} 失败：{e}");
+            }
+        }
+    }
+
     /// **真正把一行投给服务。** 屏障也在这儿落。
     ///
     /// 抽出来是为了"攒着的请求放行"和"立刻投递"**走同一条路** ——
@@ -2838,6 +3001,17 @@ impl App {
         } else {
             (false, String::new())
         };
+        // **先让执行账知道“可能要做”，再让目标进程动手。**
+        // 账写不下去时拒绝分派；宁可这次不做，也不能留下无法审计的副作用窗口。
+        if let Err(e) = self.begin_execution_effect(&q.env) {
+            self.refuse_call(
+                &q.env,
+                "service_down",
+                format!("执行账本写不进去：{e}"),
+                "这次调用没有投递给目标。检查 data-dir 的写权限和磁盘空间后再试",
+            );
+            return;
+        }
         if barrier {
             match self.log.barrier() {
                 // `synced` 为假 = 本来就干净、这次短路了 —— **不是失败**
@@ -2864,6 +3038,13 @@ impl App {
         };
         if !wrote {
             if let Some(corr) = &q.env.corr {
+                // 写失败不一定等于对方没收到：管道可能已经送出半行。
+                // 把已有效果标为 unverifiable，禁止上层把它当成“明确没做”自动重试。
+                self.apply_effect_settlement(
+                    corr,
+                    harness_runtime::EffectState::Unverifiable,
+                    Some("transport_write_failed".into()),
+                );
                 self.pending.remove(corr);
             }
             self.refuse_call(

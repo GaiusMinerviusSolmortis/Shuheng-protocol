@@ -216,9 +216,11 @@ version = "0.1.0"
 dependencies = [
  "harness-core",
  "harness-ipc",
+ "harness-runtime",
  "harness-service",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -276,6 +278,15 @@ dependencies = [
 name = "harness-memory"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harness-runtime"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
  "serde",
  "serde_json",
 ]
